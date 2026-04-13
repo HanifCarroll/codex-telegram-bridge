@@ -734,13 +734,7 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&result)?);
         }
         Commands::Watch { once, exec, events } => {
-            let filter = events.as_deref().map(|value| {
-                value
-                    .split(',')
-                    .map(|item| item.trim().to_string())
-                    .filter(|item| !item.is_empty())
-                    .collect::<BTreeSet<_>>()
-            });
+            let filter = parse_event_filter(events.as_deref());
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             if once {
@@ -2770,29 +2764,26 @@ fn sync_state_from_live(
             "sortKey": "updated_at"
         }),
     )?;
-    let summaries = list
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let mut snapshots = Vec::new();
-    for summary in summaries {
-        let thread_id = summary
-            .get("id")
-            .and_then(Value::as_str)
-            .context("thread id missing in thread/list")?;
-        let read = client.request(
-            "thread/read",
-            json!({
-                "threadId": thread_id,
-                "includeTurns": true
-            }),
-        )?;
-        let Some(thread) = read.get("thread") else {
-            continue;
-        };
-        let snapshot = normalize_thread_snapshot(&summary, thread)?;
-        snapshots.push(snapshot);
+    if let Some(summaries) = list.get("data").and_then(Value::as_array) {
+        for summary in summaries {
+            let thread_id = summary
+                .get("id")
+                .and_then(Value::as_str)
+                .context("thread id missing in thread/list")?;
+            let read = client.request(
+                "thread/read",
+                json!({
+                    "threadId": thread_id,
+                    "includeTurns": true
+                }),
+            )?;
+            let Some(thread) = read.get("thread") else {
+                continue;
+            };
+            let snapshot = normalize_thread_snapshot(summary, thread)?;
+            snapshots.push(snapshot);
+        }
     }
     reconcile_thread_snapshots(conn, now, snapshots, record_deliveries)
 }
@@ -3634,30 +3625,28 @@ fn event_is_terminal(event: &Value) -> bool {
 }
 
 fn thread_snapshot_is_terminal(thread: &Value) -> bool {
-    let turns = thread
+    let last_turn_status = thread
         .get("turns")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let last_turn_status = turns
-        .last()
+        .and_then(|turns| turns.last())
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str);
     if last_turn_status == Some("completed") {
         return true;
     }
 
-    let active_flags = thread
+    thread
         .pointer("/status/activeFlags")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    active_flags.iter().any(|flag| {
-        matches!(
-            flag.as_str(),
-            Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
-        )
-    })
+        .map(|active_flags| {
+            active_flags.iter().any(|flag| {
+                matches!(
+                    flag.as_str(),
+                    Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn settle_composed_follow_events(
