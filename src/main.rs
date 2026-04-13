@@ -609,18 +609,25 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string(&payload)?);
         }
         Commands::Threads { limit } => {
-            if let Some(result) = fixture_threads_list(limit)? {
-                println!("{}", serde_json::to_string(&result)?);
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            if load_fixture_into_db(&conn, now)? {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "threads": list_cached_threads(&conn, limit)?
+                    }))?
+                );
             } else {
                 let mut client = CodexAppServerClient::connect()?;
-                let result = client.request(
-                    "thread/list",
-                    json!({
-                        "limit": limit,
-                        "sortKey": "updated_at"
-                    }),
-                )?;
-                println!("{}", serde_json::to_string(&result)?);
+                let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "threads": result["threads"].clone()
+                    }))?
+                );
             }
         }
         Commands::Follow {
@@ -670,7 +677,7 @@ fn run() -> Result<()> {
             let conn = create_state_db(&db_path)?;
             if !load_fixture_into_db(&conn, now)? {
                 let mut client = CodexAppServerClient::connect()?;
-                sync_state_from_live(&mut client, &conn, now, 50)?;
+                sync_state_from_live(&mut client, &conn, now, 50, false)?;
             }
             println!("{}", serde_json::to_string(&get_status_audit(&conn, thread_id.as_deref())?)?);
         }
@@ -701,7 +708,7 @@ fn run() -> Result<()> {
                 }
             } else {
                 let mut client = CodexAppServerClient::connect()?;
-                sync_state_from_live(&mut client, &conn, now, limit.max(25))?;
+                sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
             }
             let result = list_waiting_from_db(&conn, project.as_deref(), limit)?;
             println!("{}", serde_json::to_string(&result)?);
@@ -718,7 +725,7 @@ fn run() -> Result<()> {
             let conn = create_state_db(&db_path)?;
             if !load_fixture_into_db(&conn, now)? {
                 let mut client = CodexAppServerClient::connect()?;
-                sync_state_from_live(&mut client, &conn, now, limit.max(25))?;
+                sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
             }
             let result = list_inbox_from_db(
                 &conn,
@@ -750,7 +757,7 @@ fn run() -> Result<()> {
                     }
                 } else {
                     let mut client = CodexAppServerClient::connect()?;
-                    sync_state_from_live(&mut client, &conn, now, 50)?;
+                    sync_state_from_live(&mut client, &conn, now, 50, true)?;
                 }
                 let filtered = filter_watch_events(watch_once_from_db(&conn)?, filter.as_ref());
                 for event in &filtered {
@@ -765,7 +772,7 @@ fn run() -> Result<()> {
                 loop {
                     let now = now_millis()?;
                     let mut client = CodexAppServerClient::connect()?;
-                    sync_state_from_live(&mut client, &conn, now, 50)?;
+                    sync_state_from_live(&mut client, &conn, now, 50, true)?;
                     let filtered = filter_watch_events(watch_once_from_db(&conn)?, filter.as_ref());
                     let serialized = serde_json::to_string(&filtered)?;
                     if serialized != last {
@@ -793,20 +800,15 @@ fn run() -> Result<()> {
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, limit)?;
-            println!("{}", serde_json::to_string(&json!({
-                "ok": true,
-                "action": "sync",
-                "limit": limit,
-                "syncedAt": now
-            }))?);
+            let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
+            println!("{}", serde_json::to_string(&result)?);
         }
         Commands::Changes => {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50)?;
+            sync_state_from_live(&mut client, &conn, now, 50, false)?;
             let result = list_changes_since_last_check(&conn, now)?;
             println!("{}", serde_json::to_string(&json!({
                 "summary": {
@@ -822,7 +824,7 @@ fn run() -> Result<()> {
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50)?;
+            sync_state_from_live(&mut client, &conn, now, 50, false)?;
             let result = list_done_since_last_check(&conn, now)?;
             println!("{}", serde_json::to_string(&json!({
                 "summary": {
@@ -962,7 +964,7 @@ fn run() -> Result<()> {
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50)?;
+            sync_state_from_live(&mut client, &conn, now, 50, false)?;
             let preview = archive_from_db(
                 &conn,
                 thread_id.as_deref(),
@@ -1769,7 +1771,12 @@ fn upsert_thread_snapshot(conn: &Connection, snapshot: &BridgeThreadSnapshot, no
             source = excluded.source,
             status_type = excluded.status_type,
             status_flags_json = excluded.status_flags_json,
-            updated_at = excluded.updated_at,
+            updated_at = CASE
+                WHEN threads_cache.updated_at IS NULL THEN excluded.updated_at
+                WHEN excluded.updated_at IS NULL THEN threads_cache.updated_at
+                WHEN excluded.updated_at > threads_cache.updated_at THEN excluded.updated_at
+                ELSE threads_cache.updated_at
+            END,
             last_seen_at = excluded.last_seen_at,
             last_turn_status = excluded.last_turn_status,
             last_preview = excluded.last_preview",
@@ -1882,6 +1889,134 @@ fn recent_actions_json(conn: &Connection, thread_id: &str, limit: u64) -> Result
         .collect())
 }
 
+fn thread_snapshot_json(snapshot: &BridgeThreadSnapshot) -> Value {
+    json!({
+        "threadId": snapshot.thread_id,
+        "name": snapshot.name,
+        "cwd": snapshot.cwd,
+        "updatedAt": snapshot.updated_at,
+        "statusType": snapshot.status_type,
+        "statusFlags": snapshot.status_flags,
+        "lastTurnStatus": snapshot.last_turn_status,
+        "lastPreview": snapshot.last_preview,
+        "pendingPrompt": snapshot.pending_prompt.as_ref().map(|prompt| json!({
+            "promptId": prompt.prompt_id,
+            "promptKind": prompt.kind,
+            "promptStatus": prompt.status,
+            "question": prompt.question
+        }))
+    })
+}
+
+fn should_emit_for_away_window(away_started_at: Option<u64>, updated_at: Option<u64>) -> bool {
+    match away_started_at {
+        None => true,
+        Some(started_at) => updated_at.map(|value| value >= started_at).unwrap_or(false),
+    }
+}
+
+fn record_delivery(
+    conn: &Connection,
+    event_key: &str,
+    thread_id: &str,
+    event_type: &str,
+    delivered_at: u64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO delivery_log(event_key, thread_id, event_type, delivered_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            event_key,
+            thread_id,
+            event_type,
+            to_sql_i64(delivered_at)?
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+fn reconcile_thread_snapshots(
+    conn: &Connection,
+    now: u64,
+    snapshots: Vec<BridgeThreadSnapshot>,
+    record_deliveries: bool,
+) -> Result<Value> {
+    let away = get_setting_text(conn, "away")?.unwrap_or_default() == "true";
+    let away_started_at = get_setting_number(conn, "away_started_at")?;
+    let mut events = Vec::new();
+    let mut threads = Vec::new();
+
+    for snapshot in &snapshots {
+        upsert_thread_snapshot(conn, snapshot, now)?;
+        threads.push(thread_snapshot_json(snapshot));
+
+        if !away || !should_emit_for_away_window(away_started_at, snapshot.updated_at) {
+            continue;
+        }
+
+        if let Some(prompt) = &snapshot.pending_prompt {
+            let event_key = format!(
+                "thread_waiting:{}:{}:{}",
+                snapshot.thread_id,
+                prompt.prompt_id,
+                snapshot.updated_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            let should_emit = !record_deliveries
+                || record_delivery(
+                    conn,
+                    &event_key,
+                    &snapshot.thread_id,
+                    "thread_waiting",
+                    now,
+                )?;
+            if should_emit {
+                events.push(json!({
+                    "type": "thread_waiting",
+                    "threadId": snapshot.thread_id,
+                    "promptKind": prompt.kind,
+                    "updatedAt": snapshot.updated_at
+                }));
+            }
+        }
+
+        if snapshot.pending_prompt.is_none()
+            && snapshot.last_turn_status.as_deref() == Some("completed")
+        {
+            let event_key = format!(
+                "thread_completed:{}:{}",
+                snapshot.thread_id,
+                snapshot.updated_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            let should_emit = !record_deliveries
+                || record_delivery(
+                    conn,
+                    &event_key,
+                    &snapshot.thread_id,
+                    "thread_completed",
+                    now,
+                )?;
+            if should_emit {
+                events.push(json!({
+                    "type": "thread_completed",
+                    "threadId": snapshot.thread_id,
+                    "updatedAt": snapshot.updated_at
+                }));
+            }
+        }
+    }
+
+    Ok(json!({
+        "synced": snapshots.len(),
+        "threads": threads,
+        "events": events,
+        "away": away
+    }))
+}
+
 fn list_waiting_from_db(
     conn: &Connection,
     project_filter: Option<&str>,
@@ -1987,6 +2122,72 @@ fn list_waiting_from_db(
         },
         threads,
     })
+}
+
+fn list_cached_threads(conn: &Connection, limit: u64) -> Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.status_type, t.status_flags_json,
+                t.last_turn_status, t.last_preview, p.prompt_id, p.prompt_kind, p.prompt_status, p.question
+         FROM threads_cache t
+         LEFT JOIN pending_prompts p ON p.thread_id = t.thread_id
+         ORDER BY COALESCE(t.updated_at, 0) DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![to_sql_i64(limit)?], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+        ))
+    })?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    raw.into_iter()
+        .map(
+            |(
+                thread_id,
+                name,
+                cwd,
+                updated_at_raw,
+                status_type,
+                status_flags_json,
+                last_turn_status,
+                last_preview,
+                prompt_id,
+                prompt_kind,
+                prompt_status,
+                question,
+            )| {
+                Ok(json!({
+                    "threadId": thread_id,
+                    "name": name,
+                    "cwd": cwd,
+                    "updatedAt": optional_from_sql_i64(updated_at_raw)?,
+                    "statusType": status_type,
+                    "statusFlags": serde_json::from_str::<Value>(&status_flags_json).unwrap_or(json!([])),
+                    "lastTurnStatus": last_turn_status,
+                    "lastPreview": last_preview,
+                    "pendingPrompt": match (prompt_id, prompt_kind, prompt_status, question) {
+                        (Some(prompt_id), Some(prompt_kind), Some(prompt_status), Some(question)) => json!({
+                            "promptId": prompt_id,
+                            "promptKind": prompt_kind,
+                            "promptStatus": prompt_status,
+                            "question": question
+                        }),
+                        _ => Value::Null,
+                    }
+                }))
+            },
+        )
+        .collect()
 }
 
 fn list_changes_since_last_check(conn: &Connection, now: u64) -> Result<ChangesResult> {
@@ -2284,7 +2485,13 @@ fn archive_from_db(
     }))
 }
 
-fn sync_state_from_live(client: &mut CodexAppServerClient, conn: &Connection, now: u64, limit: u64) -> Result<()> {
+fn sync_state_from_live(
+    client: &mut CodexAppServerClient,
+    conn: &Connection,
+    now: u64,
+    limit: u64,
+    record_deliveries: bool,
+) -> Result<Value> {
     let list = client.request(
         "thread/list",
         json!({
@@ -2297,6 +2504,7 @@ fn sync_state_from_live(client: &mut CodexAppServerClient, conn: &Connection, no
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let mut snapshots = Vec::new();
     for summary in summaries {
         let thread_id = summary
             .get("id")
@@ -2313,9 +2521,9 @@ fn sync_state_from_live(client: &mut CodexAppServerClient, conn: &Connection, no
             continue;
         };
         let snapshot = normalize_thread_snapshot(&summary, thread)?;
-        upsert_thread_snapshot(conn, &snapshot, now)?;
+        snapshots.push(snapshot);
     }
-    Ok(())
+    reconcile_thread_snapshots(conn, now, snapshots, record_deliveries)
 }
 
 fn parent_pid() -> Option<u32> {
@@ -3737,6 +3945,53 @@ mod tests {
             result["thread"]["recentActions"][0]["actionType"],
             "approve"
         );
+    }
+
+    #[test]
+    fn reconcile_snapshots_returns_ts_sync_shape_and_dedupes_away_events() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 900).expect("away on");
+        let waiting = snapshot_fixture(
+            "thr_wait",
+            "/tmp/project-a",
+            1000,
+            "active",
+            vec!["waitingOnUserInput"],
+            Some("in_progress"),
+        );
+        let completed = snapshot_fixture(
+            "thr_done",
+            "/tmp/project-b",
+            1100,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+
+        let first = reconcile_thread_snapshots(
+            &conn,
+            1200,
+            vec![waiting.clone(), completed.clone()],
+            true,
+        )
+        .expect("first reconcile");
+        assert_eq!(first["synced"], 2);
+        assert_eq!(first["away"], true);
+        assert_eq!(first["threads"][0]["threadId"], "thr_wait");
+        assert!(first["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "thread_waiting"));
+        assert!(first["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type"] == "thread_completed"));
+
+        let second = reconcile_thread_snapshots(&conn, 1300, vec![waiting, completed], true)
+            .expect("second reconcile");
+        assert_eq!(second["events"].as_array().unwrap().len(), 0);
     }
 
     #[test]
