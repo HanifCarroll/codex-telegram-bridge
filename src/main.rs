@@ -301,6 +301,7 @@ struct ErrorEnvelope {
 struct ErrorBody {
     code: &'static str,
     message: String,
+    classified: Value,
 }
 
 #[derive(Serialize)]
@@ -505,6 +506,7 @@ fn main() {
             error: ErrorBody {
                 code: "internal_error",
                 message: format!("{error:#}"),
+                classified: classify_app_server_error_message(&format!("{error:#}")),
             },
         };
         println!("{}", serde_json::to_string(&envelope).unwrap());
@@ -563,7 +565,7 @@ fn run() -> Result<()> {
                 thread_id,
                 experimental_realtime,
             }) => {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let with_turns = client.request(
                     "thread/read",
                     json!({ "threadId": thread_id, "includeTurns": true }),
@@ -573,12 +575,12 @@ fn run() -> Result<()> {
                     json!({ "threadId": thread_id, "includeTurns": false }),
                 );
                 let realtime_start = if experimental_realtime {
-                    Some(client.request("realtime/start", json!({ "threadId": thread_id })))
+                    Some(client.request("thread/realtime/start", json!({ "threadId": thread_id })))
                 } else {
                     None
                 };
                 let realtime_stop = if experimental_realtime {
-                    Some(client.request("realtime/stop", json!({ "threadId": thread_id })))
+                    Some(client.request("thread/realtime/stop", json!({ "threadId": thread_id })))
                 } else {
                     None
                 };
@@ -629,7 +631,7 @@ fn run() -> Result<()> {
             events: _,
             experimental_realtime,
         } => {
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
             let initial = client.request(
                 "thread/read",
                 json!({ "threadId": thread_id, "includeTurns": true }),
@@ -2451,16 +2453,64 @@ fn get_status_audit(conn: &Connection, thread_id: Option<&str>) -> Result<Value>
     Ok(json!({ "audits": audits }))
 }
 
+fn classify_app_server_error_message(message: &str) -> Value {
+    if message.contains("thread not loaded") {
+        return json!({
+            "code": "thread_not_loaded",
+            "retryable": true,
+            "message": message,
+            "guidance": "The thread is not visible in this app-server client session. Prefer single-session flows like --follow on new/reply/approve/fork."
+        });
+    }
+
+    if message.contains("is not materialized yet")
+        || message.contains("includeTurns is unavailable before first user message")
+    {
+        return json!({
+            "code": "thread_not_materialized",
+            "retryable": true,
+            "message": message,
+            "guidance": "The thread exists but full turn materialization is not ready yet. Retry shortly or use single-session follow after creating/resuming the thread."
+        });
+    }
+
+    if message.contains("no rollout found for thread id") {
+        return json!({
+            "code": "thread_no_rollout",
+            "retryable": false,
+            "message": message,
+            "guidance": "The backend does not consider this thread forkable/rollable in the current context. This is likely an upstream limitation rather than a bridge bug."
+        });
+    }
+
+    if message.contains("requires experimentalApi capability") {
+        return json!({
+            "code": "experimental_api_required",
+            "retryable": true,
+            "message": message,
+            "guidance": "Retry with --experimental-realtime or a client initialized with experimentalApi: true."
+        });
+    }
+
+    json!({
+        "code": "app_server_error",
+        "retryable": false,
+        "message": message,
+        "guidance": Value::Null
+    })
+}
+
 fn step_result(label: &str, result: Result<Value>) -> Value {
     match result {
         Ok(value) => json!({ "ok": true, "step": label, "result": value }),
-        Err(error) => json!({
-            "ok": false,
-            "step": label,
-            "error": {
-                "message": format!("{error:#}")
-            }
-        }),
+        Err(error) => {
+            let message = format!("{error:#}");
+            json!({
+                "ok": false,
+                "step": label,
+                "error": classify_app_server_error_message(&message)
+            })
+        }
     }
 }
 
@@ -2863,10 +2913,15 @@ struct CodexAppServerClient {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    notifications: Vec<Value>,
 }
 
 impl CodexAppServerClient {
     fn connect() -> Result<Self> {
+        Self::connect_with_options(false)
+    }
+
+    fn connect_with_options(experimental_api: bool) -> Result<Self> {
         let resolved = resolve_codex_binary()?;
         let mut child = Command::new(&resolved.path)
             .arg("app-server")
@@ -2890,19 +2945,10 @@ impl CodexAppServerClient {
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
+            notifications: Vec::new(),
         };
 
-        let _ = client.request(
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "codex-hermes-bridge-rs",
-                    "version": "0.1.0"
-                }
-            }),
-        )?;
+        let _ = client.request("initialize", initialize_params(experimental_api))?;
         client.notify("initialized", json!({}))?;
         Ok(client)
     }
@@ -2939,22 +2985,59 @@ impl CodexAppServerClient {
             }
             let parsed: Value = serde_json::from_str(trimmed)
                 .with_context(|| format!("invalid JSON from app-server: {trimmed}"))?;
-            match parsed.get("id") {
-                Some(value) if value == &json!(id) => {
-                    if let Some(error) = parsed.get("error") {
-                        bail!("{method}: {}", error);
-                    }
-                    return Ok(parsed.get("result").cloned().unwrap_or(Value::Null));
-                }
-                _ => continue,
+            if let Some(result) = handle_app_server_message(&parsed, id, &mut self.notifications)? {
+                return Ok(result);
             }
         }
+    }
+
+    fn drain_notifications(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.notifications)
     }
 
     fn write_message(&mut self, value: &Value) -> Result<()> {
         writeln!(self.stdin, "{}", serde_json::to_string(value)?)?;
         self.stdin.flush()?;
         Ok(())
+    }
+}
+
+fn initialize_params(experimental_api: bool) -> Value {
+    let capabilities = if experimental_api {
+        json!({ "experimentalApi": true })
+    } else {
+        json!({})
+    };
+
+    json!({
+        "protocolVersion": 1,
+        "capabilities": capabilities,
+        "clientInfo": {
+            "name": "codex-hermes-bridge-rs",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
+}
+
+fn handle_app_server_message(
+    parsed: &Value,
+    expected_id: u64,
+    notifications: &mut Vec<Value>,
+) -> Result<Option<Value>> {
+    match parsed.get("id") {
+        Some(value) if value == &json!(expected_id) => {
+            if let Some(error) = parsed.get("error") {
+                bail!("{}", error);
+            }
+            Ok(Some(parsed.get("result").cloned().unwrap_or(Value::Null)))
+        }
+        Some(_) => Ok(None),
+        None => {
+            if parsed.get("method").and_then(Value::as_str).is_some() {
+                notifications.push(parsed.clone());
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -3110,6 +3193,72 @@ mod tests {
             get_setting_text(&conn, "away_mode").expect("legacy away setting"),
             None
         );
+    }
+
+    #[test]
+    fn doctor_realtime_classifies_app_server_failures() {
+        let payload = doctor_realtime_result(
+            "thr_missing",
+            true,
+            Err(anyhow!("thread/read: thread not loaded: thr_missing")),
+            Err(anyhow!(
+                "thread/read: includeTurns is unavailable before first user message"
+            )),
+            Some(Err(anyhow!(
+                "thread/realtime/start: requires experimentalApi capability"
+            ))),
+            Some(Err(anyhow!("thread/realtime/stop: no rollout found for thread id"))),
+        );
+
+        assert_eq!(
+            payload["checks"]["readWithTurns"]["error"]["code"],
+            "thread_not_loaded"
+        );
+        assert_eq!(
+            payload["checks"]["readWithoutTurns"]["error"]["code"],
+            "thread_not_materialized"
+        );
+        assert_eq!(
+            payload["checks"]["realtimeStart"]["error"]["code"],
+            "experimental_api_required"
+        );
+        assert_eq!(
+            payload["checks"]["realtimeStop"]["error"]["code"],
+            "thread_no_rollout"
+        );
+    }
+
+    #[test]
+    fn app_server_initialize_params_negotiates_experimental_api() {
+        let stable = initialize_params(false);
+        assert_eq!(stable["capabilities"], json!({}));
+
+        let experimental = initialize_params(true);
+        assert_eq!(experimental["capabilities"]["experimentalApi"], true);
+        assert_eq!(experimental["clientInfo"]["name"], "codex-hermes-bridge-rs");
+    }
+
+    #[test]
+    fn app_server_message_parser_preserves_notifications() {
+        let mut notifications = Vec::new();
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": { "threadId": "thr_1" }
+        });
+        let parsed = handle_app_server_message(&notification, 7, &mut notifications)
+            .expect("notification parse");
+        assert!(parsed.is_none());
+        assert_eq!(notifications, vec![notification]);
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": { "ok": true }
+        });
+        let parsed = handle_app_server_message(&response, 7, &mut notifications)
+            .expect("response parse");
+        assert_eq!(parsed, Some(json!({ "ok": true })));
     }
 
     #[test]
