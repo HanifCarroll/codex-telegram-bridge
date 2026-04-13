@@ -13,11 +13,15 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn fixture_path() -> Option<PathBuf> {
-    env::var("CODEX_HERMES_BRIDGE_FIXTURE").ok().map(PathBuf::from)
+    env::var("CODEX_HERMES_BRIDGE_FIXTURE")
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn fixture_actions_log_path() -> Option<PathBuf> {
-    env::var("CODEX_HERMES_BRIDGE_ACTIONS_LOG").ok().map(PathBuf::from)
+    env::var("CODEX_HERMES_BRIDGE_ACTIONS_LOG")
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn fixture_threads() -> Result<Option<Vec<Value>>> {
@@ -639,14 +643,17 @@ fn run() -> Result<()> {
             for event in &events {
                 println!("{}", serde_json::to_string(event)?);
             }
-            println!("{}", serde_json::to_string(&json!({
-                "ok": true,
-                "action": "follow",
-                "threadId": thread_id,
-                "durationMs": duration,
-                "experimentalRealtime": experimental_realtime,
-                "events": events
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "ok": true,
+                    "action": "follow",
+                    "threadId": thread_id,
+                    "durationMs": duration,
+                    "experimentalRealtime": experimental_realtime,
+                    "events": events
+                }))?
+            );
         }
         Commands::StatusAudit { thread_id } => {
             let now = now_millis()?;
@@ -656,7 +663,10 @@ fn run() -> Result<()> {
                 let mut client = CodexAppServerClient::connect()?;
                 sync_state_from_live(&mut client, &conn, now, 50, false)?;
             }
-            println!("{}", serde_json::to_string(&get_status_audit(&conn, thread_id.as_deref())?)?);
+            println!(
+                "{}",
+                serde_json::to_string(&get_status_audit(&conn, thread_id.as_deref())?)?
+            );
         }
         Commands::Unarchive { thread_id, dry_run } => {
             let now = now_millis()?;
@@ -668,7 +678,16 @@ fn run() -> Result<()> {
                 let mut client = CodexAppServerClient::connect()?;
                 Some(client.request("thread/unarchive", json!({ "threadId": thread_id }))?)
             };
-            println!("{}", serde_json::to_string(&unarchive_thread_result(&conn, &thread_id, dry_run, now, live_result)?)?);
+            println!(
+                "{}",
+                serde_json::to_string(&unarchive_thread_result(
+                    &conn,
+                    &thread_id,
+                    dry_run,
+                    now,
+                    live_result
+                )?)?
+            );
         }
         Commands::Brief { query, limit } => {
             let built = build_brief(&query.join(" "), limit)?;
@@ -738,7 +757,8 @@ fn run() -> Result<()> {
                     let mut client = CodexAppServerClient::connect()?;
                     let sync_result = sync_state_from_live(&mut client, &conn, now, 50, true)?;
                     let notifications = client.drain_notifications();
-                    let filtered = watch_events_from_sync_result(&sync_result, notifications, filter.as_ref());
+                    let filtered =
+                        watch_events_from_sync_result(&sync_result, notifications, filter.as_ref());
                     for event in &filtered {
                         if let Some(command) = exec.as_deref() {
                             run_exec_hook(command, event)?;
@@ -755,7 +775,12 @@ fn run() -> Result<()> {
                 }
                 println!("{}", serde_json::to_string(&json!({ "events": filtered }))?);
             } else {
-                println!("{}", serde_json::to_string(&json!({ "type": "watch_started", "away": get_away_mode(&conn)?["away"] }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &json!({ "type": "watch_started", "away": get_away_mode(&conn)?["away"] })
+                    )?
+                );
                 let mut last = String::new();
                 let watch_rx = start_codex_watch_receiver().ok();
                 loop {
@@ -778,7 +803,7 @@ fn run() -> Result<()> {
                         }
                     }
                     if let Some(rx) = watch_rx.as_ref() {
-                        let _ = rx.recv_timeout(std::time::Duration::from_millis(1500));
+                        rx.recv_timeout(std::time::Duration::from_millis(1500));
                     } else {
                         std::thread::sleep(std::time::Duration::from_millis(1500));
                     }
@@ -811,14 +836,17 @@ fn run() -> Result<()> {
             let mut client = CodexAppServerClient::connect()?;
             sync_state_from_live(&mut client, &conn, now, 50, false)?;
             let result = list_changes_since_last_check(&conn, now)?;
-            println!("{}", serde_json::to_string(&json!({
-                "summary": {
-                    "count": result.summary.total_count,
-                    "lastCheckedAt": result.summary.last_checked_at,
-                    "currentCursor": result.summary.current_cursor
-                },
-                "threads": result.threads
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "summary": {
+                        "count": result.summary.total_count,
+                        "lastCheckedAt": result.summary.last_checked_at,
+                        "currentCursor": result.summary.current_cursor
+                    },
+                    "threads": result.threads
+                }))?
+            );
         }
         Commands::Done => {
             let now = now_millis()?;
@@ -827,27 +855,33 @@ fn run() -> Result<()> {
             let mut client = CodexAppServerClient::connect()?;
             sync_state_from_live(&mut client, &conn, now, 50, false)?;
             let result = list_done_since_last_check(&conn, now)?;
-            println!("{}", serde_json::to_string(&json!({
-                "summary": {
-                    "count": result.summary.total_count,
-                    "lastCheckedAt": result.summary.last_checked_at,
-                    "currentCursor": result.summary.current_cursor
-                },
-                "threads": result.threads
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "summary": {
+                        "count": result.summary.total_count,
+                        "lastCheckedAt": result.summary.last_checked_at,
+                        "currentCursor": result.summary.current_cursor
+                    },
+                    "threads": result.threads
+                }))?
+            );
         }
         Commands::History { thread_id, limit } => {
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             let actions = get_thread_history(&conn, &thread_id, limit)?;
-            println!("{}", serde_json::to_string(&json!({
-                "threadId": thread_id,
-                "actions": actions.iter().map(|action| json!({
-                    "actionType": action.action_type,
-                    "createdAt": action.created_at,
-                    "payload": action.payload
-                })).collect::<Vec<_>>()
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "threadId": thread_id,
+                    "actions": actions.iter().map(|action| json!({
+                        "actionType": action.action_type,
+                        "createdAt": action.created_at,
+                        "payload": action.payload
+                    })).collect::<Vec<_>>()
+                }))?
+            );
         }
         Commands::New {
             cwd,
@@ -866,7 +900,13 @@ fn run() -> Result<()> {
                 (!joined.is_empty()).then_some(joined)
             });
             if dry_run {
-                println!("{}", serde_json::to_string(&start_new_thread_dry_run(cwd.as_deref(), message.as_deref()))?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&start_new_thread_dry_run(
+                        cwd.as_deref(),
+                        message.as_deref()
+                    ))?
+                );
             } else {
                 let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let created = client.request(
@@ -902,12 +942,14 @@ fn run() -> Result<()> {
                             result.clone(),
                             &mut client,
                             &conn,
-                            thread_id,
-                            duration,
-                            poll_interval,
-                            experimental_realtime,
-                            filter.as_ref(),
-                            stream,
+                            FollowRun {
+                                thread_id,
+                                duration_ms: duration,
+                                poll_interval_ms: poll_interval,
+                                experimental_realtime,
+                                event_filter: filter.as_ref(),
+                                stream,
+                            },
                         )?
                     } else {
                         result
@@ -935,7 +977,10 @@ fn run() -> Result<()> {
                 (!joined.is_empty()).then_some(joined)
             });
             if dry_run {
-                println!("{}", serde_json::to_string(&fork_thread_dry_run(&thread_id, message.as_deref()))?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&fork_thread_dry_run(&thread_id, message.as_deref()))?
+                );
             } else {
                 let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let forked = client.request("thread/fork", json!({ "threadId": thread_id }))?;
@@ -945,17 +990,19 @@ fn run() -> Result<()> {
                     .and_then(Value::as_str)
                     .map(|value| value.to_string());
                 let started = match (new_thread_id.as_deref(), message.as_deref()) {
-                    (Some(new_thread_id), Some(message)) if !message.trim().is_empty() => Some(client.request(
-                        "turn/start",
-                        json!({
-                            "threadId": new_thread_id,
-                            "input": [{
-                                "type": "text",
-                                "text": message.trim(),
-                                "text_elements": []
-                            }]
-                        }),
-                    )?),
+                    (Some(new_thread_id), Some(message)) if !message.trim().is_empty() => {
+                        Some(client.request(
+                            "turn/start",
+                            json!({
+                                "threadId": new_thread_id,
+                                "input": [{
+                                    "type": "text",
+                                    "text": message.trim(),
+                                    "text_elements": []
+                                }]
+                            }),
+                        )?)
+                    }
                     _ => None,
                 };
                 let result = json!({
@@ -976,12 +1023,14 @@ fn run() -> Result<()> {
                             result.clone(),
                             &mut client,
                             &conn,
-                            thread_id,
-                            duration,
-                            poll_interval,
-                            experimental_realtime,
-                            filter.as_ref(),
-                            stream,
+                            FollowRun {
+                                thread_id,
+                                duration_ms: duration,
+                                poll_interval_ms: poll_interval,
+                                experimental_realtime,
+                                event_filter: filter.as_ref(),
+                                stream,
+                            },
                         )?
                     } else {
                         result
@@ -1026,22 +1075,32 @@ fn run() -> Result<()> {
                 yes,
                 now,
             )?;
-            if dry_run || thread_id.is_none() {
+            if dry_run {
                 println!("{}", serde_json::to_string(&preview)?);
-            } else {
-                let target = thread_id.expect("thread_id should exist");
+            } else if let Some(target) = thread_id {
                 let result = client.request("thread/archive", json!({ "threadId": target }))?;
-                record_action(&conn, &target, "archive", json!({ "result": result, "archivedAt": now }), now)?;
-                println!("{}", serde_json::to_string(&json!({
-                    "ok": true,
-                    "action": "archive",
-                    "dryRun": false,
-                    "results": [{
-                        "threadId": target,
-                        "status": "archived",
-                        "result": result
-                    }]
-                }))?);
+                record_action(
+                    &conn,
+                    &target,
+                    "archive",
+                    json!({ "result": result, "archivedAt": now }),
+                    now,
+                )?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "ok": true,
+                        "action": "archive",
+                        "dryRun": false,
+                        "results": [{
+                            "threadId": target,
+                            "status": "archived",
+                            "result": result
+                        }]
+                    }))?
+                );
+            } else {
+                println!("{}", serde_json::to_string(&preview)?);
             }
         }
         Commands::Show { thread_id } => {
@@ -1171,12 +1230,14 @@ fn run() -> Result<()> {
                         result,
                         &mut client,
                         &conn,
-                        &thread_id,
-                        duration,
-                        poll_interval,
-                        experimental_realtime,
-                        filter.as_ref(),
-                        stream,
+                        FollowRun {
+                            thread_id: &thread_id,
+                            duration_ms: duration,
+                            poll_interval_ms: poll_interval,
+                            experimental_realtime,
+                            event_filter: filter.as_ref(),
+                            stream,
+                        },
                     )?
                 } else {
                     result
@@ -1283,12 +1344,14 @@ fn run() -> Result<()> {
                         result,
                         &mut client,
                         &conn,
-                        &thread_id,
-                        duration,
-                        poll_interval,
-                        experimental_realtime,
-                        filter.as_ref(),
-                        stream,
+                        FollowRun {
+                            thread_id: &thread_id,
+                            duration_ms: duration,
+                            poll_interval_ms: poll_interval,
+                            experimental_realtime,
+                            event_filter: filter.as_ref(),
+                            stream,
+                        },
                     )?
                 } else {
                     result
@@ -1419,9 +1482,7 @@ fn find_last_message_by_type(thread: &Value, item_type: &str) -> Option<String> 
 
 fn latest_question(thread: &Value) -> Option<String> {
     let last_user_message = find_last_message_by_type(thread, "userMessage")?;
-    last_user_message
-        .contains('?')
-        .then_some(last_user_message)
+    last_user_message.contains('?').then_some(last_user_message)
 }
 
 fn show_pending_prompt(status_flags: &[String]) -> Option<Value> {
@@ -1705,7 +1766,6 @@ fn classify_inbox_item(snapshot: &BridgeThreadSnapshot, now: u64) -> InboxItem {
     }
 }
 
-
 #[derive(Debug, Clone)]
 struct HistoryAction {
     action_type: String,
@@ -1844,7 +1904,11 @@ fn set_setting(conn: &Connection, key: &str, value: u64) -> Result<()> {
     Ok(())
 }
 
-fn upsert_thread_snapshot(conn: &Connection, snapshot: &BridgeThreadSnapshot, now: u64) -> Result<()> {
+fn upsert_thread_snapshot(
+    conn: &Connection,
+    snapshot: &BridgeThreadSnapshot,
+    now: u64,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO threads_cache(
             thread_id, name, cwd, source, status_type, status_flags_json,
@@ -2010,12 +2074,7 @@ fn record_delivery(
     let changed = conn.execute(
         "INSERT OR IGNORE INTO delivery_log(event_key, thread_id, event_type, delivered_at)
          VALUES (?1, ?2, ?3, ?4)",
-        params![
-            event_key,
-            thread_id,
-            event_type,
-            to_sql_i64(delivered_at)?
-        ],
+        params![event_key, thread_id, event_type, to_sql_i64(delivered_at)?],
     )?;
     Ok(changed > 0)
 }
@@ -2044,18 +2103,13 @@ fn reconcile_thread_snapshots(
                 "thread_waiting:{}:{}:{}",
                 snapshot.thread_id,
                 prompt.prompt_id,
-                snapshot.updated_at
+                snapshot
+                    .updated_at
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string())
             );
             let should_emit = !record_deliveries
-                || record_delivery(
-                    conn,
-                    &event_key,
-                    &snapshot.thread_id,
-                    "thread_waiting",
-                    now,
-                )?;
+                || record_delivery(conn, &event_key, &snapshot.thread_id, "thread_waiting", now)?;
             if should_emit {
                 events.push(json!({
                     "type": "thread_waiting",
@@ -2072,7 +2126,8 @@ fn reconcile_thread_snapshots(
             let event_key = format!(
                 "thread_completed:{}:{}",
                 snapshot.thread_id,
-                snapshot.updated_at
+                snapshot
+                    .updated_at
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string())
             );
@@ -2201,7 +2256,10 @@ fn list_waiting_from_db(
     Ok(WaitingResult {
         summary: WaitingSummary {
             count: threads.len(),
-            thread_ids: threads.iter().map(|thread| thread.thread_id.clone()).collect(),
+            thread_ids: threads
+                .iter()
+                .map(|thread| thread.thread_id.clone())
+                .collect(),
             labels: threads.iter().map(|thread| thread.label.clone()).collect(),
             applied_filters: json!({ "project": project_filter, "limit": limit }),
         },
@@ -2417,17 +2475,14 @@ fn list_inbox_from_db(
                 prompt_status,
                 question,
             )| {
-                let status_flags = serde_json::from_str::<Vec<String>>(&status_flags_json)
-                    .unwrap_or_default();
-                let pending_prompt = match prompt_kind.clone() {
-                    Some(kind) => Some(PendingPrompt {
-                        prompt_id: format!("{}:{}", kind, thread_id),
-                        kind,
-                        status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
-                        question,
-                    }),
-                    None => None,
-                };
+                let status_flags =
+                    serde_json::from_str::<Vec<String>>(&status_flags_json).unwrap_or_default();
+                let pending_prompt = prompt_kind.clone().map(|kind| PendingPrompt {
+                    prompt_id: format!("{}:{}", kind, thread_id),
+                    kind,
+                    status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
+                    question,
+                });
                 let snapshot = BridgeThreadSnapshot {
                     thread_id,
                     name,
@@ -2468,7 +2523,7 @@ fn list_inbox_from_db(
         items.retain(|item| item.waiting_on == waiting_on);
     }
 
-    items.sort_by(|left, right| score_inbox_item(right).cmp(&score_inbox_item(left)));
+    items.sort_by_key(|item| std::cmp::Reverse(score_inbox_item(item)));
     if limit > 0 {
         items.truncate(limit as usize);
     }
@@ -2544,7 +2599,11 @@ fn archive_from_db(
         vec![thread_id.to_string()]
     } else {
         let inbox = list_inbox_from_db(conn, now, None, None, attention, None, 100)?;
-        inbox.items.into_iter().map(|item| item.thread_id).collect::<Vec<_>>()
+        inbox
+            .items
+            .into_iter()
+            .map(|item| item.thread_id)
+            .collect::<Vec<_>>()
     };
 
     let using_filter_selection = thread_id.is_none() && attention.is_some();
@@ -2725,16 +2784,28 @@ fn get_setting_text(conn: &Connection, key: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-fn render_notification_message(
-    kind: &str,
-    display_name: &str,
-    project: &str,
-    cwd: Option<&str>,
-    summary: Option<&str>,
-    detail: Option<&str>,
-    recent_action: Option<&str>,
-    next_step: Option<&str>,
-) -> String {
+struct NotificationMessage<'a> {
+    kind: &'a str,
+    display_name: &'a str,
+    project: &'a str,
+    cwd: Option<&'a str>,
+    summary: Option<&'a str>,
+    detail: Option<&'a str>,
+    recent_action: Option<&'a str>,
+    next_step: Option<&'a str>,
+}
+
+fn render_notification_message(message: NotificationMessage<'_>) -> String {
+    let NotificationMessage {
+        kind,
+        display_name,
+        project,
+        cwd,
+        summary,
+        detail,
+        recent_action,
+        next_step,
+    } = message;
     let type_label = match kind {
         "thread_waiting" => "waiting",
         "thread_completed" => "completed",
@@ -2791,7 +2862,11 @@ fn describe_recent_action(action_type: Option<&str>) -> Option<String> {
 }
 
 fn recent_action_label(action: Option<&Value>) -> Option<String> {
-    describe_recent_action(action.and_then(|value| value.get("actionType")).and_then(Value::as_str))
+    describe_recent_action(
+        action
+            .and_then(|value| value.get("actionType"))
+            .and_then(Value::as_str),
+    )
 }
 
 fn get_away_mode(conn: &Connection) -> Result<Value> {
@@ -2803,7 +2878,8 @@ fn get_away_mode(conn: &Connection) -> Result<Value> {
         }
     }
     let existing_session = get_setting_text(conn, "away_session_id")?;
-    let away_session_id = existing_session.or_else(|| away_started_at.map(|value| value.to_string()));
+    let away_session_id =
+        existing_session.or_else(|| away_started_at.map(|value| value.to_string()));
     if let Some(session_id) = away_session_id.as_deref() {
         if get_setting_text(conn, "away_session_id")?.is_none() {
             conn.execute(
@@ -2840,8 +2916,14 @@ fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<Value> {
             "awaySessionId": now.to_string()
         }))
     } else {
-        conn.execute("DELETE FROM settings WHERE key = ?1", params!["away_started_at"])?;
-        conn.execute("DELETE FROM settings WHERE key = ?1", params!["away_session_id"])?;
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params!["away_started_at"],
+        )?;
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params!["away_session_id"],
+        )?;
         Ok(json!({
             "ok": true,
             "away": false,
@@ -2889,17 +2971,20 @@ fn build_show_thread_result(
     requested_thread_id: &str,
     response: Value,
 ) -> Result<Value> {
-    let thread = response
-        .get("thread")
-        .cloned()
-        .unwrap_or(response);
+    let thread = response.get("thread").cloned().unwrap_or(response);
     let thread_id = thread
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or(requested_thread_id)
         .to_string();
-    let name = thread.get("name").and_then(Value::as_str).map(str::to_string);
-    let cwd = thread.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let name = thread
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let cwd = thread
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let project = derive_project_label(cwd.as_deref());
     let status_type = thread
         .pointer("/status/type")
@@ -2947,9 +3032,7 @@ fn build_show_thread_result(
     let display_name = derive_thread_display_name(
         name.as_deref(),
         project.as_deref(),
-        latest_question
-            .as_deref()
-            .or(last_user_message.as_deref()),
+        latest_question.as_deref().or(last_user_message.as_deref()),
         &thread_id,
     );
     let delta_summary = build_delta_summary(
@@ -2998,7 +3081,11 @@ fn get_status_audit(conn: &Connection, thread_id: Option<&str>) -> Result<Value>
     let audits = inbox
         .items
         .into_iter()
-        .filter(|item| thread_id.map(|target| item.thread_id == target).unwrap_or(true))
+        .filter(|item| {
+            thread_id
+                .map(|target| item.thread_id == target)
+                .unwrap_or(true)
+        })
         .map(|item| {
             json!({
                 "threadId": item.thread_id,
@@ -3109,14 +3196,15 @@ fn doctor_realtime_result(
 }
 
 fn parse_event_filter(input: Option<&str>) -> Option<BTreeSet<String>> {
-    input.map(|value| {
-        value
-            .split(',')
-            .map(|item| item.trim().to_string())
-            .filter(|item| !item.is_empty())
-            .collect::<BTreeSet<_>>()
-    })
-    .filter(|set| !set.is_empty())
+    input
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<BTreeSet<_>>()
+        })
+        .filter(|set| !set.is_empty())
 }
 
 fn should_emit_event(filter: Option<&BTreeSet<String>>, event: &Value) -> bool {
@@ -3165,13 +3253,20 @@ fn normalize_notification_event(notification: &Value) -> Value {
     }
 }
 
-fn push_follow_event(events: &mut Vec<Value>, event_filter: Option<&BTreeSet<String>>, event: Value) {
+fn push_follow_event(
+    events: &mut Vec<Value>,
+    event_filter: Option<&BTreeSet<String>>,
+    event: Value,
+) {
     if should_emit_event(event_filter, &event) {
         events.push(event);
     }
 }
 
-fn read_thread_with_turns_fallback(client: &mut CodexAppServerClient, thread_id: &str) -> Result<Value> {
+fn read_thread_with_turns_fallback(
+    client: &mut CodexAppServerClient,
+    thread_id: &str,
+) -> Result<Value> {
     match client.request(
         "thread/read",
         json!({ "threadId": thread_id, "includeTurns": true }),
@@ -3282,8 +3377,8 @@ fn collect_follow_events(
                     "thread": thread.get("thread").cloned().unwrap_or(Value::Null)
                 }),
             );
-            next_poll_at = std::time::Instant::now()
-                + std::time::Duration::from_millis(poll_interval_ms);
+            next_poll_at =
+                std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -3319,7 +3414,12 @@ fn collect_follow_events(
     Ok(events)
 }
 
-fn persist_follow_events(conn: &Connection, thread_id: &str, events: &[Value], now: u64) -> Result<()> {
+fn persist_follow_events(
+    conn: &Connection,
+    thread_id: &str,
+    events: &[Value],
+    now: u64,
+) -> Result<()> {
     let latest_snapshot = events
         .iter()
         .rev()
@@ -3337,34 +3437,41 @@ fn persist_follow_events(conn: &Connection, thread_id: &str, events: &[Value], n
             Some("task_complete") | Some("turn.completed")
         )
     }) {
-        conn.execute("DELETE FROM pending_prompts WHERE thread_id = ?1", params![thread_id])?;
+        conn.execute(
+            "DELETE FROM pending_prompts WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
     }
 
     Ok(())
+}
+
+struct FollowRun<'a> {
+    thread_id: &'a str,
+    duration_ms: u64,
+    poll_interval_ms: u64,
+    experimental_realtime: bool,
+    event_filter: Option<&'a BTreeSet<String>>,
+    stream: bool,
 }
 
 fn attach_follow_result(
     mut result: Value,
     client: &mut CodexAppServerClient,
     conn: &Connection,
-    thread_id: &str,
-    duration_ms: u64,
-    poll_interval_ms: u64,
-    experimental_realtime: bool,
-    event_filter: Option<&BTreeSet<String>>,
-    stream: bool,
+    follow: FollowRun<'_>,
 ) -> Result<Value> {
     let events = collect_follow_events(
         client,
-        thread_id,
+        follow.thread_id,
         None,
-        duration_ms,
-        poll_interval_ms,
-        experimental_realtime,
-        event_filter,
+        follow.duration_ms,
+        follow.poll_interval_ms,
+        follow.experimental_realtime,
+        follow.event_filter,
     )?;
-    persist_follow_events(conn, thread_id, &events, now_millis()?)?;
-    if stream {
+    persist_follow_events(conn, follow.thread_id, &events, now_millis()?)?;
+    if follow.stream {
         for event in &events {
             println!("{}", serde_json::to_string(event)?);
         }
@@ -3376,53 +3483,58 @@ fn attach_follow_result(
     result["follow"] = json!({
         "ok": true,
         "action": "follow",
-        "threadId": thread_id,
-        "durationMs": duration_ms,
-        "experimentalRealtime": experimental_realtime,
+        "threadId": follow.thread_id,
+        "durationMs": follow.duration_ms,
+        "experimentalRealtime": follow.experimental_realtime,
         "events": events
     });
     Ok(result)
 }
 
-fn build_follow_events(
-    thread_id: &str,
+#[cfg(test)]
+struct FollowEventsFixture<'a> {
+    thread_id: &'a str,
     duration_ms: u64,
     poll_interval_ms: u64,
     experimental_realtime: bool,
     initial_thread: Option<Value>,
     started: Option<Value>,
     notifications: Vec<Value>,
-    event_filter: Option<&BTreeSet<String>>,
-) -> Result<Vec<Value>> {
+    event_filter: Option<&'a BTreeSet<String>>,
+}
+
+#[cfg(test)]
+fn build_follow_events(fixture: FollowEventsFixture<'_>) -> Result<Vec<Value>> {
     let mut events = vec![json!({
         "type": "follow_started",
-        "threadId": thread_id,
-        "durationMs": duration_ms,
-        "pollIntervalMs": poll_interval_ms,
-        "experimentalRealtime": experimental_realtime
+        "threadId": fixture.thread_id,
+        "durationMs": fixture.duration_ms,
+        "pollIntervalMs": fixture.poll_interval_ms,
+        "experimentalRealtime": fixture.experimental_realtime
     })];
-    if let Some(thread) = initial_thread {
+    if let Some(thread) = fixture.initial_thread {
         events.push(json!({
             "type": "follow_snapshot",
-            "threadId": thread_id,
+            "threadId": fixture.thread_id,
             "thread": thread
         }));
     }
-    if let Some(started) = started {
+    if let Some(started) = fixture.started {
         events.push(json!({
             "type": "follow_turn_started",
-            "threadId": thread_id,
+            "threadId": fixture.thread_id,
             "started": started
         }));
     }
     events.extend(
-        notifications
+        fixture
+            .notifications
             .into_iter()
             .map(|notification| normalize_notification_event(&notification)),
     );
     Ok(events
         .into_iter()
-        .filter(|event| should_emit_event(event_filter, event))
+        .filter(|event| should_emit_event(fixture.event_filter, event))
         .collect())
 }
 
@@ -3566,7 +3678,13 @@ fn truncate_text(value: &str, max_length: usize) -> String {
     if trimmed.chars().count() <= max_length {
         trimmed
     } else {
-        format!("{}…", trimmed.chars().take(max_length.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            trimmed
+                .chars()
+                .take(max_length.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }
 
@@ -3639,15 +3757,28 @@ fn build_brief(query: &str, limit: u64) -> Result<Value> {
             }
             let parsed: Value = serde_json::from_str(row)?;
             if parsed.get("type").and_then(Value::as_str) == Some("session_meta") {
-                cwd = parsed.pointer("/payload/cwd").and_then(Value::as_str).map(|s| s.to_string());
-                meta_timestamp = parsed.pointer("/payload/timestamp").and_then(Value::as_str).map(|s| s.to_string());
+                cwd = parsed
+                    .pointer("/payload/cwd")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
+                meta_timestamp = parsed
+                    .pointer("/payload/timestamp")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
                 continue;
             }
             if parsed.get("type").and_then(Value::as_str) != Some("response_item") {
                 continue;
             }
-            let role = parsed.pointer("/payload/role").and_then(Value::as_str).unwrap_or("");
-            let pieces = parsed.pointer("/payload/content").and_then(Value::as_array).cloned().unwrap_or_default();
+            let role = parsed
+                .pointer("/payload/role")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let pieces = parsed
+                .pointer("/payload/content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let text = pieces
                 .iter()
                 .filter_map(|item| item.get("text").and_then(Value::as_str))
@@ -3658,7 +3789,10 @@ fn build_brief(query: &str, limit: u64) -> Result<Value> {
                 continue;
             }
             let lower = normalized.to_lowercase();
-            let line_score = tokens.iter().filter(|token| lower.contains(token.as_str())).count() as u64;
+            let line_score = tokens
+                .iter()
+                .filter(|token| lower.contains(token.as_str()))
+                .count() as u64;
             if line_score == 0 {
                 continue;
             }
@@ -3673,7 +3807,10 @@ fn build_brief(query: &str, limit: u64) -> Result<Value> {
                 user_asks.push(truncate_text(&normalized, 180));
             } else {
                 why_relevant.push(truncate_text(&normalized, 180));
-                if normalized.contains("should") || normalized.contains("need") || normalized.contains("verified") {
+                if normalized.contains("should")
+                    || normalized.contains("need")
+                    || normalized.contains("verified")
+                {
                     decisions.push(truncate_text(&normalized, 180));
                 }
             }
@@ -3681,17 +3818,20 @@ fn build_brief(query: &str, limit: u64) -> Result<Value> {
         if score == 0 {
             continue;
         }
-        sessions.push((score, json!({
-            "session_id": session_id,
-            "thread_name": entry.get("thread_name").cloned().unwrap_or(Value::Null),
-            "cwd": cwd,
-            "updated_at": meta_timestamp.or_else(|| Some(updated_at.to_string())),
-            "why_relevant": why_relevant.into_iter().take(3).collect::<Vec<_>>(),
-            "user_asks": user_asks.into_iter().take(3).collect::<Vec<_>>(),
-            "decisions": decisions.into_iter().take(3).collect::<Vec<_>>(),
-            "receipts": receipts.into_iter().take(3).collect::<Vec<_>>(),
-            "suggested_show_command": format!("codex-recall show {session_id} --limit 40")
-        })));
+        sessions.push((
+            score,
+            json!({
+                "session_id": session_id,
+                "thread_name": entry.get("thread_name").cloned().unwrap_or(Value::Null),
+                "cwd": cwd,
+                "updated_at": meta_timestamp.or_else(|| Some(updated_at.to_string())),
+                "why_relevant": why_relevant.into_iter().take(3).collect::<Vec<_>>(),
+                "user_asks": user_asks.into_iter().take(3).collect::<Vec<_>>(),
+                "decisions": decisions.into_iter().take(3).collect::<Vec<_>>(),
+                "receipts": receipts.into_iter().take(3).collect::<Vec<_>>(),
+                "suggested_show_command": format!("codex-recall show {session_id} --limit 40")
+            }),
+        ));
     }
     sessions.sort_by(|a, b| b.0.cmp(&a.0));
     let limited = sessions
@@ -3702,7 +3842,11 @@ fn build_brief(query: &str, limit: u64) -> Result<Value> {
     Ok(json!({ "query": query, "sessions": limited }))
 }
 
-fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: bool) -> Result<Value> {
+fn build_notify_away_from_db(
+    conn: &Connection,
+    now: u64,
+    include_completed: bool,
+) -> Result<Value> {
     let away_status = get_away_mode(conn)?;
     let away = away_status
         .get("away")
@@ -3749,16 +3893,19 @@ fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: boo
             delivery_key,
             kind: "thread_waiting",
             thread_id: thread.thread_id.clone(),
-            text: render_notification_message(
-                "thread_waiting",
-                &thread.display_name,
-                thread.project.as_deref().unwrap_or("unknown"),
-                thread.cwd.as_deref(),
-                thread.prompt.question.as_deref(),
-                Some(&thread.prompt.kind),
-                recent_action_label(recent_actions_json(conn, &thread.thread_id, 1)?.first()).as_deref(),
-                Some("Tell me how you want me to reply"),
-            ),
+            text: render_notification_message(NotificationMessage {
+                kind: "thread_waiting",
+                display_name: &thread.display_name,
+                project: thread.project.as_deref().unwrap_or("unknown"),
+                cwd: thread.cwd.as_deref(),
+                summary: thread.prompt.question.as_deref(),
+                detail: Some(&thread.prompt.kind),
+                recent_action: recent_action_label(
+                    recent_actions_json(conn, &thread.thread_id, 1)?.first(),
+                )
+                .as_deref(),
+                next_step: Some("Tell me how you want me to reply"),
+            }),
         });
     }
 
@@ -3788,20 +3935,20 @@ fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: boo
             delivery_key,
             kind,
             thread_id: item.thread_id.clone(),
-            text: render_notification_message(
+            text: render_notification_message(NotificationMessage {
                 kind,
-                &item.display_name,
-                item.project.as_deref().unwrap_or("unknown"),
-                item.cwd.as_deref(),
-                item.last_preview.as_deref(),
-                None,
-                recent_action_label(item.recent_action.as_ref()).as_deref(),
-                Some(if kind == "thread_completed" {
+                display_name: &item.display_name,
+                project: item.project.as_deref().unwrap_or("unknown"),
+                cwd: item.cwd.as_deref(),
+                summary: item.last_preview.as_deref(),
+                detail: None,
+                recent_action: recent_action_label(item.recent_action.as_ref()).as_deref(),
+                next_step: Some(if kind == "thread_completed" {
                     "Tell me if you want me to follow up"
                 } else {
                     "Tell me if you want me to check it"
                 }),
-            ),
+            }),
         });
     }
 
@@ -3838,6 +3985,7 @@ fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: boo
     Ok(json!({ "ok": true, "action": "notify-away", "notifications": notifications }))
 }
 
+#[cfg(test)]
 fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
     let waiting = list_waiting_from_db(conn, None, 100)?;
     Ok(waiting
@@ -4071,7 +4219,10 @@ mod tests {
             "--events",
             "follow_snapshot,item_completed",
         ]);
-        assert!(new_cli.is_ok(), "new should accept TS follow flags: {new_cli:?}");
+        assert!(
+            new_cli.is_ok(),
+            "new should accept TS follow flags: {new_cli:?}"
+        );
 
         let reply_cli = Cli::try_parse_from([
             "codex-hermes-bridge-rs",
@@ -4085,7 +4236,10 @@ mod tests {
             "--events",
             "item_completed",
         ]);
-        assert!(reply_cli.is_ok(), "reply should accept TS follow flags: {reply_cli:?}");
+        assert!(
+            reply_cli.is_ok(),
+            "reply should accept TS follow flags: {reply_cli:?}"
+        );
 
         let approve_cli = Cli::try_parse_from([
             "codex-hermes-bridge-rs",
@@ -4095,7 +4249,10 @@ mod tests {
             "--follow",
             "--stream",
         ]);
-        assert!(approve_cli.is_ok(), "approve should accept positional decision and follow flags: {approve_cli:?}");
+        assert!(
+            approve_cli.is_ok(),
+            "approve should accept positional decision and follow flags: {approve_cli:?}"
+        );
 
         let fork_cli = Cli::try_parse_from([
             "codex-hermes-bridge-rs",
@@ -4106,7 +4263,10 @@ mod tests {
             "--follow",
             "--experimental-realtime",
         ]);
-        assert!(fork_cli.is_ok(), "fork should accept TS follow flags: {fork_cli:?}");
+        assert!(
+            fork_cli.is_ok(),
+            "fork should accept TS follow flags: {fork_cli:?}"
+        );
     }
 
     #[test]
@@ -4126,7 +4286,10 @@ mod tests {
             "5",
             "--dry-run",
         ]);
-        assert!(cli.is_ok(), "archive should accept TS filter flags: {cli:?}");
+        assert!(
+            cli.is_ok(),
+            "archive should accept TS filter flags: {cli:?}"
+        );
     }
 
     #[test]
@@ -4145,7 +4308,9 @@ mod tests {
         let enabled = set_away_mode(&conn, true, 1234).expect("enable away");
         assert_eq!(enabled["away"], true);
         assert_eq!(
-            get_setting_text(&conn, "away").expect("away setting").as_deref(),
+            get_setting_text(&conn, "away")
+                .expect("away setting")
+                .as_deref(),
             Some("true")
         );
         assert_eq!(
@@ -4166,7 +4331,9 @@ mod tests {
             Some(Err(anyhow!(
                 "thread/realtime/start: requires experimentalApi capability"
             ))),
-            Some(Err(anyhow!("thread/realtime/stop: no rollout found for thread id"))),
+            Some(Err(anyhow!(
+                "thread/realtime/stop: no rollout found for thread id"
+            ))),
         );
 
         assert_eq!(
@@ -4215,8 +4382,8 @@ mod tests {
             "id": 7,
             "result": { "ok": true }
         });
-        let parsed = handle_app_server_message(&response, 7, &mut notifications)
-            .expect("response parse");
+        let parsed =
+            handle_app_server_message(&response, 7, &mut notifications).expect("response parse");
         assert_eq!(parsed, Some(json!({ "ok": true })));
     }
 
@@ -4245,14 +4412,14 @@ mod tests {
 
     #[test]
     fn follow_events_filter_normalized_notifications() {
-        let events = build_follow_events(
-            "thr_follow",
-            1000,
-            500,
-            false,
-            Some(json!({"id": "thr_follow"})),
-            None,
-            vec![json!({
+        let events = build_follow_events(FollowEventsFixture {
+            thread_id: "thr_follow",
+            duration_ms: 1000,
+            poll_interval_ms: 500,
+            experimental_realtime: false,
+            initial_thread: Some(json!({"id": "thr_follow"})),
+            started: None,
+            notifications: vec![json!({
                 "method": "item/completed",
                 "params": {
                     "threadId": "thr_follow",
@@ -4260,8 +4427,8 @@ mod tests {
                     "item": { "type": "agentMessage" }
                 }
             })],
-            Some(&BTreeSet::from(["item_completed".to_string()])),
-        )
+            event_filter: Some(&BTreeSet::from(["item_completed".to_string()])),
+        })
         .expect("follow events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "item_completed");
@@ -4466,13 +4633,22 @@ mod tests {
         .expect("show result");
 
         assert_eq!(result["thread"]["threadId"], "thr_show");
-        assert_eq!(result["thread"]["displayName"], "Which option should I pick?");
+        assert_eq!(
+            result["thread"]["displayName"],
+            "Which option should I pick?"
+        );
         assert_eq!(result["thread"]["project"], "project-a");
         assert_eq!(result["thread"]["pendingPrompt"]["kind"], "reply");
         assert_eq!(result["thread"]["canReply"], true);
         assert_eq!(result["thread"]["canApprove"], false);
-        assert_eq!(result["thread"]["lastUserMessage"], "Which option should I pick?");
-        assert_eq!(result["thread"]["latestQuestion"], "Which option should I pick?");
+        assert_eq!(
+            result["thread"]["lastUserMessage"],
+            "Which option should I pick?"
+        );
+        assert_eq!(
+            result["thread"]["latestQuestion"],
+            "Which option should I pick?"
+        );
         assert!(result["thread"]["deltaSummary"]
             .as_str()
             .unwrap()
@@ -4504,13 +4680,9 @@ mod tests {
             Some("completed"),
         );
 
-        let first = reconcile_thread_snapshots(
-            &conn,
-            1200,
-            vec![waiting.clone(), completed.clone()],
-            true,
-        )
-        .expect("first reconcile");
+        let first =
+            reconcile_thread_snapshots(&conn, 1200, vec![waiting.clone(), completed.clone()], true)
+                .expect("first reconcile");
         assert_eq!(first["synced"], 2);
         assert_eq!(first["away"], true);
         assert_eq!(first["threads"][0]["threadId"], "thr_wait");
@@ -4571,7 +4743,8 @@ mod tests {
         assert_eq!(events[0]["thread"]["pendingPrompt"]["promptKind"], "reply");
         assert!(events
             .iter()
-            .any(|event| event["type"] == "item_completed" && event["thread"]["threadId"] == "thr_wait"));
+            .any(|event| event["type"] == "item_completed"
+                && event["thread"]["threadId"] == "thr_wait"));
     }
 
     #[test]
@@ -4595,21 +4768,18 @@ mod tests {
         );
         upsert_thread_snapshot(&conn, &old_waiting, 1300).expect("old waiting");
         upsert_thread_snapshot(&conn, &completed, 1300).expect("completed");
-        record_action(
-            &conn,
-            "thr_done",
-            "reply",
-            json!({"message": "done"}),
-            1250,
-        )
-        .expect("record action");
+        record_action(&conn, "thr_done", "reply", json!({"message": "done"}), 1250)
+            .expect("record action");
         set_away_mode(&conn, true, 1000).expect("away on");
 
         let notify = build_notify_away_from_db(&conn, 1400, true).expect("notify");
         let notifications = notify["notifications"].as_array().unwrap();
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0]["threadId"], "thr_done");
-        assert!(notifications[0]["text"].as_str().unwrap().contains("replied"));
+        assert!(notifications[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("replied"));
     }
 
     #[test]
@@ -4698,16 +4868,16 @@ mod tests {
 
     #[test]
     fn shared_notification_renderer_preserves_context_first() {
-        let rendered = render_notification_message(
-            "thread_completed",
-            "Sample thread",
-            "project-a",
-            Some("/tmp/project-a"),
-            Some("Finished work"),
-            None,
-            Some("Last action: replied"),
-            Some("Tell me if you want me to follow up"),
-        );
+        let rendered = render_notification_message(NotificationMessage {
+            kind: "thread_completed",
+            display_name: "Sample thread",
+            project: "project-a",
+            cwd: Some("/tmp/project-a"),
+            summary: Some("Finished work"),
+            detail: None,
+            recent_action: Some("Last action: replied"),
+            next_step: Some("Tell me if you want me to follow up"),
+        });
         let lines = rendered.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "🔔 Codex update");
         assert!(rendered.contains("• Thread: Sample thread"));
@@ -4741,7 +4911,8 @@ mod tests {
     fn unarchive_dry_run_and_live_record_action() {
         let conn = create_state_db_in_memory().expect("db");
 
-        let dry_run = unarchive_thread_result(&conn, "thr_archived", true, 1000, None).expect("dry run");
+        let dry_run =
+            unarchive_thread_result(&conn, "thr_archived", true, 1000, None).expect("dry run");
         assert_eq!(dry_run["action"], "unarchive");
         assert_eq!(dry_run["results"][0]["status"], "would_unarchive");
 
@@ -4774,7 +4945,10 @@ mod tests {
 
         let audit = get_status_audit(&conn, Some("thr_approve")).expect("audit");
         assert_eq!(audit["audits"][0]["threadId"], "thr_approve");
-        assert_eq!(audit["audits"][0]["derived"]["attentionReason"], "pending_approval");
+        assert_eq!(
+            audit["audits"][0]["derived"]["attentionReason"],
+            "pending_approval"
+        );
         assert_eq!(audit["audits"][0]["derived"]["suggestedAction"], "approve");
         assert_eq!(audit["audits"][0]["derived"]["waitingOn"], "me");
     }
@@ -4798,8 +4972,17 @@ mod tests {
     #[test]
     fn follow_result_emits_started_and_snapshot_events() {
         let thread = json!({"id": "thr_follow", "name": "Follow me"});
-        let events = build_follow_events("thr_follow", 1000, 500, false, Some(thread.clone()), None, vec![], None)
-            .expect("follow events");
+        let events = build_follow_events(FollowEventsFixture {
+            thread_id: "thr_follow",
+            duration_ms: 1000,
+            poll_interval_ms: 500,
+            experimental_realtime: false,
+            initial_thread: Some(thread.clone()),
+            started: None,
+            notifications: vec![],
+            event_filter: None,
+        })
+        .expect("follow events");
         assert_eq!(events[0]["type"], "follow_started");
         assert_eq!(events[1]["type"], "follow_snapshot");
         assert_eq!(events[1]["thread"], thread);
@@ -4840,7 +5023,9 @@ mod tests {
                 json!({"type": "thread_waiting", "threadId": "thr_1"}),
                 json!({"type": "item_completed", "threadId": "thr_1"}),
             ],
-            Some(&std::collections::BTreeSet::from(["item_completed".to_string()])),
+            Some(&std::collections::BTreeSet::from([
+                "item_completed".to_string()
+            ])),
         );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["type"], "item_completed");
@@ -4852,8 +5037,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).expect("mkdir temp");
         let hook_output = temp.join("hook.json");
-        let command = format!("python3 -c \"import sys,pathlib; pathlib.Path(r'{}').write_text(sys.stdin.read())\"", hook_output.display());
-        run_exec_hook(&command, &json!({"type": "thread_waiting", "threadId": "thr_1"})).expect("exec hook");
+        let command = format!(
+            "python3 -c \"import sys,pathlib; pathlib.Path(r'{}').write_text(sys.stdin.read())\"",
+            hook_output.display()
+        );
+        run_exec_hook(
+            &command,
+            &json!({"type": "thread_waiting", "threadId": "thr_1"}),
+        )
+        .expect("exec hook");
         std::thread::sleep(std::time::Duration::from_millis(200));
         let payload = std::fs::read_to_string(hook_output).expect("hook output");
         assert!(payload.contains("thread_waiting"));
