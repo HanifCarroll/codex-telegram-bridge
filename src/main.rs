@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+use notify::Watcher as _;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -726,16 +727,27 @@ fn run() -> Result<()> {
             let conn = create_state_db(&db_path)?;
             if once {
                 let now = now_millis()?;
-                if let Some(threads) = fixture_threads()? {
+                let sync_result = if let Some(threads) = fixture_threads()? {
+                    let mut snapshots = Vec::new();
                     for thread in threads {
                         let snapshot = normalize_thread_snapshot(&thread, &thread)?;
-                        upsert_thread_snapshot(&conn, &snapshot, now)?;
+                        snapshots.push(snapshot);
                     }
+                    reconcile_thread_snapshots(&conn, now, snapshots, true)?
                 } else {
                     let mut client = CodexAppServerClient::connect()?;
-                    sync_state_from_live(&mut client, &conn, now, 50, true)?;
-                }
-                let filtered = filter_watch_events(watch_once_from_db(&conn)?, filter.as_ref());
+                    let sync_result = sync_state_from_live(&mut client, &conn, now, 50, true)?;
+                    let notifications = client.drain_notifications();
+                    let filtered = watch_events_from_sync_result(&sync_result, notifications, filter.as_ref());
+                    for event in &filtered {
+                        if let Some(command) = exec.as_deref() {
+                            run_exec_hook(command, event)?;
+                        }
+                    }
+                    println!("{}", serde_json::to_string(&json!({ "events": filtered }))?);
+                    return Ok(());
+                };
+                let filtered = watch_events_from_sync_result(&sync_result, vec![], filter.as_ref());
                 for event in &filtered {
                     if let Some(command) = exec.as_deref() {
                         run_exec_hook(command, event)?;
@@ -745,11 +757,16 @@ fn run() -> Result<()> {
             } else {
                 println!("{}", serde_json::to_string(&json!({ "type": "watch_started", "away": get_away_mode(&conn)?["away"] }))?);
                 let mut last = String::new();
+                let watch_rx = start_codex_watch_receiver().ok();
                 loop {
                     let now = now_millis()?;
                     let mut client = CodexAppServerClient::connect()?;
-                    sync_state_from_live(&mut client, &conn, now, 50, true)?;
-                    let filtered = filter_watch_events(watch_once_from_db(&conn)?, filter.as_ref());
+                    let sync_result = sync_state_from_live(&mut client, &conn, now, 50, true)?;
+                    let filtered = watch_events_from_sync_result(
+                        &sync_result,
+                        client.drain_notifications(),
+                        filter.as_ref(),
+                    );
                     let serialized = serde_json::to_string(&filtered)?;
                     if serialized != last {
                         last = serialized;
@@ -760,7 +777,11 @@ fn run() -> Result<()> {
                             }
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    if let Some(rx) = watch_rx.as_ref() {
+                        let _ = rx.recv_timeout(std::time::Duration::from_millis(1500));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                    }
                 }
             }
         }
@@ -768,6 +789,10 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
+            if !load_fixture_into_db(&conn, now)? {
+                let mut client = CodexAppServerClient::connect()?;
+                sync_state_from_live(&mut client, &conn, now, 50, true)?;
+            }
             let result = build_notify_away_from_db(&conn, now, completed)?;
             println!("{}", serde_json::to_string(&result)?);
         }
@@ -2752,6 +2777,23 @@ fn render_notification_message(
     lines.join("\n")
 }
 
+fn describe_recent_action(action_type: Option<&str>) -> Option<String> {
+    match action_type {
+        Some("reply") => Some("Last action: replied".to_string()),
+        Some("approve") => Some("Last action: approved".to_string()),
+        Some("fork") => Some("Last action: forked thread".to_string()),
+        Some("new") => Some("Last action: started thread".to_string()),
+        Some("archive") => Some("Last action: archived".to_string()),
+        Some("unarchive") => Some("Last action: unarchived".to_string()),
+        Some(other) => Some(format!("Last action: {other}")),
+        None => None,
+    }
+}
+
+fn recent_action_label(action: Option<&Value>) -> Option<String> {
+    describe_recent_action(action.and_then(|value| value.get("actionType")).and_then(Value::as_str))
+}
+
 fn get_away_mode(conn: &Connection) -> Result<Value> {
     let away_started_at = get_setting_number(conn, "away_started_at")?;
     if get_setting_text(conn, "away")?.is_none() {
@@ -3400,6 +3442,50 @@ fn filter_watch_events(events: Vec<Value>, filter: Option<&BTreeSet<String>>) ->
     }
 }
 
+fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
+    let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else {
+        return event;
+    };
+    let Some(thread) = threads
+        .iter()
+        .find(|thread| thread.get("threadId").and_then(Value::as_str) == Some(thread_id))
+    else {
+        return event;
+    };
+    let mut enriched = event;
+    if let Some(object) = enriched.as_object_mut() {
+        object.insert("thread".to_string(), thread.clone());
+    }
+    enriched
+}
+
+fn watch_events_from_sync_result(
+    sync_result: &Value,
+    notifications: Vec<Value>,
+    filter: Option<&BTreeSet<String>>,
+) -> Vec<Value> {
+    let threads = sync_result
+        .get("threads")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut events = sync_result
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| enrich_event_with_thread(event, &threads))
+        .collect::<Vec<_>>();
+    events.extend(
+        notifications
+            .into_iter()
+            .map(|notification| normalize_notification_event(&notification))
+            .map(|event| enrich_event_with_thread(event, &threads)),
+    );
+    filter_watch_events(events, filter)
+}
+
 fn run_exec_hook(command: &str, event: &Value) -> Result<()> {
     let mut child = Command::new("/bin/sh")
         .arg("-c")
@@ -3414,6 +3500,52 @@ fn run_exec_hook(command: &str, event: &Value) -> Result<()> {
     }
     let _ = child.wait();
     Ok(())
+}
+
+struct CodexWatchReceiver {
+    rx: std::sync::mpsc::Receiver<()>,
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl CodexWatchReceiver {
+    fn recv_timeout(&self, timeout: std::time::Duration) {
+        let _ = self.rx.recv_timeout(timeout);
+        while self.rx.try_recv().is_ok() {}
+    }
+}
+
+fn start_codex_watch_receiver() -> Result<CodexWatchReceiver> {
+    let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
+    let sessions_root = home.join(".codex").join("sessions");
+    let session_index = home.join(".codex").join("session_index.jsonl");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::RecommendedWatcher::new(
+        move |result: notify::Result<notify::Event>| {
+            if result.is_ok() {
+                let _ = tx.send(());
+            }
+        },
+        notify::Config::default(),
+    )?;
+
+    let mut watched_any = false;
+    if sessions_root.exists() {
+        watcher.watch(&sessions_root, notify::RecursiveMode::Recursive)?;
+        watched_any = true;
+    }
+    if session_index.exists() {
+        watcher.watch(&session_index, notify::RecursiveMode::NonRecursive)?;
+        watched_any = true;
+    }
+
+    if !watched_any {
+        bail!("No Codex session paths exist to watch");
+    }
+
+    Ok(CodexWatchReceiver {
+        rx,
+        _watcher: watcher,
+    })
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -3571,9 +3703,19 @@ fn build_brief(query: &str, limit: u64) -> Result<Value> {
 }
 
 fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: bool) -> Result<Value> {
-    let away = get_setting_text(conn, "away_mode")?.unwrap_or_default() == "true";
-    let away_session_id = get_setting_text(conn, "away_session_id")?;
-    let away_started_at = get_setting_number(conn, "away_started_at")?.unwrap_or(0);
+    let away_status = get_away_mode(conn)?;
+    let away = away_status
+        .get("away")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let away_session_id = away_status
+        .get("awaySessionId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let away_started_at = away_status
+        .get("awayStartedAt")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     if !away || away_session_id.is_none() {
         return Ok(json!({ "ok": true, "action": "notify-away", "notifications": [] }));
     }
@@ -3593,6 +3735,9 @@ fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: boo
     let mut candidates = Vec::new();
 
     for thread in waiting.threads {
+        if thread.updated_at.unwrap_or(0) < away_started_at {
+            continue;
+        }
         let delivery_key = format!(
             "{}:thread_waiting:{}:{}:{}",
             away_session_id,
@@ -3611,7 +3756,7 @@ fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: boo
                 thread.cwd.as_deref(),
                 thread.prompt.question.as_deref(),
                 Some(&thread.prompt.kind),
-                None,
+                recent_action_label(recent_actions_json(conn, &thread.thread_id, 1)?.first()).as_deref(),
                 Some("Tell me how you want me to reply"),
             ),
         });
@@ -3650,7 +3795,7 @@ fn build_notify_away_from_db(conn: &Connection, now: u64, include_completed: boo
                 item.cwd.as_deref(),
                 item.last_preview.as_deref(),
                 None,
-                None,
+                recent_action_label(item.recent_action.as_ref()).as_deref(),
                 Some(if kind == "thread_completed" {
                     "Tell me if you want me to follow up"
                 } else {
@@ -4383,6 +4528,88 @@ mod tests {
         let second = reconcile_thread_snapshots(&conn, 1300, vec![waiting, completed], true)
             .expect("second reconcile");
         assert_eq!(second["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn watch_events_from_sync_result_enriches_events_and_notifications() {
+        let sync_result = json!({
+            "threads": [{
+                "threadId": "thr_wait",
+                "name": "Need reply",
+                "cwd": "/tmp/project",
+                "updatedAt": 1000,
+                "statusType": "active",
+                "statusFlags": ["waitingOnUserInput"],
+                "lastTurnStatus": "in_progress",
+                "lastPreview": "Question",
+                "pendingPrompt": {
+                    "promptId": "reply:thr_wait",
+                    "promptKind": "reply",
+                    "promptStatus": "Needs input",
+                    "question": "Question"
+                }
+            }],
+            "events": [{
+                "type": "thread_waiting",
+                "threadId": "thr_wait",
+                "promptKind": "reply",
+                "updatedAt": 1000
+            }]
+        });
+        let events = watch_events_from_sync_result(
+            &sync_result,
+            vec![json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thr_wait",
+                    "turnId": "turn_1",
+                    "item": { "type": "agentMessage" }
+                }
+            })],
+            None,
+        );
+        assert_eq!(events[0]["thread"]["pendingPrompt"]["promptKind"], "reply");
+        assert!(events
+            .iter()
+            .any(|event| event["type"] == "item_completed" && event["thread"]["threadId"] == "thr_wait"));
+    }
+
+    #[test]
+    fn notify_away_skips_old_waiting_and_includes_recent_action() {
+        let conn = create_state_db_in_memory().expect("db");
+        let old_waiting = snapshot_fixture(
+            "thr_old_wait",
+            "/tmp/project-old",
+            500,
+            "active",
+            vec!["waitingOnUserInput"],
+            Some("in_progress"),
+        );
+        let completed = snapshot_fixture(
+            "thr_done",
+            "/tmp/project-done",
+            1200,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+        upsert_thread_snapshot(&conn, &old_waiting, 1300).expect("old waiting");
+        upsert_thread_snapshot(&conn, &completed, 1300).expect("completed");
+        record_action(
+            &conn,
+            "thr_done",
+            "reply",
+            json!({"message": "done"}),
+            1250,
+        )
+        .expect("record action");
+        set_away_mode(&conn, true, 1000).expect("away on");
+
+        let notify = build_notify_away_from_db(&conn, 1400, true).expect("notify");
+        let notifications = notify["notifications"].as_array().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0]["threadId"], "thr_done");
+        assert!(notifications[0]["text"].as_str().unwrap().contains("replied"));
     }
 
     #[test]
