@@ -113,6 +113,8 @@ enum Commands {
         duration: u64,
         #[arg(long = "poll-interval", default_value_t = 1000)]
         poll_interval: u64,
+        #[arg(long)]
+        events: Option<String>,
         #[arg(long = "experimental-realtime", default_value_t = false)]
         experimental_realtime: bool,
     },
@@ -177,6 +179,19 @@ enum Commands {
         message: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+        #[arg(long, default_value_t = 3000)]
+        duration: u64,
+        #[arg(long = "poll-interval", default_value_t = 1000)]
+        poll_interval: u64,
+        #[arg(long)]
+        events: Option<String>,
+        #[arg(long = "experimental-realtime", default_value_t = false)]
+        experimental_realtime: bool,
+        prompt: Vec<String>,
     },
     Fork {
         thread_id: String,
@@ -184,11 +199,32 @@ enum Commands {
         message: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+        #[arg(long, default_value_t = 3000)]
+        duration: u64,
+        #[arg(long = "poll-interval", default_value_t = 1000)]
+        poll_interval: u64,
+        #[arg(long)]
+        events: Option<String>,
+        #[arg(long = "experimental-realtime", default_value_t = false)]
+        experimental_realtime: bool,
+        prompt: Vec<String>,
     },
     Archive {
-        thread_id: Option<String>,
+        #[arg(long = "thread-id")]
+        thread_id_option: Option<String>,
+        thread_ids: Vec<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
         #[arg(long)]
         attention: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
         #[arg(long, default_value_t = false)]
@@ -200,16 +236,42 @@ enum Commands {
     Reply {
         thread_id: String,
         #[arg(long)]
-        message: String,
+        message: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+        #[arg(long, default_value_t = 3000)]
+        duration: u64,
+        #[arg(long = "poll-interval", default_value_t = 1000)]
+        poll_interval: u64,
+        #[arg(long)]
+        events: Option<String>,
+        #[arg(long = "experimental-realtime", default_value_t = false)]
+        experimental_realtime: bool,
+        prompt: Vec<String>,
     },
     Approve {
         thread_id: String,
         #[arg(long)]
-        decision: String,
+        decision: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+        #[arg(long, default_value_t = 3000)]
+        duration: u64,
+        #[arg(long = "poll-interval", default_value_t = 1000)]
+        poll_interval: u64,
+        #[arg(long)]
+        events: Option<String>,
+        #[arg(long = "experimental-realtime", default_value_t = false)]
+        experimental_realtime: bool,
+        positional_decision: Option<String>,
     },
 }
 
@@ -564,6 +626,7 @@ fn run() -> Result<()> {
             message,
             duration,
             poll_interval,
+            events: _,
             experimental_realtime,
         } => {
             let mut client = CodexAppServerClient::connect()?;
@@ -781,7 +844,22 @@ fn run() -> Result<()> {
                 })).collect::<Vec<_>>()
             }))?);
         }
-        Commands::New { cwd, message, dry_run } => {
+        Commands::New {
+            cwd,
+            message,
+            dry_run,
+            follow: _,
+            stream: _,
+            duration: _,
+            poll_interval: _,
+            events: _,
+            experimental_realtime: _,
+            prompt,
+        } => {
+            let message = message.or_else(|| {
+                let joined = prompt.join(" ").trim().to_string();
+                (!joined.is_empty()).then_some(joined)
+            });
             if dry_run {
                 println!("{}", serde_json::to_string(&start_new_thread_dry_run(cwd.as_deref(), message.as_deref()))?);
             } else {
@@ -806,7 +884,22 @@ fn run() -> Result<()> {
                 }))?);
             }
         }
-        Commands::Fork { thread_id, message, dry_run } => {
+        Commands::Fork {
+            thread_id,
+            message,
+            dry_run,
+            follow: _,
+            stream: _,
+            duration: _,
+            poll_interval: _,
+            events: _,
+            experimental_realtime: _,
+            prompt,
+        } => {
+            let message = message.or_else(|| {
+                let joined = prompt.join(" ").trim().to_string();
+                (!joined.is_empty()).then_some(joined)
+            });
             if dry_run {
                 println!("{}", serde_json::to_string(&fork_thread_dry_run(&thread_id, message.as_deref()))?);
             } else {
@@ -842,7 +935,27 @@ fn run() -> Result<()> {
                 }))?);
             }
         }
-        Commands::Archive { thread_id, attention, dry_run, yes } => {
+        Commands::Archive {
+            thread_id_option,
+            thread_ids,
+            project: _,
+            status: _,
+            attention,
+            limit: _,
+            dry_run,
+            yes,
+        } => {
+            let mut targets = Vec::new();
+            if let Some(raw) = thread_id_option {
+                targets.extend(
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                );
+            }
+            targets.extend(thread_ids);
+            let thread_id = targets.first().cloned();
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
@@ -893,8 +1006,22 @@ fn run() -> Result<()> {
             thread_id,
             message,
             dry_run,
+            follow: _,
+            stream: _,
+            duration: _,
+            poll_interval: _,
+            events: _,
+            experimental_realtime: _,
+            prompt,
         } => {
-            let message = message.trim().to_string();
+            let message = message
+                .or_else(|| {
+                    let joined = prompt.join(" ").trim().to_string();
+                    (!joined.is_empty()).then_some(joined)
+                })
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if message.is_empty() {
                 bail!("Reply message cannot be empty");
             }
@@ -972,8 +1099,19 @@ fn run() -> Result<()> {
             thread_id,
             decision,
             dry_run,
+            follow: _,
+            stream: _,
+            duration: _,
+            poll_interval: _,
+            events: _,
+            experimental_realtime: _,
+            positional_decision,
         } => {
-            let normalized = decision.trim().to_lowercase();
+            let normalized = decision
+                .or(positional_decision)
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
             let sent_text = match normalized.as_str() {
                 "approve" => "YES",
                 "deny" => "NO",
@@ -1429,6 +1567,19 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           question TEXT NOT NULL,
           created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS delivery_log (
+          event_key TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          delivered_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notify_delivery_log (
+          delivery_key TEXT PRIMARY KEY,
+          away_session_id TEXT NOT NULL,
+          thread_id TEXT NOT NULL,
+          notification_type TEXT NOT NULL,
+          delivered_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS actions_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           thread_id TEXT NOT NULL,
@@ -1443,7 +1594,7 @@ fn init_state_db(conn: &Connection) -> Result<()> {
 
 fn state_db_path() -> Result<PathBuf> {
     let home = env::var("HOME").context("HOME is not set")?;
-    let dir = PathBuf::from(home).join(".codex-hermes-bridge-rs");
+    let dir = PathBuf::from(home).join(".codex-hermes-bridge");
     fs::create_dir_all(&dir)?;
     Ok(dir.join("state.db"))
 }
@@ -2107,7 +2258,6 @@ fn workspace_roots(start: &Path) -> Vec<PathBuf> {
     roots
 }
 
-#[cfg(test)]
 fn set_setting_text(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO settings(key, value) VALUES (?1, ?2)
@@ -2181,6 +2331,12 @@ fn render_notification_message(
 
 fn get_away_mode(conn: &Connection) -> Result<Value> {
     let away_started_at = get_setting_number(conn, "away_started_at")?;
+    if get_setting_text(conn, "away")?.is_none() {
+        if let Some(legacy) = get_setting_text(conn, "away_mode")? {
+            set_setting_text(conn, "away", &legacy)?;
+            conn.execute("DELETE FROM settings WHERE key = ?1", params!["away_mode"])?;
+        }
+    }
     let existing_session = get_setting_text(conn, "away_session_id")?;
     let away_session_id = existing_session.or_else(|| away_started_at.map(|value| value.to_string()));
     if let Some(session_id) = away_session_id.as_deref() {
@@ -2194,18 +2350,15 @@ fn get_away_mode(conn: &Connection) -> Result<Value> {
     }
     Ok(json!({
         "ok": true,
-        "away": get_setting_text(conn, "away_mode")?.unwrap_or_default() == "true",
+        "away": get_setting_text(conn, "away")?.unwrap_or_default() == "true",
         "awayStartedAt": away_started_at,
         "awaySessionId": away_session_id
     }))
 }
 
 fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<Value> {
-    conn.execute(
-        "INSERT INTO settings(key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params!["away_mode", if away { "true" } else { "false" }],
-    )?;
+    set_setting_text(conn, "away", if away { "true" } else { "false" })?;
+    conn.execute("DELETE FROM settings WHERE key = ?1", params!["away_mode"])?;
 
     if away {
         let session_id = now.to_string();
@@ -2858,6 +3011,105 @@ mod tests {
             Some("Can you confirm the plan?")
         );
         assert_eq!(snapshot.last_turn_status.as_deref(), Some("in_progress"));
+    }
+
+    #[test]
+    fn cli_accepts_ts_composed_follow_flags() {
+        let new_cli = Cli::try_parse_from([
+            "codex-hermes-bridge-rs",
+            "new",
+            "--message",
+            "hello",
+            "--follow",
+            "--stream",
+            "--duration",
+            "500",
+            "--poll-interval",
+            "100",
+            "--events",
+            "follow_snapshot,item_completed",
+        ]);
+        assert!(new_cli.is_ok(), "new should accept TS follow flags: {new_cli:?}");
+
+        let reply_cli = Cli::try_parse_from([
+            "codex-hermes-bridge-rs",
+            "reply",
+            "thr_1",
+            "--message",
+            "ok",
+            "--follow",
+            "--duration",
+            "500",
+            "--events",
+            "item_completed",
+        ]);
+        assert!(reply_cli.is_ok(), "reply should accept TS follow flags: {reply_cli:?}");
+
+        let approve_cli = Cli::try_parse_from([
+            "codex-hermes-bridge-rs",
+            "approve",
+            "thr_1",
+            "approve",
+            "--follow",
+            "--stream",
+        ]);
+        assert!(approve_cli.is_ok(), "approve should accept positional decision and follow flags: {approve_cli:?}");
+
+        let fork_cli = Cli::try_parse_from([
+            "codex-hermes-bridge-rs",
+            "fork",
+            "thr_1",
+            "--message",
+            "try again",
+            "--follow",
+            "--experimental-realtime",
+        ]);
+        assert!(fork_cli.is_ok(), "fork should accept TS follow flags: {fork_cli:?}");
+    }
+
+    #[test]
+    fn cli_accepts_ts_archive_filter_flags() {
+        let cli = Cli::try_parse_from([
+            "codex-hermes-bridge-rs",
+            "archive",
+            "--thread-id",
+            "thr_1,thr_2",
+            "--project",
+            "bridge",
+            "--status",
+            "active",
+            "--attention",
+            "completed",
+            "--limit",
+            "5",
+            "--dry-run",
+        ]);
+        assert!(cli.is_ok(), "archive should accept TS filter flags: {cli:?}");
+    }
+
+    #[test]
+    fn state_schema_matches_ts_bridge_contract() {
+        let conn = create_state_db_in_memory().expect("db");
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .expect("prepare")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("tables");
+        assert!(tables.contains(&"delivery_log".to_string()));
+        assert!(tables.contains(&"notify_delivery_log".to_string()));
+
+        let enabled = set_away_mode(&conn, true, 1234).expect("enable away");
+        assert_eq!(enabled["away"], true);
+        assert_eq!(
+            get_setting_text(&conn, "away").expect("away setting").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            get_setting_text(&conn, "away_mode").expect("legacy away setting"),
+            None
+        );
     }
 
     #[test]
