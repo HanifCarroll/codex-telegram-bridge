@@ -754,10 +754,20 @@ fn run() -> Result<()> {
                     reconcile_thread_snapshots(&conn, now, snapshots, true)?
                 } else {
                     let mut client = CodexAppServerClient::connect()?;
-                    let sync_result = sync_state_from_live(&mut client, &conn, now, 50, true)?;
-                    let notifications = client.drain_notifications();
-                    let filtered =
-                        watch_events_from_sync_result(&sync_result, notifications, filter.as_ref());
+                    let filtered = match sync_state_from_live(&mut client, &conn, now, 50, true) {
+                        Ok(sync_result) => {
+                            let notifications = client.drain_notifications();
+                            watch_events_from_sync_result(
+                                &sync_result,
+                                notifications,
+                                filter.as_ref(),
+                            )
+                        }
+                        Err(error) => filter_watch_events(
+                            vec![watch_thread_error_event(&error)],
+                            filter.as_ref(),
+                        ),
+                    };
                     for event in &filtered {
                         if let Some(command) = exec.as_deref() {
                             run_exec_hook(command, event)?;
@@ -785,12 +795,17 @@ fn run() -> Result<()> {
                 loop {
                     let now = now_millis()?;
                     let mut client = CodexAppServerClient::connect()?;
-                    let sync_result = sync_state_from_live(&mut client, &conn, now, 50, true)?;
-                    let filtered = watch_events_from_sync_result(
-                        &sync_result,
-                        client.drain_notifications(),
-                        filter.as_ref(),
-                    );
+                    let filtered = match sync_state_from_live(&mut client, &conn, now, 50, true) {
+                        Ok(sync_result) => watch_events_from_sync_result(
+                            &sync_result,
+                            client.drain_notifications(),
+                            filter.as_ref(),
+                        ),
+                        Err(error) => filter_watch_events(
+                            vec![watch_thread_error_event(&error)],
+                            filter.as_ref(),
+                        ),
+                    };
                     let serialized = serde_json::to_string(&filtered)?;
                     if serialized != last {
                         last = serialized;
@@ -3797,6 +3812,13 @@ fn filter_watch_events(events: Vec<Value>, filter: Option<&BTreeSet<String>>) ->
     }
 }
 
+fn watch_thread_error_event(error: &anyhow::Error) -> Value {
+    json!({
+        "type": "thread_error",
+        "message": error.to_string()
+    })
+}
+
 fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
     let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else {
         return event;
@@ -5412,6 +5434,19 @@ mod tests {
         );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["type"], "item_completed");
+    }
+
+    #[test]
+    fn watch_thread_error_event_matches_ts_stream_shape() {
+        let event = watch_thread_error_event(&anyhow!("sync failed"));
+        assert_eq!(event["type"], "thread_error");
+        assert_eq!(event["message"], "sync failed");
+
+        let filtered = filter_watch_events(
+            vec![event],
+            Some(&BTreeSet::from(["thread_waiting".to_string()])),
+        );
+        assert!(filtered.is_empty());
     }
 
     #[test]
