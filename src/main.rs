@@ -645,14 +645,13 @@ fn run() -> Result<()> {
             }
             println!(
                 "{}",
-                serde_json::to_string(&json!({
-                    "ok": true,
-                    "action": "follow",
-                    "threadId": thread_id,
-                    "durationMs": duration,
-                    "experimentalRealtime": experimental_realtime,
-                    "events": events
-                }))?
+                serde_json::to_string(&follow_result_summary(
+                    &thread_id,
+                    duration,
+                    experimental_realtime,
+                    &events,
+                    false,
+                ))?
             );
         }
         Commands::StatusAudit { thread_id } => {
@@ -815,7 +814,7 @@ fn run() -> Result<()> {
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             if !load_fixture_into_db(&conn, now)? {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = CodexAppServerClient::connect_with_options(true)?;
                 sync_state_from_live(&mut client, &conn, now, 50, true)?;
             }
             let result = build_notify_away_from_db(&conn, now, completed)?;
@@ -895,7 +894,7 @@ fn run() -> Result<()> {
             experimental_realtime,
             prompt,
         } => {
-            let message = message.or_else(|| {
+            let message = normalized_message(message.as_deref()).or_else(|| {
                 let joined = prompt.join(" ").trim().to_string();
                 (!joined.is_empty()).then_some(joined)
             });
@@ -911,28 +910,18 @@ fn run() -> Result<()> {
                 let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let created = client.request(
                     "thread/start",
-                    json!({
-                        "cwd": cwd,
-                        "input": message.as_deref().map(|text| vec![json!({
-                            "type": "text",
-                            "text": text.trim(),
-                            "text_elements": []
-                        })])
-                    }),
+                    thread_start_params(cwd.as_deref(), message.as_deref()),
                 )?;
-                let thread_id = created
-                    .get("thread")
-                    .and_then(|thread| thread.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let result = json!({
-                    "ok": true,
-                    "action": "new",
-                    "threadId": thread_id,
-                    "cwd": cwd,
-                    "message": message,
-                    "created": created
-                });
+                let thread_id = thread_id_from_response(&created);
+                let started = match (thread_id.as_deref(), message.as_deref()) {
+                    (Some(thread_id), Some(message)) => Some(client.request(
+                        "turn/start",
+                        turn_start_params(thread_id, cwd.as_deref(), message),
+                    )?),
+                    _ => None,
+                };
+                let result =
+                    new_thread_live_result(cwd.as_deref(), message.as_deref(), created, started);
                 let result = if follow {
                     let db_path = state_db_path()?;
                     let conn = create_state_db(&db_path)?;
@@ -972,7 +961,7 @@ fn run() -> Result<()> {
             experimental_realtime,
             prompt,
         } => {
-            let message = message.or_else(|| {
+            let message = normalized_message(message.as_deref()).or_else(|| {
                 let joined = prompt.join(" ").trim().to_string();
                 (!joined.is_empty()).then_some(joined)
             });
@@ -984,36 +973,19 @@ fn run() -> Result<()> {
             } else {
                 let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let forked = client.request("thread/fork", json!({ "threadId": thread_id }))?;
-                let new_thread_id = forked
-                    .get("thread")
-                    .and_then(|thread| thread.get("id"))
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string());
+                let new_thread_id = thread_id_from_response(&forked);
+                let forked_cwd = thread_cwd_from_response(&forked, None);
                 let started = match (new_thread_id.as_deref(), message.as_deref()) {
                     (Some(new_thread_id), Some(message)) if !message.trim().is_empty() => {
                         Some(client.request(
                             "turn/start",
-                            json!({
-                                "threadId": new_thread_id,
-                                "input": [{
-                                    "type": "text",
-                                    "text": message.trim(),
-                                    "text_elements": []
-                                }]
-                            }),
+                            turn_start_params(new_thread_id, forked_cwd.as_deref(), message),
                         )?)
                     }
                     _ => None,
                 };
-                let result = json!({
-                    "ok": true,
-                    "action": "fork",
-                    "fromThreadId": thread_id,
-                    "threadId": new_thread_id,
-                    "message": message,
-                    "forked": forked,
-                    "started": started
-                });
+                let result =
+                    fork_thread_live_result(&thread_id, message.as_deref(), forked, started);
                 let result = if follow {
                     let db_path = state_db_path()?;
                     let conn = create_state_db(&db_path)?;
@@ -1044,10 +1016,10 @@ fn run() -> Result<()> {
         Commands::Archive {
             thread_id_option,
             thread_ids,
-            project: _,
-            status: _,
+            project,
+            status,
             attention,
-            limit: _,
+            limit,
             dry_run,
             yes,
         } => {
@@ -1061,46 +1033,51 @@ fn run() -> Result<()> {
                 );
             }
             targets.extend(thread_ids);
-            let thread_id = targets.first().cloned();
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
             let mut client = CodexAppServerClient::connect()?;
             sync_state_from_live(&mut client, &conn, now, 50, false)?;
-            let preview = archive_from_db(
+            let selection = resolve_archive_targets(
                 &conn,
-                thread_id.as_deref(),
+                &targets,
+                project.as_deref(),
+                status.as_deref(),
                 attention.as_deref(),
-                dry_run,
-                yes,
+                limit,
                 now,
             )?;
+            if !dry_run && selection.using_filter_selection && !yes {
+                bail!("Refusing bulk archive without --yes or --dry-run");
+            }
             if dry_run {
-                println!("{}", serde_json::to_string(&preview)?);
-            } else if let Some(target) = thread_id {
-                let result = client.request("thread/archive", json!({ "threadId": target }))?;
-                record_action(
-                    &conn,
-                    &target,
-                    "archive",
-                    json!({ "result": result, "archivedAt": now }),
-                    now,
-                )?;
+                let results = selection
+                    .targets
+                    .into_iter()
+                    .map(|thread_id| json!({ "threadId": thread_id, "status": "would_archive" }))
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string(&archive_result(true, results))?);
+            } else {
+                let mut results = Vec::new();
+                for target in selection.targets {
+                    let result = client.request("thread/archive", json!({ "threadId": target }))?;
+                    record_action(
+                        &conn,
+                        &target,
+                        "archive",
+                        json!({ "result": result, "archivedAt": now }),
+                        now,
+                    )?;
+                    results.push(json!({
+                        "threadId": target,
+                        "status": "archived",
+                        "result": result
+                    }));
+                }
                 println!(
                     "{}",
-                    serde_json::to_string(&json!({
-                        "ok": true,
-                        "action": "archive",
-                        "dryRun": false,
-                        "results": [{
-                            "threadId": target,
-                            "status": "archived",
-                            "result": result
-                        }]
-                    }))?
+                    serde_json::to_string(&archive_result(false, results))?
                 );
-            } else {
-                println!("{}", serde_json::to_string(&preview)?);
             }
         }
         Commands::Show { thread_id } => {
@@ -1254,7 +1231,7 @@ fn run() -> Result<()> {
             duration,
             poll_interval,
             events,
-            experimental_realtime,
+            experimental_realtime: _experimental_realtime,
             positional_decision,
         } => {
             let normalized = decision
@@ -1300,7 +1277,7 @@ fn run() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
+                let mut client = CodexAppServerClient::connect()?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -1348,7 +1325,7 @@ fn run() -> Result<()> {
                             thread_id: &thread_id,
                             duration_ms: duration,
                             poll_interval_ms: poll_interval,
-                            experimental_realtime,
+                            experimental_realtime: false,
                             event_filter: filter.as_ref(),
                             stream,
                         },
@@ -2577,6 +2554,73 @@ fn start_new_thread_dry_run(cwd: Option<&str>, message: Option<&str>) -> Value {
     })
 }
 
+fn normalized_message(message: Option<&str>) -> Option<String> {
+    message
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn text_input_value(text: &str) -> Value {
+    json!({ "type": "text", "text": text, "text_elements": [] })
+}
+
+fn thread_start_params(cwd: Option<&str>, message: Option<&str>) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        params.insert("cwd".to_string(), json!(cwd));
+    }
+    if let Some(message) = normalized_message(message) {
+        params.insert("input".to_string(), json!([text_input_value(&message)]));
+    }
+    Value::Object(params)
+}
+
+fn turn_start_params(thread_id: &str, cwd: Option<&str>, message: &str) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        params.insert("cwd".to_string(), json!(cwd));
+    }
+    params.insert("input".to_string(), json!([text_input_value(message)]));
+    Value::Object(params)
+}
+
+fn thread_field_string(response: &Value, field: &str) -> Option<String> {
+    response
+        .get("thread")
+        .and_then(|thread| thread.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn thread_id_from_response(response: &Value) -> Option<String> {
+    thread_field_string(response, "id")
+}
+
+fn thread_cwd_from_response(response: &Value, fallback: Option<&str>) -> Option<String> {
+    thread_field_string(response, "cwd").or_else(|| fallback.map(str::to_string))
+}
+
+fn new_thread_live_result(
+    cwd: Option<&str>,
+    message: Option<&str>,
+    created: Value,
+    started: Option<Value>,
+) -> Value {
+    let thread_id = thread_id_from_response(&created);
+    let resolved_cwd = thread_cwd_from_response(&created, cwd);
+    json!({
+        "ok": true,
+        "action": "new",
+        "threadId": thread_id,
+        "cwd": resolved_cwd,
+        "message": normalized_message(message),
+        "created": created,
+        "started": started
+    })
+}
+
 fn fork_thread_dry_run(thread_id: &str, message: Option<&str>) -> Value {
     json!({
         "ok": true,
@@ -2587,6 +2631,66 @@ fn fork_thread_dry_run(thread_id: &str, message: Option<&str>) -> Value {
     })
 }
 
+fn fork_thread_live_result(
+    from_thread_id: &str,
+    message: Option<&str>,
+    forked: Value,
+    started: Option<Value>,
+) -> Value {
+    json!({
+        "ok": true,
+        "action": "fork",
+        "fromThreadId": from_thread_id,
+        "threadId": thread_id_from_response(&forked),
+        "message": normalized_message(message),
+        "forked": forked,
+        "started": started
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveSelection {
+    targets: Vec<String>,
+    using_filter_selection: bool,
+}
+
+fn resolve_archive_targets(
+    conn: &Connection,
+    thread_ids: &[String],
+    project: Option<&str>,
+    status: Option<&str>,
+    attention: Option<&str>,
+    limit: u64,
+    now: u64,
+) -> Result<ArchiveSelection> {
+    if !thread_ids.is_empty() {
+        return Ok(ArchiveSelection {
+            targets: thread_ids.to_vec(),
+            using_filter_selection: false,
+        });
+    }
+
+    let inbox = list_inbox_from_db(conn, now, project, status, attention, None, limit)?;
+    Ok(ArchiveSelection {
+        targets: inbox
+            .items
+            .into_iter()
+            .map(|item| item.thread_id)
+            .collect::<Vec<_>>(),
+        using_filter_selection: project.is_some() || status.is_some() || attention.is_some(),
+    })
+}
+
+fn archive_result(dry_run: bool, results: Vec<Value>) -> Value {
+    json!({
+        "ok": true,
+        "action": "archive",
+        "dryRun": dry_run,
+        "results": results
+    })
+}
+
+#[cfg(test)]
 fn archive_from_db(
     conn: &Connection,
     thread_id: Option<&str>,
@@ -2595,23 +2699,16 @@ fn archive_from_db(
     yes: bool,
     now: u64,
 ) -> Result<Value> {
-    let targets = if let Some(thread_id) = thread_id {
-        vec![thread_id.to_string()]
-    } else {
-        let inbox = list_inbox_from_db(conn, now, None, None, attention, None, 100)?;
-        inbox
-            .items
-            .into_iter()
-            .map(|item| item.thread_id)
-            .collect::<Vec<_>>()
-    };
-
-    let using_filter_selection = thread_id.is_none() && attention.is_some();
-    if !dry_run && using_filter_selection && !yes {
+    let explicit = thread_id
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+    let selection = resolve_archive_targets(conn, &explicit, None, None, attention, 100, now)?;
+    if !dry_run && selection.using_filter_selection && !yes {
         bail!("Refusing bulk archive without --yes or --dry-run");
     }
 
-    let results = targets
+    let results = selection
+        .targets
         .into_iter()
         .map(|thread_id| {
             json!({
@@ -2621,12 +2718,7 @@ fn archive_from_db(
         })
         .collect::<Vec<_>>();
 
-    Ok(json!({
-        "ok": true,
-        "action": "archive",
-        "dryRun": dry_run,
-        "results": results
-    }))
+    Ok(archive_result(dry_run, results))
 }
 
 fn sync_state_from_live(
@@ -3455,13 +3547,133 @@ struct FollowRun<'a> {
     stream: bool,
 }
 
+fn follow_result_summary(
+    thread_id: &str,
+    duration_ms: u64,
+    experimental_realtime: bool,
+    events: &[Value],
+    include_events: bool,
+) -> Value {
+    let mut summary = json!({
+        "ok": true,
+        "action": "follow",
+        "threadId": thread_id,
+        "durationMs": duration_ms,
+        "experimentalRealtime": experimental_realtime
+    });
+    if include_events {
+        summary["events"] = json!(events);
+    }
+    summary
+}
+
+fn attach_follow_payload(mut result: Value, follow: Value, stream: bool) -> Value {
+    result["follow"] = follow;
+    if stream {
+        json!({
+            "type": "command_result",
+            "result": result
+        })
+    } else {
+        result
+    }
+}
+
+fn composed_settle_duration_ms(duration_ms: u64) -> u64 {
+    if duration_ms <= 100 {
+        0
+    } else {
+        20_000
+    }
+}
+
+fn event_is_terminal(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("item_completed")
+            | Some("task_complete")
+            | Some("turn.completed")
+            | Some("turn.waiting")
+            | Some("approval_request")
+    )
+}
+
+fn thread_snapshot_is_terminal(thread: &Value) -> bool {
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let last_turn_status = turns
+        .last()
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str);
+    if last_turn_status == Some("completed") {
+        return true;
+    }
+
+    let active_flags = thread
+        .pointer("/status/activeFlags")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    active_flags.iter().any(|flag| {
+        matches!(
+            flag.as_str(),
+            Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
+        )
+    })
+}
+
+fn settle_composed_follow_events(
+    client: &mut CodexAppServerClient,
+    thread_id: &str,
+    events: &mut Vec<Value>,
+    duration_ms: u64,
+    event_filter: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    if events.iter().any(event_is_terminal) {
+        return Ok(());
+    }
+
+    let settle_duration_ms = composed_settle_duration_ms(duration_ms);
+    if settle_duration_ms == 0 {
+        return Ok(());
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(settle_duration_ms);
+    while std::time::Instant::now() < deadline {
+        let read = read_thread_with_turns_fallback(client, thread_id)?;
+        let thread = read.get("thread").cloned().unwrap_or(Value::Null);
+        push_follow_event(
+            events,
+            event_filter,
+            json!({
+                "type": "follow_snapshot",
+                "threadId": thread_id,
+                "thread": thread
+            }),
+        );
+        if read
+            .get("thread")
+            .map(thread_snapshot_is_terminal)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+    }
+
+    Ok(())
+}
+
 fn attach_follow_result(
-    mut result: Value,
+    result: Value,
     client: &mut CodexAppServerClient,
     conn: &Connection,
     follow: FollowRun<'_>,
 ) -> Result<Value> {
-    let events = collect_follow_events(
+    let mut events = collect_follow_events(
         client,
         follow.thread_id,
         None,
@@ -3470,25 +3682,36 @@ fn attach_follow_result(
         follow.experimental_realtime,
         follow.event_filter,
     )?;
-    persist_follow_events(conn, follow.thread_id, &events, now_millis()?)?;
     if follow.stream {
         for event in &events {
             println!("{}", serde_json::to_string(event)?);
         }
-        return Ok(json!({
-            "type": "command_result",
-            "result": result
-        }));
+        let follow_summary = follow_result_summary(
+            follow.thread_id,
+            follow.duration_ms,
+            follow.experimental_realtime,
+            &events,
+            false,
+        );
+        return Ok(attach_follow_payload(result, follow_summary, true));
     }
-    result["follow"] = json!({
-        "ok": true,
-        "action": "follow",
-        "threadId": follow.thread_id,
-        "durationMs": follow.duration_ms,
-        "experimentalRealtime": follow.experimental_realtime,
-        "events": events
-    });
-    Ok(result)
+
+    settle_composed_follow_events(
+        client,
+        follow.thread_id,
+        &mut events,
+        follow.duration_ms,
+        follow.event_filter,
+    )?;
+    persist_follow_events(conn, follow.thread_id, &events, now_millis()?)?;
+    let follow_summary = follow_result_summary(
+        follow.thread_id,
+        follow.duration_ms,
+        follow.experimental_realtime,
+        &events,
+        true,
+    );
+    Ok(attach_follow_payload(result, follow_summary, false))
 }
 
 #[cfg(test)]
@@ -4986,6 +5209,115 @@ mod tests {
         assert_eq!(events[0]["type"], "follow_started");
         assert_eq!(events[1]["type"], "follow_snapshot");
         assert_eq!(events[1]["thread"], thread);
+    }
+
+    #[test]
+    fn follow_summaries_match_direct_and_composed_ts_shapes() {
+        let events = vec![json!({"type": "follow_started", "threadId": "thr_follow"})];
+
+        let direct = follow_result_summary("thr_follow", 3000, false, &events, false);
+        assert_eq!(direct["ok"], true);
+        assert_eq!(direct["action"], "follow");
+        assert_eq!(direct["threadId"], "thr_follow");
+        assert!(direct.get("events").is_none());
+
+        let composed = follow_result_summary("thr_follow", 3000, false, &events, true);
+        assert_eq!(composed["events"].as_array().unwrap().len(), 1);
+
+        let command = attach_follow_payload(
+            json!({"ok": true, "action": "reply", "threadId": "thr_follow"}),
+            direct,
+            true,
+        );
+        assert_eq!(command["type"], "command_result");
+        assert_eq!(command["result"]["follow"]["action"], "follow");
+    }
+
+    #[test]
+    fn composed_follow_settle_duration_matches_ts_default() {
+        assert_eq!(composed_settle_duration_ms(100), 0);
+        assert_eq!(composed_settle_duration_ms(101), 20_000);
+        assert_eq!(composed_settle_duration_ms(3_000), 20_000);
+    }
+
+    #[test]
+    fn new_thread_request_and_result_shapes_match_ts() {
+        assert_eq!(thread_start_params(None, None), json!({}));
+        assert_eq!(
+            thread_start_params(Some("/tmp/project"), Some("hello")),
+            json!({
+                "cwd": "/tmp/project",
+                "input": [{"type": "text", "text": "hello", "text_elements": []}]
+            })
+        );
+        assert_eq!(
+            turn_start_params("thr_new", Some("/tmp/project"), "hello"),
+            json!({
+                "threadId": "thr_new",
+                "cwd": "/tmp/project",
+                "input": [{"type": "text", "text": "hello", "text_elements": []}]
+            })
+        );
+
+        let result = new_thread_live_result(
+            Some("/tmp/input"),
+            Some(" hello "),
+            json!({"thread": {"id": "thr_new", "cwd": "/tmp/from-codex"}}),
+            Some(json!({"turn": {"id": "turn_1"}})),
+        );
+        assert_eq!(result["threadId"], "thr_new");
+        assert_eq!(result["cwd"], "/tmp/from-codex");
+        assert_eq!(result["message"], "hello");
+        assert_eq!(result["started"]["turn"]["id"], "turn_1");
+    }
+
+    #[test]
+    fn archive_targets_match_ts_explicit_and_filtered_selection() {
+        let conn = create_state_db_in_memory().expect("db");
+        let project_a = snapshot_fixture(
+            "thr_a",
+            "/tmp/project-a",
+            1000,
+            "active",
+            vec!["waitingOnUserInput"],
+            Some("in_progress"),
+        );
+        let project_b = snapshot_fixture(
+            "thr_b",
+            "/tmp/project-b",
+            900,
+            "idle",
+            vec![],
+            Some("completed"),
+        );
+        upsert_thread_snapshot(&conn, &project_a, 1000).expect("upsert a");
+        upsert_thread_snapshot(&conn, &project_b, 1000).expect("upsert b");
+
+        let explicit = resolve_archive_targets(
+            &conn,
+            &["thr_a".into(), "thr_b".into()],
+            None,
+            None,
+            None,
+            100,
+            1500,
+        )
+        .expect("explicit targets");
+        assert_eq!(explicit.targets, vec!["thr_a", "thr_b"]);
+        assert!(!explicit.using_filter_selection);
+
+        let filtered = resolve_archive_targets(
+            &conn,
+            &[],
+            Some("project-a"),
+            Some("active"),
+            None,
+            10,
+            1500,
+        )
+        .expect("filtered targets");
+        assert_eq!(filtered.targets, vec!["thr_a"]);
+        assert!(filtered.using_filter_selection);
     }
 
     #[test]
