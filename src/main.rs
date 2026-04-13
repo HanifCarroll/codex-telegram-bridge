@@ -990,8 +990,17 @@ fn run() -> Result<()> {
             }
         }
         Commands::Show { thread_id } => {
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
             if let Some(result) = fixture_show_thread(&thread_id)? {
-                println!("{}", serde_json::to_string(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&build_show_thread_result(
+                        Some(&conn),
+                        &thread_id,
+                        result,
+                    )?)?
+                );
             } else {
                 let mut client = CodexAppServerClient::connect()?;
                 let result = client.request(
@@ -1001,7 +1010,14 @@ fn run() -> Result<()> {
                         "includeTurns": true
                     }),
                 )?;
-                println!("{}", serde_json::to_string(&result)?);
+                println!(
+                    "{}",
+                    serde_json::to_string(&build_show_thread_result(
+                        Some(&conn),
+                        &thread_id,
+                        result,
+                    )?)?
+                );
             }
         }
         Commands::Reply {
@@ -1273,6 +1289,126 @@ fn last_preview_from_thread(thread: &Value) -> Option<String> {
         }
     }
     fallback
+}
+
+fn extract_item_text(item: &Value) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str).map(str::trim) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn find_last_message_by_type(thread: &Value, item_type: &str) -> Option<String> {
+    let turns = thread.get("turns").and_then(Value::as_array)?;
+    for turn in turns.iter().rev() {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items.iter().rev() {
+            if item.get("type").and_then(Value::as_str) == Some(item_type) {
+                if let Some(text) = extract_item_text(item) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn latest_question(thread: &Value) -> Option<String> {
+    let last_user_message = find_last_message_by_type(thread, "userMessage")?;
+    last_user_message
+        .contains('?')
+        .then_some(last_user_message)
+}
+
+fn show_pending_prompt(status_flags: &[String]) -> Option<Value> {
+    if status_flags.iter().any(|flag| flag == "waitingOnApproval") {
+        return Some(json!({
+            "kind": "approval",
+            "promptStatus": "Needs approval"
+        }));
+    }
+    if status_flags
+        .iter()
+        .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")
+    {
+        return Some(json!({
+            "kind": "reply",
+            "promptStatus": "Needs input"
+        }));
+    }
+    None
+}
+
+fn build_delta_summary(
+    pending_prompt: Option<&Value>,
+    last_turn_status: Option<&str>,
+    last_agent_message: Option<&str>,
+) -> Option<String> {
+    let agent_suffix = last_agent_message
+        .filter(|value| !value.trim().is_empty())
+        .map(|message| format!(" · Last agent update: {message}"))
+        .unwrap_or_default();
+
+    if let Some(prompt) = pending_prompt {
+        let prompt_status = prompt
+            .get("promptStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("Needs input");
+        return Some(format!("{prompt_status}{agent_suffix}"));
+    }
+
+    if let Some(status) = last_turn_status {
+        return Some(format!("Last turn status: {status}{agent_suffix}"));
+    }
+
+    last_agent_message.map(str::to_string)
+}
+
+fn build_unresolved_summary(
+    pending_prompt: Option<&Value>,
+    latest_question: Option<&str>,
+    last_user_message: Option<&str>,
+) -> Option<String> {
+    if pending_prompt
+        .and_then(|prompt| prompt.get("kind"))
+        .and_then(Value::as_str)
+        == Some("approval")
+    {
+        return Some("Approval is still pending.".to_string());
+    }
+
+    if let Some(question) = latest_question {
+        return Some(format!("Latest unresolved question: {question}"));
+    }
+
+    if pending_prompt
+        .and_then(|prompt| prompt.get("kind"))
+        .and_then(Value::as_str)
+        == Some("reply")
+    {
+        if let Some(message) = last_user_message {
+            return Some(format!("Reply still needed: {message}"));
+        }
+    }
+
+    None
 }
 
 fn derive_pending_prompt(
@@ -1733,6 +1869,19 @@ fn get_thread_history(
         .collect()
 }
 
+fn recent_actions_json(conn: &Connection, thread_id: &str, limit: u64) -> Result<Vec<Value>> {
+    Ok(get_thread_history(conn, thread_id, limit)?
+        .into_iter()
+        .map(|action| {
+            json!({
+                "actionType": action.action_type,
+                "createdAt": action.created_at,
+                "payload": action.payload
+            })
+        })
+        .collect())
+}
+
 fn list_waiting_from_db(
     conn: &Connection,
     project_filter: Option<&str>,
@@ -2004,7 +2153,11 @@ fn list_inbox_from_db(
                     last_preview,
                     pending_prompt,
                 };
-                Ok(classify_inbox_item(&snapshot, now))
+                let mut item = classify_inbox_item(&snapshot, now);
+                item.recent_action = recent_actions_json(conn, &item.thread_id, 1)?
+                    .into_iter()
+                    .next();
+                Ok(item)
             },
         )
         .collect::<Result<Vec<_>>>()?;
@@ -2418,6 +2571,115 @@ fn unarchive_thread_result(
         "action": "unarchive",
         "dryRun": false,
         "results": [{ "threadId": thread_id, "status": "unarchived", "result": result }]
+    }))
+}
+
+fn build_show_thread_result(
+    conn: Option<&Connection>,
+    requested_thread_id: &str,
+    response: Value,
+) -> Result<Value> {
+    let thread = response
+        .get("thread")
+        .cloned()
+        .unwrap_or(response);
+    let thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or(requested_thread_id)
+        .to_string();
+    let name = thread.get("name").and_then(Value::as_str).map(str::to_string);
+    let cwd = thread.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let project = derive_project_label(cwd.as_deref());
+    let status_type = thread
+        .pointer("/status/type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let status_flags = thread
+        .pointer("/status/activeFlags")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let last_turn_status = turns
+        .last()
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let last_agent_message = find_last_message_by_type(&thread, "agentMessage");
+    let last_user_message = find_last_message_by_type(&thread, "userMessage");
+    let latest_question = latest_question(&thread);
+    let pending_prompt = show_pending_prompt(&status_flags);
+    let can_approve = pending_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.get("kind"))
+        .and_then(Value::as_str)
+        == Some("approval");
+    let can_reply = pending_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.get("kind"))
+        .and_then(Value::as_str)
+        == Some("reply")
+        || !can_approve;
+    let is_waiting = pending_prompt.is_some();
+    let is_completed = last_turn_status.as_deref() == Some("completed");
+    let display_name = derive_thread_display_name(
+        name.as_deref(),
+        project.as_deref(),
+        latest_question
+            .as_deref()
+            .or(last_user_message.as_deref()),
+        &thread_id,
+    );
+    let delta_summary = build_delta_summary(
+        pending_prompt.as_ref(),
+        last_turn_status.as_deref(),
+        last_agent_message.as_deref(),
+    );
+    let unresolved_summary = build_unresolved_summary(
+        pending_prompt.as_ref(),
+        latest_question.as_deref(),
+        last_user_message.as_deref(),
+    );
+    let recent_actions = match conn {
+        Some(conn) => recent_actions_json(conn, &thread_id, 5)?,
+        None => Vec::new(),
+    };
+
+    Ok(json!({
+        "thread": {
+            "threadId": thread_id,
+            "name": name,
+            "displayName": display_name,
+            "project": project,
+            "cwd": cwd,
+            "statusType": status_type,
+            "statusFlags": status_flags,
+            "pendingPrompt": pending_prompt,
+            "canReply": can_reply,
+            "canApprove": can_approve,
+            "isWaiting": is_waiting,
+            "isCompleted": is_completed,
+            "lastTurnStatus": last_turn_status,
+            "lastAgentMessage": last_agent_message,
+            "lastUserMessage": last_user_message,
+            "latestQuestion": latest_question,
+            "deltaSummary": delta_summary,
+            "unresolvedSummary": unresolved_summary,
+            "recentActions": recent_actions,
+            "turns": turns
+        }
     }))
 }
 
@@ -3385,6 +3647,96 @@ mod tests {
         assert_eq!(inbox.summary.needs_attention, 1);
         assert_eq!(inbox.items[0].attention_reason, "pending_approval");
         assert_eq!(inbox.items[0].suggested_action, "approve");
+    }
+
+    #[test]
+    fn inbox_items_include_recent_actions() {
+        let conn = create_state_db_in_memory().expect("db");
+        let reply = snapshot_fixture(
+            "thr_reply",
+            "/tmp/project-a",
+            1000,
+            "active",
+            vec!["waitingOnUserInput"],
+            Some("in_progress"),
+        );
+        upsert_thread_snapshot(&conn, &reply, 2000).expect("upsert reply");
+        record_action(
+            &conn,
+            "thr_reply",
+            "reply",
+            json!({"message": "On it"}),
+            2100,
+        )
+        .expect("record action");
+
+        let inbox = list_inbox_from_db(&conn, 3000, None, None, None, None, 10).expect("inbox");
+        assert_eq!(
+            inbox.items[0].recent_action.as_ref().unwrap()["actionType"],
+            "reply"
+        );
+        assert_eq!(
+            inbox.items[0].recent_action.as_ref().unwrap()["payload"]["message"],
+            "On it"
+        );
+    }
+
+    #[test]
+    fn show_thread_result_includes_derived_state_and_recent_actions() {
+        let conn = create_state_db_in_memory().expect("db");
+        record_action(
+            &conn,
+            "thr_show",
+            "approve",
+            json!({"decision": "approve"}),
+            2200,
+        )
+        .expect("record action");
+        let result = build_show_thread_result(
+            Some(&conn),
+            "thr_show",
+            json!({
+                "thread": {
+                    "id": "thr_show",
+                    "name": null,
+                    "cwd": "/tmp/project-a",
+                    "status": { "type": "active", "activeFlags": ["waitingOnUserInput"] },
+                    "turns": [
+                        {
+                            "status": "completed",
+                            "items": [
+                                { "type": "userMessage", "text": "Can you check this?" },
+                                { "type": "agentMessage", "text": "I checked it." }
+                            ]
+                        },
+                        {
+                            "status": "interrupted",
+                            "items": [
+                                { "type": "userMessage", "text": "Which option should I pick?" }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )
+        .expect("show result");
+
+        assert_eq!(result["thread"]["threadId"], "thr_show");
+        assert_eq!(result["thread"]["displayName"], "Which option should I pick?");
+        assert_eq!(result["thread"]["project"], "project-a");
+        assert_eq!(result["thread"]["pendingPrompt"]["kind"], "reply");
+        assert_eq!(result["thread"]["canReply"], true);
+        assert_eq!(result["thread"]["canApprove"], false);
+        assert_eq!(result["thread"]["lastUserMessage"], "Which option should I pick?");
+        assert_eq!(result["thread"]["latestQuestion"], "Which option should I pick?");
+        assert!(result["thread"]["deltaSummary"]
+            .as_str()
+            .unwrap()
+            .contains("Needs input"));
+        assert_eq!(
+            result["thread"]["recentActions"][0]["actionType"],
+            "approve"
+        );
     }
 
     #[test]
