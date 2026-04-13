@@ -1851,6 +1851,26 @@ fn init_state_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
+    ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
+    Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns)
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let columns = table_columns(conn, table)?;
+    if !columns.iter().any(|current| current == column) {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
     Ok(())
 }
 
@@ -4540,6 +4560,37 @@ mod tests {
             get_setting_text(&conn, "away_mode").expect("legacy away setting"),
             None
         );
+    }
+
+    #[test]
+    fn create_state_db_migrates_legacy_threads_cache_columns() {
+        let path =
+            std::env::temp_dir().join(format!("codex-state-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open legacy db");
+            conn.execute_batch(
+                "
+                CREATE TABLE threads_cache (
+                    thread_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    cwd TEXT,
+                    source TEXT,
+                    status_type TEXT NOT NULL,
+                    status_flags_json TEXT NOT NULL,
+                    updated_at INTEGER,
+                    last_seen_at INTEGER NOT NULL
+                );
+                ",
+            )
+            .expect("create legacy table");
+        }
+
+        let conn = create_state_db(&path).expect("migrated db");
+        let columns = table_columns(&conn, "threads_cache").expect("columns");
+        assert!(columns.contains(&"last_turn_status".to_string()));
+        assert!(columns.contains(&"last_preview".to_string()));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
