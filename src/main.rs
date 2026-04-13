@@ -47,10 +47,6 @@ fn append_fixture_action(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn fixture_mode_enabled() -> bool {
-    fixture_path().is_some()
-}
-
 fn load_fixture_into_db(conn: &Connection, now: u64) -> Result<bool> {
     let Some(threads) = fixture_threads()? else {
         return Ok(false);
@@ -60,16 +56,6 @@ fn load_fixture_into_db(conn: &Connection, now: u64) -> Result<bool> {
         upsert_thread_snapshot(conn, &snapshot, now)?;
     }
     Ok(true)
-}
-
-fn fixture_threads_list(limit: u64) -> Result<Option<Value>> {
-    let Some(threads) = fixture_threads()? else {
-        return Ok(None);
-    };
-    let mut items = threads;
-    items.sort_by_key(|thread| std::cmp::Reverse(thread.get("updatedAt").and_then(Value::as_u64).unwrap_or(0)));
-    items.truncate(limit as usize);
-    Ok(Some(json!({"data": items})))
 }
 
 fn fixture_show_thread(thread_id: &str) -> Result<Option<Value>> {
@@ -635,33 +621,23 @@ fn run() -> Result<()> {
             message,
             duration,
             poll_interval,
-            events: _,
+            events,
             experimental_realtime,
         } => {
+            let event_filter = parse_event_filter(events.as_deref());
             let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
-            let initial = client.request(
-                "thread/read",
-                json!({ "threadId": thread_id, "includeTurns": true }),
-            ).ok().and_then(|value| value.get("thread").cloned());
-            let started = match message.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-                Some(text) => Some(client.request(
-                    "turn/start",
-                    json!({
-                        "threadId": thread_id,
-                        "input": [{ "type": "text", "text": text, "text_elements": [] }]
-                    }),
-                )?),
-                None => None,
-            };
-            let events = build_follow_events(
+            let events = collect_follow_events(
+                &mut client,
                 &thread_id,
+                message.as_deref(),
                 duration,
                 poll_interval,
                 experimental_realtime,
-                initial,
-                started,
-                vec![],
+                event_filter.as_ref(),
             )?;
+            for event in &events {
+                println!("{}", serde_json::to_string(event)?);
+            }
             println!("{}", serde_json::to_string(&json!({
                 "ok": true,
                 "action": "follow",
@@ -852,12 +828,12 @@ fn run() -> Result<()> {
             cwd,
             message,
             dry_run,
-            follow: _,
-            stream: _,
-            duration: _,
-            poll_interval: _,
-            events: _,
-            experimental_realtime: _,
+            follow,
+            stream,
+            duration,
+            poll_interval,
+            events,
+            experimental_realtime,
             prompt,
         } => {
             let message = message.or_else(|| {
@@ -867,7 +843,7 @@ fn run() -> Result<()> {
             if dry_run {
                 println!("{}", serde_json::to_string(&start_new_thread_dry_run(cwd.as_deref(), message.as_deref()))?);
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let created = client.request(
                     "thread/start",
                     json!({
@@ -879,25 +855,54 @@ fn run() -> Result<()> {
                         })])
                     }),
                 )?;
-                println!("{}", serde_json::to_string(&json!({
+                let thread_id = created
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let result = json!({
                     "ok": true,
                     "action": "new",
+                    "threadId": thread_id,
                     "cwd": cwd,
                     "message": message,
                     "created": created
-                }))?);
+                });
+                let result = if follow {
+                    let db_path = state_db_path()?;
+                    let conn = create_state_db(&db_path)?;
+                    let filter = parse_event_filter(events.as_deref());
+                    if let Some(thread_id) = result.get("threadId").and_then(Value::as_str) {
+                        attach_follow_result(
+                            result.clone(),
+                            &mut client,
+                            &conn,
+                            thread_id,
+                            duration,
+                            poll_interval,
+                            experimental_realtime,
+                            filter.as_ref(),
+                            stream,
+                        )?
+                    } else {
+                        result
+                    }
+                } else {
+                    result
+                };
+                println!("{}", serde_json::to_string(&result)?);
             }
         }
         Commands::Fork {
             thread_id,
             message,
             dry_run,
-            follow: _,
-            stream: _,
-            duration: _,
-            poll_interval: _,
-            events: _,
-            experimental_realtime: _,
+            follow,
+            stream,
+            duration,
+            poll_interval,
+            events,
+            experimental_realtime,
             prompt,
         } => {
             let message = message.or_else(|| {
@@ -907,7 +912,7 @@ fn run() -> Result<()> {
             if dry_run {
                 println!("{}", serde_json::to_string(&fork_thread_dry_run(&thread_id, message.as_deref()))?);
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let forked = client.request("thread/fork", json!({ "threadId": thread_id }))?;
                 let new_thread_id = forked
                     .get("thread")
@@ -928,7 +933,7 @@ fn run() -> Result<()> {
                     )?),
                     _ => None,
                 };
-                println!("{}", serde_json::to_string(&json!({
+                let result = json!({
                     "ok": true,
                     "action": "fork",
                     "fromThreadId": thread_id,
@@ -936,7 +941,30 @@ fn run() -> Result<()> {
                     "message": message,
                     "forked": forked,
                     "started": started
-                }))?);
+                });
+                let result = if follow {
+                    let db_path = state_db_path()?;
+                    let conn = create_state_db(&db_path)?;
+                    let filter = parse_event_filter(events.as_deref());
+                    if let Some(thread_id) = result.get("threadId").and_then(Value::as_str) {
+                        attach_follow_result(
+                            result.clone(),
+                            &mut client,
+                            &conn,
+                            thread_id,
+                            duration,
+                            poll_interval,
+                            experimental_realtime,
+                            filter.as_ref(),
+                            stream,
+                        )?
+                    } else {
+                        result
+                    }
+                } else {
+                    result
+                };
+                println!("{}", serde_json::to_string(&result)?);
             }
         }
         Commands::Archive {
@@ -1026,12 +1054,12 @@ fn run() -> Result<()> {
             thread_id,
             message,
             dry_run,
-            follow: _,
-            stream: _,
-            duration: _,
-            poll_interval: _,
-            events: _,
-            experimental_realtime: _,
+            follow,
+            stream,
+            duration,
+            poll_interval,
+            events,
+            experimental_realtime,
             prompt,
         } => {
             let message = message
@@ -1076,7 +1104,7 @@ fn run() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -1103,28 +1131,44 @@ fn run() -> Result<()> {
                     }),
                     sent_at,
                 )?;
-                let payload = LiveReplyResult {
-                    ok: true,
-                    action: "reply",
-                    thread_id: &thread_id,
-                    message: &message,
-                    sent_at,
-                    resumed,
-                    started,
+                let result = json!({
+                    "ok": true,
+                    "action": "reply",
+                    "threadId": thread_id,
+                    "message": message,
+                    "sentAt": sent_at,
+                    "resumed": resumed,
+                    "started": started
+                });
+                let result = if follow {
+                    let filter = parse_event_filter(events.as_deref());
+                    attach_follow_result(
+                        result,
+                        &mut client,
+                        &conn,
+                        &thread_id,
+                        duration,
+                        poll_interval,
+                        experimental_realtime,
+                        filter.as_ref(),
+                        stream,
+                    )?
+                } else {
+                    result
                 };
-                println!("{}", serde_json::to_string(&payload)?);
+                println!("{}", serde_json::to_string(&result)?);
             }
         }
         Commands::Approve {
             thread_id,
             decision,
             dry_run,
-            follow: _,
-            stream: _,
-            duration: _,
-            poll_interval: _,
-            events: _,
-            experimental_realtime: _,
+            follow,
+            stream,
+            duration,
+            poll_interval,
+            events,
+            experimental_realtime,
             positional_decision,
         } => {
             let normalized = decision
@@ -1170,7 +1214,7 @@ fn run() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = CodexAppServerClient::connect_with_options(experimental_realtime)?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -1198,17 +1242,33 @@ fn run() -> Result<()> {
                     }),
                     sent_at,
                 )?;
-                let payload = LiveApproveResult {
-                    ok: true,
-                    action: "approve",
-                    thread_id: &thread_id,
-                    decision: &normalized,
-                    sent_text,
-                    sent_at,
-                    resumed,
-                    started,
+                let result = json!({
+                    "ok": true,
+                    "action": "approve",
+                    "threadId": thread_id,
+                    "decision": normalized,
+                    "sentText": sent_text,
+                    "sentAt": sent_at,
+                    "resumed": resumed,
+                    "started": started
+                });
+                let result = if follow {
+                    let filter = parse_event_filter(events.as_deref());
+                    attach_follow_result(
+                        result,
+                        &mut client,
+                        &conn,
+                        &thread_id,
+                        duration,
+                        poll_interval,
+                        experimental_realtime,
+                        filter.as_ref(),
+                        stream,
+                    )?
+                } else {
+                    result
                 };
-                println!("{}", serde_json::to_string(&payload)?);
+                println!("{}", serde_json::to_string(&result)?);
             }
         }
     }
@@ -3006,6 +3066,282 @@ fn doctor_realtime_result(
     })
 }
 
+fn parse_event_filter(input: Option<&str>) -> Option<BTreeSet<String>> {
+    input.map(|value| {
+        value
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect::<BTreeSet<_>>()
+    })
+    .filter(|set| !set.is_empty())
+}
+
+fn should_emit_event(filter: Option<&BTreeSet<String>>, event: &Value) -> bool {
+    match filter {
+        None => true,
+        Some(filter) => event
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|kind| filter.contains(kind))
+            .unwrap_or(false),
+    }
+}
+
+fn normalize_notification_event(notification: &Value) -> Value {
+    match notification.get("method").and_then(Value::as_str) {
+        Some("thread/status/changed") => json!({
+            "type": "thread_status_changed",
+            "threadId": notification.pointer("/params/threadId").cloned().unwrap_or(Value::Null),
+            "status": notification.pointer("/params/status").cloned().unwrap_or(Value::Null),
+            "raw": notification
+        }),
+        Some("turn/started") => json!({
+            "type": "turn_started",
+            "threadId": notification.pointer("/params/threadId").cloned().unwrap_or(Value::Null),
+            "turn": notification.pointer("/params/turn").cloned().unwrap_or(Value::Null),
+            "raw": notification
+        }),
+        Some("item/started") => json!({
+            "type": "item_started",
+            "threadId": notification.pointer("/params/threadId").cloned().unwrap_or(Value::Null),
+            "turnId": notification.pointer("/params/turnId").cloned().unwrap_or(Value::Null),
+            "item": notification.pointer("/params/item").cloned().unwrap_or(Value::Null),
+            "raw": notification
+        }),
+        Some("item/completed") => json!({
+            "type": "item_completed",
+            "threadId": notification.pointer("/params/threadId").cloned().unwrap_or(Value::Null),
+            "turnId": notification.pointer("/params/turnId").cloned().unwrap_or(Value::Null),
+            "item": notification.pointer("/params/item").cloned().unwrap_or(Value::Null),
+            "raw": notification
+        }),
+        _ => json!({
+            "type": "notification",
+            "raw": notification
+        }),
+    }
+}
+
+fn push_follow_event(events: &mut Vec<Value>, event_filter: Option<&BTreeSet<String>>, event: Value) {
+    if should_emit_event(event_filter, &event) {
+        events.push(event);
+    }
+}
+
+fn read_thread_with_turns_fallback(client: &mut CodexAppServerClient, thread_id: &str) -> Result<Value> {
+    match client.request(
+        "thread/read",
+        json!({ "threadId": thread_id, "includeTurns": true }),
+    ) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let message = format!("{error:#}");
+            if !message.contains("includeTurns is unavailable before first user message")
+                && !message.contains("is not materialized yet")
+            {
+                return Err(error);
+            }
+            client.request(
+                "thread/read",
+                json!({ "threadId": thread_id, "includeTurns": false }),
+            )
+        }
+    }
+}
+
+fn collect_follow_events(
+    client: &mut CodexAppServerClient,
+    thread_id: &str,
+    message: Option<&str>,
+    duration_ms: u64,
+    poll_interval_ms: u64,
+    experimental_realtime: bool,
+    event_filter: Option<&BTreeSet<String>>,
+) -> Result<Vec<Value>> {
+    let mut events = Vec::new();
+    push_follow_event(
+        &mut events,
+        event_filter,
+        json!({
+            "type": "follow_started",
+            "threadId": thread_id,
+            "durationMs": duration_ms,
+            "pollIntervalMs": poll_interval_ms,
+            "experimentalRealtime": experimental_realtime
+        }),
+    );
+
+    let initial = read_thread_with_turns_fallback(client, thread_id)?;
+    push_follow_event(
+        &mut events,
+        event_filter,
+        json!({
+            "type": "follow_snapshot",
+            "threadId": thread_id,
+            "thread": initial.get("thread").cloned().unwrap_or(Value::Null)
+        }),
+    );
+
+    if experimental_realtime {
+        match client.request("thread/realtime/start", json!({ "threadId": thread_id })) {
+            Ok(realtime) => push_follow_event(
+                &mut events,
+                event_filter,
+                json!({ "type": "follow_realtime_started", "threadId": thread_id, "realtime": realtime }),
+            ),
+            Err(error) => push_follow_event(
+                &mut events,
+                event_filter,
+                json!({
+                    "type": "follow_realtime_error",
+                    "threadId": thread_id,
+                    "message": format!("{error:#}")
+                }),
+            ),
+        }
+    }
+
+    if let Some(message) = message.map(str::trim).filter(|value| !value.is_empty()) {
+        let started = client.request(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": message, "text_elements": [] }]
+            }),
+        )?;
+        push_follow_event(
+            &mut events,
+            event_filter,
+            json!({ "type": "follow_turn_started", "threadId": thread_id, "started": started }),
+        );
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+    let mut next_poll_at =
+        std::time::Instant::now() + std::time::Duration::from_millis(poll_interval_ms);
+    while std::time::Instant::now() < deadline {
+        for notification in client.drain_notifications() {
+            push_follow_event(
+                &mut events,
+                event_filter,
+                normalize_notification_event(&notification),
+            );
+        }
+
+        if poll_interval_ms > 0 && std::time::Instant::now() >= next_poll_at {
+            let thread = read_thread_with_turns_fallback(client, thread_id)?;
+            push_follow_event(
+                &mut events,
+                event_filter,
+                json!({
+                    "type": "follow_snapshot",
+                    "threadId": thread_id,
+                    "thread": thread.get("thread").cloned().unwrap_or(Value::Null)
+                }),
+            );
+            next_poll_at = std::time::Instant::now()
+                + std::time::Duration::from_millis(poll_interval_ms);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    for notification in client.drain_notifications() {
+        push_follow_event(
+            &mut events,
+            event_filter,
+            normalize_notification_event(&notification),
+        );
+    }
+
+    if experimental_realtime {
+        match client.request("thread/realtime/stop", json!({ "threadId": thread_id })) {
+            Ok(realtime) => push_follow_event(
+                &mut events,
+                event_filter,
+                json!({ "type": "follow_realtime_stopped", "threadId": thread_id, "realtime": realtime }),
+            ),
+            Err(error) => push_follow_event(
+                &mut events,
+                event_filter,
+                json!({
+                    "type": "follow_realtime_stop_error",
+                    "threadId": thread_id,
+                    "message": format!("{error:#}")
+                }),
+            ),
+        }
+    }
+
+    Ok(events)
+}
+
+fn persist_follow_events(conn: &Connection, thread_id: &str, events: &[Value], now: u64) -> Result<()> {
+    let latest_snapshot = events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(Value::as_str) == Some("follow_snapshot"))
+        .and_then(|event| event.get("thread"));
+
+    if let Some(thread) = latest_snapshot {
+        let snapshot = normalize_thread_snapshot(thread, thread)?;
+        upsert_thread_snapshot(conn, &snapshot, now)?;
+    }
+
+    if events.iter().any(|event| {
+        matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("task_complete") | Some("turn.completed")
+        )
+    }) {
+        conn.execute("DELETE FROM pending_prompts WHERE thread_id = ?1", params![thread_id])?;
+    }
+
+    Ok(())
+}
+
+fn attach_follow_result(
+    mut result: Value,
+    client: &mut CodexAppServerClient,
+    conn: &Connection,
+    thread_id: &str,
+    duration_ms: u64,
+    poll_interval_ms: u64,
+    experimental_realtime: bool,
+    event_filter: Option<&BTreeSet<String>>,
+    stream: bool,
+) -> Result<Value> {
+    let events = collect_follow_events(
+        client,
+        thread_id,
+        None,
+        duration_ms,
+        poll_interval_ms,
+        experimental_realtime,
+        event_filter,
+    )?;
+    persist_follow_events(conn, thread_id, &events, now_millis()?)?;
+    if stream {
+        for event in &events {
+            println!("{}", serde_json::to_string(event)?);
+        }
+        return Ok(json!({
+            "type": "command_result",
+            "result": result
+        }));
+    }
+    result["follow"] = json!({
+        "ok": true,
+        "action": "follow",
+        "threadId": thread_id,
+        "durationMs": duration_ms,
+        "experimentalRealtime": experimental_realtime,
+        "events": events
+    });
+    Ok(result)
+}
+
 fn build_follow_events(
     thread_id: &str,
     duration_ms: u64,
@@ -3014,6 +3350,7 @@ fn build_follow_events(
     initial_thread: Option<Value>,
     started: Option<Value>,
     notifications: Vec<Value>,
+    event_filter: Option<&BTreeSet<String>>,
 ) -> Result<Vec<Value>> {
     let mut events = vec![json!({
         "type": "follow_started",
@@ -3036,8 +3373,15 @@ fn build_follow_events(
             "started": started
         }));
     }
-    events.extend(notifications);
-    Ok(events)
+    events.extend(
+        notifications
+            .into_iter()
+            .map(|notification| normalize_notification_event(&notification)),
+    );
+    Ok(events
+        .into_iter()
+        .filter(|event| should_emit_event(event_filter, event))
+        .collect())
 }
 
 fn filter_watch_events(events: Vec<Value>, filter: Option<&BTreeSet<String>>) -> Vec<Value> {
@@ -3732,6 +4076,53 @@ mod tests {
     }
 
     #[test]
+    fn normalize_notification_matches_ts_event_contract() {
+        let event = normalize_notification_event(&json!({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "item": { "type": "agentMessage" }
+            }
+        }));
+        assert_eq!(event["type"], "item_completed");
+        assert_eq!(event["threadId"], "thr_1");
+        assert_eq!(event["turnId"], "turn_1");
+
+        let unknown = normalize_notification_event(&json!({
+            "method": "codex/custom",
+            "params": { "ok": true }
+        }));
+        assert_eq!(unknown["type"], "notification");
+        assert_eq!(unknown["raw"]["method"], "codex/custom");
+    }
+
+    #[test]
+    fn follow_events_filter_normalized_notifications() {
+        let events = build_follow_events(
+            "thr_follow",
+            1000,
+            500,
+            false,
+            Some(json!({"id": "thr_follow"})),
+            None,
+            vec![json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thr_follow",
+                    "turnId": "turn_1",
+                    "item": { "type": "agentMessage" }
+                }
+            })],
+            Some(&BTreeSet::from(["item_completed".to_string()])),
+        )
+        .expect("follow events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "item_completed");
+    }
+
+    #[test]
     fn classifies_inbox_attention_states() {
         let approval = snapshot_fixture(
             "thr_approve",
@@ -4180,7 +4571,7 @@ mod tests {
     #[test]
     fn follow_result_emits_started_and_snapshot_events() {
         let thread = json!({"id": "thr_follow", "name": "Follow me"});
-        let events = build_follow_events("thr_follow", 1000, 500, false, Some(thread.clone()), None, vec![])
+        let events = build_follow_events("thr_follow", 1000, 500, false, Some(thread.clone()), None, vec![], None)
             .expect("follow events");
         assert_eq!(events[0]["type"], "follow_started");
         assert_eq!(events[1]["type"], "follow_snapshot");
