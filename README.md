@@ -1,6 +1,6 @@
-# codex-hermes-bridge-rs
+# codex-hermes-bridge
 
-Rust port of `codex-hermes-bridge`: a CLI bridge for inspecting Codex threads, relaying actions, and streaming JSON events for automation.
+Rust implementation of `codex-hermes-bridge`: a CLI bridge for inspecting Codex threads, relaying actions, and streaming JSON events for automation.
 
 ## Current model
 
@@ -30,14 +30,13 @@ Install the Rust binary:
 cargo install --path .
 ```
 
-Run through the compatibility wrappers without installing:
+Run through the wrapper without installing:
 
 ```bash
 bin/codex-hermes-bridge --help
-bin/codex-hermes-bridge-rs --help
 ```
 
-Both wrappers build `target/debug/codex-hermes-bridge-rs` on first use and then exec it.
+The wrapper builds `target/debug/codex-hermes-bridge` on first use and then execs it.
 
 ## Commands
 
@@ -46,11 +45,11 @@ Both wrappers build `target/debug/codex-hermes-bridge-rs` on first use and then 
 Stream JSON events for a thread.
 
 ```bash
-codex-hermes-bridge-rs follow <threadId>
-codex-hermes-bridge-rs follow <threadId> --message "please continue" --duration 3000
-codex-hermes-bridge-rs follow <threadId> --poll-interval 500
-codex-hermes-bridge-rs follow <threadId> --events follow_snapshot,item_completed
-codex-hermes-bridge-rs follow <threadId> --experimental-realtime
+codex-hermes-bridge follow <threadId>
+codex-hermes-bridge follow <threadId> --message "please continue" --duration 3000
+codex-hermes-bridge follow <threadId> --poll-interval 500
+codex-hermes-bridge follow <threadId> --events follow_snapshot,item_completed
+codex-hermes-bridge follow <threadId> --experimental-realtime
 ```
 
 ### Composed follow flows
@@ -58,10 +57,10 @@ codex-hermes-bridge-rs follow <threadId> --experimental-realtime
 Run the action and follow in the same app-server session.
 
 ```bash
-codex-hermes-bridge-rs new --message "start work" --follow
-codex-hermes-bridge-rs reply <threadId> --message "please continue" --follow
-codex-hermes-bridge-rs approve <threadId> approve --follow
-codex-hermes-bridge-rs fork <threadId> --message "try another path" --follow
+codex-hermes-bridge new --message "start work" --follow
+codex-hermes-bridge reply <threadId> --message "please continue" --follow
+codex-hermes-bridge approve <threadId> approve --follow
+codex-hermes-bridge fork <threadId> --message "try another path" --follow
 ```
 
 By default, composed follow events are embedded in the final JSON result at `follow.events`.
@@ -69,7 +68,7 @@ By default, composed follow events are embedded in the final JSON result at `fol
 For live JSONL streaming instead, add `--stream`:
 
 ```bash
-codex-hermes-bridge-rs new --message "start work" --follow --stream --events follow_snapshot,item_completed
+codex-hermes-bridge new --message "start work" --follow --stream --events follow_snapshot,item_completed
 ```
 
 Useful flags:
@@ -84,10 +83,10 @@ Useful flags:
 Stream JSON events from sync reconciliation plus normalized live notifications.
 
 ```bash
-codex-hermes-bridge-rs watch
-codex-hermes-bridge-rs watch --once
-codex-hermes-bridge-rs watch --events thread_waiting,item_completed
-codex-hermes-bridge-rs watch --exec "python3 examples/hermes-codex-hook.py"
+codex-hermes-bridge watch
+codex-hermes-bridge watch --once
+codex-hermes-bridge watch --events thread_waiting,item_completed
+codex-hermes-bridge watch --exec "python3 examples/hermes-codex-hook.py"
 ```
 
 Useful flags:
@@ -100,9 +99,9 @@ Useful flags:
 Track when the user is away and emit attention-needed summaries.
 
 ```bash
-codex-hermes-bridge-rs away on
-codex-hermes-bridge-rs notify-away
-codex-hermes-bridge-rs away off
+codex-hermes-bridge away on
+codex-hermes-bridge notify-away
+codex-hermes-bridge away off
 ```
 
 `notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply or approval prompts.
@@ -191,8 +190,8 @@ Use CSV event names.
 Probe whether a thread can be read/followed/realtime-started in the current app-server context.
 
 ```bash
-codex-hermes-bridge-rs doctor realtime <threadId>
-codex-hermes-bridge-rs doctor realtime <threadId> --experimental-realtime
+codex-hermes-bridge doctor realtime <threadId>
+codex-hermes-bridge doctor realtime <threadId> --experimental-realtime
 ```
 
 This reports per-step readiness for:

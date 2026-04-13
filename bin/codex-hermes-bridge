@@ -9,7 +9,7 @@ def main() -> int:
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
 
-    binary = root / "target" / "debug" / "codex-hermes-bridge-rs"
+    binary = root / "target" / "debug" / "codex-hermes-bridge"
     if not binary.exists():
         result = subprocess.run(["cargo", "build"], cwd=root)
         if result.returncode != 0:

@@ -74,7 +74,7 @@ fn fixture_show_thread(thread_id: &str) -> Result<Option<Value>> {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "codex-hermes-bridge-rs")]
+#[command(name = "codex-hermes-bridge")]
 #[command(about = "Rust rewrite of the Codex Hermes bridge")]
 struct Cli {
     #[command(subcommand)]
@@ -4385,7 +4385,7 @@ fn initialize_params(experimental_api: bool) -> Value {
         "protocolVersion": 1,
         "capabilities": capabilities,
         "clientInfo": {
-            "name": "codex-hermes-bridge-rs",
+            "name": env!("CARGO_PKG_NAME"),
             "version": env!("CARGO_PKG_VERSION")
         }
     })
@@ -4471,7 +4471,7 @@ mod tests {
     #[test]
     fn cli_accepts_ts_composed_follow_flags() {
         let new_cli = Cli::try_parse_from([
-            "codex-hermes-bridge-rs",
+            "codex-hermes-bridge",
             "new",
             "--message",
             "hello",
@@ -4490,7 +4490,7 @@ mod tests {
         );
 
         let reply_cli = Cli::try_parse_from([
-            "codex-hermes-bridge-rs",
+            "codex-hermes-bridge",
             "reply",
             "thr_1",
             "--message",
@@ -4507,7 +4507,7 @@ mod tests {
         );
 
         let approve_cli = Cli::try_parse_from([
-            "codex-hermes-bridge-rs",
+            "codex-hermes-bridge",
             "approve",
             "thr_1",
             "approve",
@@ -4520,7 +4520,7 @@ mod tests {
         );
 
         let fork_cli = Cli::try_parse_from([
-            "codex-hermes-bridge-rs",
+            "codex-hermes-bridge",
             "fork",
             "thr_1",
             "--message",
@@ -4537,7 +4537,7 @@ mod tests {
     #[test]
     fn cli_accepts_ts_archive_filter_flags() {
         let cli = Cli::try_parse_from([
-            "codex-hermes-bridge-rs",
+            "codex-hermes-bridge",
             "archive",
             "--thread-id",
             "thr_1,thr_2",
@@ -4657,7 +4657,7 @@ mod tests {
 
         let experimental = initialize_params(true);
         assert_eq!(experimental["capabilities"]["experimentalApi"], true);
-        assert_eq!(experimental["clientInfo"]["name"], "codex-hermes-bridge-rs");
+        assert_eq!(experimental["clientInfo"]["name"], "codex-hermes-bridge");
     }
 
     #[test]
