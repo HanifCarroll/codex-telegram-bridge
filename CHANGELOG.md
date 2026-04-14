@@ -11,4 +11,7 @@ Initial OSS release candidate.
 - Stream normalized JSON events with `follow` and `watch`.
 - Run trusted local hooks with `watch --exec`.
 - Emit away-mode notification summaries with `away` and `notify-away`.
+- Expose a stdio MCP server for Hermes with structured Codex control tools.
+- Expose MCP resources and prompts for Codex thread context and safer Hermes workflows.
+- Add a `hermes install` helper that registers the bridge through `hermes mcp add`.
 - Include generic hook examples for printing events and sending Telegram notifications.

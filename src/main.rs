@@ -193,6 +193,13 @@ enum Commands {
         events: Option<String>,
         positional_decision: Option<String>,
     },
+    #[command(about = "Run a stdio MCP server for Hermes")]
+    Mcp,
+    #[command(about = "Install or inspect Hermes integration helpers")]
+    Hermes {
+        #[command(subcommand)]
+        command: HermesCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -200,6 +207,21 @@ enum AwayCommands {
     On,
     Off,
     Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum HermesCommands {
+    #[command(about = "Register this bridge as a Hermes MCP server")]
+    Install {
+        #[arg(long, default_value = "codex")]
+        server_name: String,
+        #[arg(long, default_value = "hermes")]
+        hermes_command: String,
+        #[arg(long, default_value = "codex-hermes-bridge")]
+        bridge_command: String,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Serialize)]
@@ -1015,6 +1037,23 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string(&result)?);
             }
         }
+        Commands::Mcp => {
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            run_mcp_server(stdin.lock(), stdout.lock())?;
+        }
+        Commands::Hermes { command } => match command {
+            HermesCommands::Install {
+                server_name,
+                hermes_command,
+                bridge_command,
+                dry_run,
+            } => {
+                let result =
+                    run_hermes_install(&server_name, &hermes_command, &bridge_command, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+        },
     }
 
     Ok(())
@@ -3679,6 +3718,1219 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
         .collect())
 }
 
+fn run_hermes_install(
+    server_name: &str,
+    hermes_command: &str,
+    bridge_command: &str,
+    dry_run: bool,
+) -> Result<Value> {
+    if server_name.trim().is_empty() {
+        bail!("server name cannot be empty");
+    }
+    if hermes_command.trim().is_empty() {
+        bail!("hermes command cannot be empty");
+    }
+    if bridge_command.trim().is_empty() {
+        bail!("bridge command cannot be empty");
+    }
+
+    let args = vec![
+        "mcp".to_string(),
+        "add".to_string(),
+        server_name.trim().to_string(),
+        "--command".to_string(),
+        bridge_command.trim().to_string(),
+        "--args".to_string(),
+        "mcp".to_string(),
+    ];
+    let base = json!({
+        "ok": true,
+        "action": "hermes_install",
+        "dryRun": dry_run,
+        "serverName": server_name.trim(),
+        "hermesCommand": hermes_command.trim(),
+        "bridgeCommand": bridge_command.trim(),
+        "args": args.clone(),
+        "nextStep": "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
+    });
+    if dry_run {
+        return Ok(base);
+    }
+
+    let output = Command::new(hermes_command.trim())
+        .args(&args)
+        .output()
+        .with_context(|| format!("failed to run {hermes_command} mcp add"))?;
+    if !output.status.success() {
+        bail!(
+            "Hermes MCP registration failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "hermes_install",
+        "dryRun": false,
+        "serverName": server_name.trim(),
+        "hermesCommand": hermes_command.trim(),
+        "bridgeCommand": bridge_command.trim(),
+        "args": args,
+        "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+        "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+        "nextStep": "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
+    }))
+}
+
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+fn run_mcp_server<R: BufRead, W: Write>(reader: R, mut writer: W) -> Result<()> {
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed = match serde_json::from_str::<Value>(trimmed) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let response =
+                    mcp_error_response(None, -32700, format!("Parse error: {error}"), Value::Null);
+                writeln!(writer, "{}", serde_json::to_string(&response)?)?;
+                writer.flush()?;
+                continue;
+            }
+        };
+
+        if let Some(response) = mcp_handle_message(parsed) {
+            writeln!(writer, "{}", serde_json::to_string(&response)?)?;
+            writer.flush()?;
+        }
+    }
+    Ok(())
+}
+
+fn mcp_handle_message(message: Value) -> Option<Value> {
+    let id = message.get("id").cloned();
+    let method = match message.get("method").and_then(Value::as_str) {
+        Some(method) => method,
+        None => {
+            return id.map(|id| {
+                mcp_error_response(
+                    Some(id),
+                    -32600,
+                    "Invalid request: missing method",
+                    Value::Null,
+                )
+            })
+        }
+    };
+    let params = message.get("params").unwrap_or(&Value::Null);
+
+    match method {
+        "notifications/initialized" => None,
+        "initialize" => id.map(|id| mcp_success_response(id, mcp_initialize_result(params))),
+        "ping" => id.map(|id| mcp_success_response(id, json!({}))),
+        "tools/list" => id.map(|id| mcp_success_response(id, json!({ "tools": mcp_tools() }))),
+        "tools/call" => id.map(|id| {
+            let result = match mcp_tool_call_result(params) {
+                Ok(result) => result,
+                Err(error) => mcp_tool_error_result(&error),
+            };
+            mcp_success_response(id, result)
+        }),
+        "resources/list" => {
+            id.map(|id| mcp_success_response(id, json!({ "resources": mcp_resources() })))
+        }
+        "resources/templates/list" => id.map(|id| {
+            mcp_success_response(
+                id,
+                json!({
+                    "resourceTemplates": [{
+                        "uriTemplate": "codex://thread/{threadId}",
+                        "name": "Codex Thread",
+                        "title": "Codex Thread",
+                        "description": "Read one Codex thread by id.",
+                        "mimeType": "application/json"
+                    }]
+                }),
+            )
+        }),
+        "resources/read" => id.map(|id| match mcp_read_resource(params) {
+            Ok(result) => mcp_success_response(id, result),
+            Err(error) => mcp_error_response(
+                Some(id),
+                -32602,
+                format!("Invalid resource read: {error:#}"),
+                Value::Null,
+            ),
+        }),
+        "prompts/list" => {
+            id.map(|id| mcp_success_response(id, json!({ "prompts": mcp_prompts() })))
+        }
+        "prompts/get" => id.map(|id| match mcp_get_prompt(params) {
+            Ok(result) => mcp_success_response(id, result),
+            Err(error) => mcp_error_response(
+                Some(id),
+                -32602,
+                format!("Invalid prompt request: {error:#}"),
+                Value::Null,
+            ),
+        }),
+        _ => id.map(|id| {
+            mcp_error_response(
+                Some(id),
+                -32601,
+                format!("Method not found: {method}"),
+                Value::Null,
+            )
+        }),
+    }
+}
+
+fn mcp_success_response(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn mcp_error_response(
+    id: Option<Value>,
+    code: i64,
+    message: impl Into<String>,
+    data: Value,
+) -> Value {
+    let mut response = serde_json::Map::new();
+    response.insert("jsonrpc".to_string(), json!("2.0"));
+    response.insert("id".to_string(), id.unwrap_or(Value::Null));
+    response.insert(
+        "error".to_string(),
+        json!({
+            "code": code,
+            "message": message.into(),
+            "data": data
+        }),
+    );
+    Value::Object(response)
+}
+
+fn mcp_initialize_result(params: &Value) -> Value {
+    let requested = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or(MCP_PROTOCOL_VERSION);
+    let protocol_version = if requested == MCP_PROTOCOL_VERSION {
+        requested
+    } else {
+        MCP_PROTOCOL_VERSION
+    };
+    json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "tools": {
+                "listChanged": false
+            },
+            "resources": {
+                "listChanged": false,
+                "subscribe": false
+            },
+            "prompts": {
+                "listChanged": false
+            }
+        },
+        "serverInfo": {
+            "name": env!("CARGO_PKG_NAME"),
+            "title": "Codex Hermes Bridge",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "instructions": "Use these tools to inspect and control local Codex threads. Do not expose this server to untrusted agents or remote users."
+    })
+}
+
+fn mcp_tool_call_result(params: &Value) -> Result<Value> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .context("tools/call requires params.name")?;
+    let empty_args = json!({});
+    let arguments = params.get("arguments").unwrap_or(&empty_args);
+    let payload = execute_mcp_tool(name, arguments)?;
+    mcp_tool_success_result(payload)
+}
+
+fn mcp_tool_success_result(payload: Value) -> Result<Value> {
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&payload)?
+        }],
+        "structuredContent": payload,
+        "isError": false
+    }))
+}
+
+fn mcp_tool_error_result(error: &anyhow::Error) -> Value {
+    let message = format!("{error:#}");
+    json!({
+        "content": [{
+            "type": "text",
+            "text": message
+        }],
+        "structuredContent": {
+            "ok": false,
+            "error": {
+                "code": "tool_error",
+                "message": message,
+                "classified": classify_app_server_error_message(&format!("{error:#}"))
+            }
+        },
+        "isError": true
+    })
+}
+
+fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
+    match name {
+        "codex_doctor" => {
+            let resolved = resolve_codex_binary()?;
+            let output = Command::new(&resolved.path)
+                .arg("--version")
+                .output()
+                .with_context(|| {
+                    format!("failed to execute {} --version", resolved.path.display())
+                })?;
+            if !output.status.success() {
+                bail!(
+                    "codex binary {} returned non-zero exit status for --version",
+                    resolved.path.display()
+                );
+            }
+            serde_json::to_value(DoctorEnvelope {
+                ok: true,
+                codex: DoctorCodex {
+                    resolved_path: resolved.path.display().to_string(),
+                    source: resolved.source.to_string(),
+                    version_stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                },
+            })
+            .map_err(Into::into)
+        }
+        "codex_threads" => {
+            let limit = mcp_arg_u64(arguments, &["limit"], 25)?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            let mut client = CodexAppServerClient::connect()?;
+            let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
+            Ok(json!({ "threads": result["threads"].clone() }))
+        }
+        "codex_waiting" => {
+            let project = mcp_arg_string(arguments, &["project"])?;
+            let limit = mcp_arg_u64(arguments, &["limit"], 25)?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            let mut client = CodexAppServerClient::connect()?;
+            sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
+            serde_json::to_value(list_waiting_from_db(&conn, project.as_deref(), limit)?)
+                .map_err(Into::into)
+        }
+        "codex_inbox" => {
+            let project = mcp_arg_string(arguments, &["project"])?;
+            let status = mcp_arg_string(arguments, &["status"])?;
+            let attention = mcp_arg_string(arguments, &["attention"])?;
+            let waiting_on = mcp_arg_string(arguments, &["waitingOn", "waiting_on"])?;
+            let limit = mcp_arg_u64(arguments, &["limit"], 25)?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            let mut client = CodexAppServerClient::connect()?;
+            sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
+            serde_json::to_value(list_inbox_from_db(
+                &conn,
+                now,
+                project.as_deref(),
+                status.as_deref(),
+                attention.as_deref(),
+                waiting_on.as_deref(),
+                limit,
+            )?)
+            .map_err(Into::into)
+        }
+        "codex_show" => {
+            let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            let mut client = CodexAppServerClient::connect()?;
+            let result = client.request(
+                "thread/read",
+                json!({
+                    "threadId": thread_id,
+                    "includeTurns": true
+                }),
+            )?;
+            build_show_thread_result(Some(&conn), &thread_id, result)
+        }
+        "codex_new" => {
+            let cwd = mcp_arg_string(arguments, &["cwd"])?;
+            let message = mcp_arg_string(arguments, &["message", "prompt"])?;
+            let dry_run = mcp_arg_bool(arguments, &["dryRun", "dry_run"], false)?;
+            let follow = mcp_arg_bool(arguments, &["follow"], false)?;
+            let stream = mcp_arg_bool(arguments, &["stream"], false)?;
+            let duration = mcp_arg_u64(arguments, &["durationMs", "duration"], 3000)?;
+            let poll_interval = mcp_arg_u64(arguments, &["pollIntervalMs", "poll_interval"], 1000)?;
+            let events = mcp_arg_events(arguments, &["events"])?;
+            if dry_run {
+                Ok(start_new_thread_dry_run(cwd.as_deref(), message.as_deref()))
+            } else {
+                let mut client = CodexAppServerClient::connect()?;
+                let created =
+                    client.request("thread/start", thread_start_params(cwd.as_deref()))?;
+                let thread_id = thread_id_from_response(&created);
+                let started = match (thread_id.as_deref(), message.as_deref()) {
+                    (Some(thread_id), Some(message)) => Some(client.request(
+                        "turn/start",
+                        turn_start_params(thread_id, cwd.as_deref(), message),
+                    )?),
+                    _ => None,
+                };
+                let result =
+                    new_thread_live_result(cwd.as_deref(), message.as_deref(), created, started);
+                attach_mcp_follow_if_requested(
+                    result,
+                    &mut client,
+                    follow,
+                    stream,
+                    duration,
+                    poll_interval,
+                    events.as_deref(),
+                )
+            }
+        }
+        "codex_fork" => {
+            let from_thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let message = mcp_arg_string(arguments, &["message", "prompt"])?;
+            let dry_run = mcp_arg_bool(arguments, &["dryRun", "dry_run"], false)?;
+            let follow = mcp_arg_bool(arguments, &["follow"], false)?;
+            let stream = mcp_arg_bool(arguments, &["stream"], false)?;
+            let duration = mcp_arg_u64(arguments, &["durationMs", "duration"], 3000)?;
+            let poll_interval = mcp_arg_u64(arguments, &["pollIntervalMs", "poll_interval"], 1000)?;
+            let events = mcp_arg_events(arguments, &["events"])?;
+            if dry_run {
+                Ok(fork_thread_dry_run(&from_thread_id, message.as_deref()))
+            } else {
+                let mut client = CodexAppServerClient::connect()?;
+                let forked =
+                    client.request("thread/fork", json!({ "threadId": from_thread_id }))?;
+                let new_thread_id = thread_id_from_response(&forked);
+                let forked_cwd = thread_cwd_from_response(&forked, None);
+                let started = match (new_thread_id.as_deref(), message.as_deref()) {
+                    (Some(new_thread_id), Some(message)) if !message.trim().is_empty() => {
+                        Some(client.request(
+                            "turn/start",
+                            turn_start_params(new_thread_id, forked_cwd.as_deref(), message),
+                        )?)
+                    }
+                    _ => None,
+                };
+                let result =
+                    fork_thread_live_result(&from_thread_id, message.as_deref(), forked, started);
+                attach_mcp_follow_if_requested(
+                    result,
+                    &mut client,
+                    follow,
+                    stream,
+                    duration,
+                    poll_interval,
+                    events.as_deref(),
+                )
+            }
+        }
+        "codex_reply" => {
+            let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let message = mcp_required_string(arguments, &["message", "prompt"])?;
+            let dry_run = mcp_arg_bool(arguments, &["dryRun", "dry_run"], false)?;
+            let follow = mcp_arg_bool(arguments, &["follow"], false)?;
+            let stream = mcp_arg_bool(arguments, &["stream"], false)?;
+            let duration = mcp_arg_u64(arguments, &["durationMs", "duration"], 3000)?;
+            let poll_interval = mcp_arg_u64(arguments, &["pollIntervalMs", "poll_interval"], 1000)?;
+            let events = mcp_arg_events(arguments, &["events"])?;
+            let sent_at = now_millis()?;
+            if dry_run {
+                serde_json::to_value(ReplyResult {
+                    ok: true,
+                    action: "reply",
+                    dry_run: true,
+                    thread_id: &thread_id,
+                    message: &message,
+                    sent_at,
+                })
+                .map_err(Into::into)
+            } else {
+                let mut client = CodexAppServerClient::connect()?;
+                let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
+                let started = client.request(
+                    "turn/start",
+                    json!({
+                        "threadId": thread_id,
+                        "input": [text_input_value(&message)]
+                    }),
+                )?;
+                let db_path = state_db_path()?;
+                let conn = create_state_db(&db_path)?;
+                record_action(
+                    &conn,
+                    &thread_id,
+                    "reply",
+                    json!({
+                        "message": message,
+                        "resumed": resumed,
+                        "started": started,
+                        "sentAt": sent_at
+                    }),
+                    sent_at,
+                )?;
+                let result = json!({
+                    "ok": true,
+                    "action": "reply",
+                    "threadId": thread_id,
+                    "message": message,
+                    "sentAt": sent_at,
+                    "resumed": resumed,
+                    "started": started
+                });
+                attach_mcp_follow_if_requested(
+                    result,
+                    &mut client,
+                    follow,
+                    stream,
+                    duration,
+                    poll_interval,
+                    events.as_deref(),
+                )
+            }
+        }
+        "codex_approve" => {
+            let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let decision = mcp_required_string(arguments, &["decision"])?;
+            let dry_run = mcp_arg_bool(arguments, &["dryRun", "dry_run"], false)?;
+            let follow = mcp_arg_bool(arguments, &["follow"], false)?;
+            let stream = mcp_arg_bool(arguments, &["stream"], false)?;
+            let duration = mcp_arg_u64(arguments, &["durationMs", "duration"], 3000)?;
+            let poll_interval = mcp_arg_u64(arguments, &["pollIntervalMs", "poll_interval"], 1000)?;
+            let events = mcp_arg_events(arguments, &["events"])?;
+            let normalized = decision.trim().to_lowercase();
+            let sent_text = match normalized.as_str() {
+                "approve" => "YES",
+                "deny" => "NO",
+                _ => bail!("Approval decision must be approve or deny"),
+            };
+            let sent_at = now_millis()?;
+            if dry_run {
+                serde_json::to_value(ApproveResult {
+                    ok: true,
+                    action: "approve",
+                    dry_run: true,
+                    thread_id: &thread_id,
+                    decision: &normalized,
+                    sent_text,
+                    sent_at,
+                })
+                .map_err(Into::into)
+            } else {
+                let mut client = CodexAppServerClient::connect()?;
+                let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
+                let started = client.request(
+                    "turn/start",
+                    json!({
+                        "threadId": thread_id,
+                        "input": [text_input_value(sent_text)]
+                    }),
+                )?;
+                let db_path = state_db_path()?;
+                let conn = create_state_db(&db_path)?;
+                record_action(
+                    &conn,
+                    &thread_id,
+                    "approve",
+                    json!({
+                        "decision": normalized,
+                        "sentText": sent_text,
+                        "resumed": resumed,
+                        "started": started,
+                        "sentAt": sent_at
+                    }),
+                    sent_at,
+                )?;
+                let result = json!({
+                    "ok": true,
+                    "action": "approve",
+                    "threadId": thread_id,
+                    "decision": normalized,
+                    "sentText": sent_text,
+                    "sentAt": sent_at,
+                    "resumed": resumed,
+                    "started": started
+                });
+                attach_mcp_follow_if_requested(
+                    result,
+                    &mut client,
+                    follow,
+                    stream,
+                    duration,
+                    poll_interval,
+                    events.as_deref(),
+                )
+            }
+        }
+        "codex_archive" => {
+            let thread_ids = mcp_arg_string_list(arguments, &["threadIds", "thread_ids"])?;
+            let project = mcp_arg_string(arguments, &["project"])?;
+            let status = mcp_arg_string(arguments, &["status"])?;
+            let attention = mcp_arg_string(arguments, &["attention"])?;
+            let limit = mcp_arg_u64(arguments, &["limit"], 100)?;
+            let dry_run = mcp_arg_bool(arguments, &["dryRun", "dry_run"], false)?;
+            let yes = mcp_arg_bool(arguments, &["yes"], false)?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            if !dry_run && thread_ids.is_empty() && !yes {
+                bail!("Refusing bulk archive without yes=true or dryRun=true");
+            }
+            let mut client = if dry_run {
+                None
+            } else {
+                Some(CodexAppServerClient::connect()?)
+            };
+            if !dry_run && thread_ids.is_empty() {
+                if let Some(client) = client.as_mut() {
+                    sync_state_from_live(client, &conn, now, 50, false)?;
+                }
+            }
+            let selection = resolve_archive_targets(
+                &conn,
+                &thread_ids,
+                project.as_deref(),
+                status.as_deref(),
+                attention.as_deref(),
+                limit,
+                now,
+            )?;
+            if !dry_run && selection.using_filter_selection && !yes {
+                bail!("Refusing bulk archive without yes=true or dryRun=true");
+            }
+            if dry_run {
+                let results = selection
+                    .targets
+                    .into_iter()
+                    .map(|thread_id| json!({ "threadId": thread_id, "status": "would_archive" }))
+                    .collect::<Vec<_>>();
+                Ok(archive_result(true, results))
+            } else {
+                let mut results = Vec::new();
+                for target in selection.targets {
+                    let result = client
+                        .as_mut()
+                        .context("archive client missing")?
+                        .request("thread/archive", json!({ "threadId": target }))?;
+                    record_action(
+                        &conn,
+                        &target,
+                        "archive",
+                        json!({ "result": result, "archivedAt": now }),
+                        now,
+                    )?;
+                    results.push(json!({
+                        "threadId": target,
+                        "status": "archived",
+                        "result": result
+                    }));
+                }
+                Ok(archive_result(false, results))
+            }
+        }
+        "codex_unarchive" => {
+            let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let dry_run = mcp_arg_bool(arguments, &["dryRun", "dry_run"], false)?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            let live_result = if dry_run {
+                None
+            } else {
+                let mut client = CodexAppServerClient::connect()?;
+                Some(client.request("thread/unarchive", json!({ "threadId": thread_id }))?)
+            };
+            unarchive_thread_result(&conn, &thread_id, dry_run, now, live_result)
+        }
+        "codex_away" => {
+            let action = mcp_required_string(arguments, &["action"])?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            match action.as_str() {
+                "on" => set_away_mode(&conn, true, now),
+                "off" => set_away_mode(&conn, false, now),
+                "status" => get_away_mode(&conn),
+                _ => bail!("away action must be on, off, or status"),
+            }
+        }
+        "codex_notify_away" => {
+            let completed = mcp_arg_bool(arguments, &["completed"], true)?;
+            let mark_delivered =
+                mcp_arg_bool(arguments, &["markDelivered", "mark_delivered"], false)?;
+            let now = now_millis()?;
+            let db_path = state_db_path()?;
+            let conn = create_state_db(&db_path)?;
+            let mut client = CodexAppServerClient::connect()?;
+            sync_state_from_live(&mut client, &conn, now, 50, true)?;
+            build_notify_away_from_db(&conn, now, completed, mark_delivered)
+        }
+        _ => bail!("Unknown MCP tool: {name}"),
+    }
+}
+
+fn attach_mcp_follow_if_requested(
+    result: Value,
+    client: &mut CodexAppServerClient,
+    follow: bool,
+    stream: bool,
+    duration: u64,
+    poll_interval: u64,
+    events: Option<&str>,
+) -> Result<Value> {
+    if !follow {
+        return Ok(result);
+    }
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    let filter = parse_event_filter(events);
+    if let Some(thread_id) = result.get("threadId").and_then(Value::as_str) {
+        attach_follow_result(
+            result.clone(),
+            client,
+            &conn,
+            FollowRun {
+                thread_id,
+                duration_ms: duration,
+                poll_interval_ms: poll_interval,
+                event_filter: filter.as_ref(),
+                stream,
+            },
+        )
+    } else {
+        Ok(result)
+    }
+}
+
+fn mcp_arg_value<'a>(arguments: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    let object = arguments.as_object()?;
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn mcp_arg_string(arguments: &Value, keys: &[&str]) -> Result<Option<String>> {
+    match mcp_arg_value(arguments, keys) {
+        Some(Value::String(value)) => Ok(normalized_message(Some(value))),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => bail!("argument {} must be a string, got {}", keys[0], other),
+    }
+}
+
+fn mcp_required_string(arguments: &Value, keys: &[&str]) -> Result<String> {
+    mcp_arg_string(arguments, keys)?.with_context(|| format!("argument {} is required", keys[0]))
+}
+
+fn mcp_arg_bool(arguments: &Value, keys: &[&str], default: bool) -> Result<bool> {
+    match mcp_arg_value(arguments, keys) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(Value::Null) | None => Ok(default),
+        Some(other) => bail!("argument {} must be a boolean, got {}", keys[0], other),
+    }
+}
+
+fn mcp_arg_u64(arguments: &Value, keys: &[&str], default: u64) -> Result<u64> {
+    match mcp_arg_value(arguments, keys) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .with_context(|| format!("argument {} must be an unsigned integer", keys[0])),
+        Some(Value::Null) | None => Ok(default),
+        Some(other) => bail!(
+            "argument {} must be an unsigned integer, got {}",
+            keys[0],
+            other
+        ),
+    }
+}
+
+fn mcp_arg_string_list(arguments: &Value, keys: &[&str]) -> Result<Vec<String>> {
+    match mcp_arg_value(arguments, keys) {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .with_context(|| format!("argument {} must contain only strings", keys[0]))
+            })
+            .collect(),
+        Some(Value::String(value)) => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(other) => bail!(
+            "argument {} must be a string array or comma-separated string, got {}",
+            keys[0],
+            other
+        ),
+    }
+}
+
+fn mcp_arg_events(arguments: &Value, keys: &[&str]) -> Result<Option<String>> {
+    match mcp_arg_value(arguments, keys) {
+        Some(Value::Array(values)) => {
+            let mut events = Vec::new();
+            for value in values {
+                let event = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .with_context(|| format!("argument {} must contain only strings", keys[0]))?;
+                events.push(event.to_string());
+            }
+            Ok((!events.is_empty()).then(|| events.join(",")))
+        }
+        Some(Value::String(value)) => Ok(normalized_message(Some(value))),
+        Some(Value::Null) | None => Ok(None),
+        Some(other) => bail!(
+            "argument {} must be a string or string array, got {}",
+            keys[0],
+            other
+        ),
+    }
+}
+
+fn mcp_resources() -> Vec<Value> {
+    vec![
+        json!({
+            "uri": "codex://threads",
+            "name": "Codex Threads",
+            "title": "Codex Threads",
+            "description": "Recent Codex threads from the local bridge.",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uri": "codex://inbox",
+            "name": "Codex Inbox",
+            "title": "Codex Inbox",
+            "description": "Actionable Codex inbox rows with suggested actions.",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uri": "codex://waiting",
+            "name": "Codex Waiting",
+            "title": "Codex Waiting Threads",
+            "description": "Codex threads waiting on user input or approval.",
+            "mimeType": "application/json"
+        }),
+    ]
+}
+
+fn mcp_read_resource(params: &Value) -> Result<Value> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .context("resources/read requires params.uri")?;
+    let payload = match uri {
+        "codex://threads" => execute_mcp_tool("codex_threads", &json!({ "limit": 25 }))?,
+        "codex://inbox" => execute_mcp_tool("codex_inbox", &json!({ "limit": 25 }))?,
+        "codex://waiting" => execute_mcp_tool("codex_waiting", &json!({ "limit": 25 }))?,
+        _ if uri.starts_with("codex://thread/") => {
+            let thread_id = uri.trim_start_matches("codex://thread/");
+            if thread_id.trim().is_empty() {
+                bail!("thread resource uri is missing a thread id");
+            }
+            execute_mcp_tool("codex_show", &json!({ "threadId": thread_id }))?
+        }
+        _ => bail!("unknown Codex resource uri: {uri}"),
+    };
+
+    Ok(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": serde_json::to_string_pretty(&payload)?
+        }]
+    }))
+}
+
+fn mcp_prompts() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "codex_check_inbox",
+            "title": "Check Codex Inbox",
+            "description": "Ask Hermes to inspect current Codex work before taking action.",
+            "arguments": []
+        }),
+        json!({
+            "name": "codex_reply",
+            "title": "Reply To Codex",
+            "description": "Prepare an explicit reply action for a Codex thread.",
+            "arguments": [
+                {
+                    "name": "threadId",
+                    "description": "Codex thread id to reply to.",
+                    "required": true
+                },
+                {
+                    "name": "message",
+                    "description": "Exact reply text to send.",
+                    "required": true
+                }
+            ]
+        }),
+        json!({
+            "name": "codex_approve",
+            "title": "Approve Codex Prompt",
+            "description": "Prepare an explicit approve or deny action for a Codex prompt.",
+            "arguments": [
+                {
+                    "name": "threadId",
+                    "description": "Codex thread id with the approval prompt.",
+                    "required": true
+                },
+                {
+                    "name": "decision",
+                    "description": "Approval decision: approve or deny.",
+                    "required": true
+                }
+            ]
+        }),
+    ]
+}
+
+fn mcp_get_prompt(params: &Value) -> Result<Value> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .context("prompts/get requires params.name")?;
+    let empty_args = json!({});
+    let arguments = params.get("arguments").unwrap_or(&empty_args);
+    let text = match name {
+        "codex_check_inbox" => {
+            "Check Codex state before taking action. Start with codex_inbox or codex_waiting. Summarize what is waiting, which threads need the user, and which action you recommend next.".to_string()
+        }
+        "codex_reply" => {
+            let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let message = mcp_required_string(arguments, &["message", "prompt"])?;
+            format!(
+                "Use the codex_reply tool with threadId `{thread_id}` and message `{message}`. Do not change the message unless the user explicitly asks you to revise it."
+            )
+        }
+        "codex_approve" => {
+            let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
+            let decision = mcp_required_string(arguments, &["decision"])?;
+            format!(
+                "Use the codex_approve tool with threadId `{thread_id}` and decision `{decision}`. Only approve or deny when the user explicitly requested that decision."
+            )
+        }
+        _ => bail!("unknown Codex prompt: {name}"),
+    };
+
+    Ok(json!({
+        "description": match name {
+            "codex_check_inbox" => "Inspect Codex inbox state",
+            "codex_reply" => "Reply to a Codex thread",
+            "codex_approve" => "Approve or deny a Codex prompt",
+            _ => "Codex prompt"
+        },
+        "messages": [{
+            "role": "user",
+            "content": {
+                "type": "text",
+                "text": text
+            }
+        }]
+    }))
+}
+
+fn mcp_tools() -> Vec<Value> {
+    vec![
+        mcp_tool(
+            "codex_doctor",
+            "Codex Doctor",
+            "Inspect the local Codex executable that the bridge will control.",
+            mcp_schema(json!({}), vec![]),
+            mcp_annotations(true, false, true, false),
+        ),
+        mcp_tool(
+            "codex_threads",
+            "List Codex Threads",
+            "Sync live Codex state and list recent threads.",
+            mcp_schema(
+                json!({
+                    "limit": integer_property("Maximum number of recent threads to sync and return.")
+                }),
+                vec![],
+            ),
+            mcp_annotations(true, false, false, false),
+        ),
+        mcp_tool(
+            "codex_waiting",
+            "List Waiting Threads",
+            "List Codex threads that are waiting for user input or approval.",
+            mcp_schema(
+                json!({
+                    "project": string_property("Optional project label to filter by."),
+                    "limit": integer_property("Maximum number of waiting threads to return.")
+                }),
+                vec![],
+            ),
+            mcp_annotations(true, false, false, false),
+        ),
+        mcp_tool(
+            "codex_inbox",
+            "List Codex Inbox",
+            "List actionable Codex inbox rows with attention and suggested-action metadata.",
+            mcp_schema(
+                json!({
+                    "project": string_property("Optional project label to filter by."),
+                    "status": string_property("Optional status type to filter by."),
+                    "attention": string_property("Optional attention reason to filter by."),
+                    "waitingOn": string_property("Optional waiting owner filter, such as me, codex, or none."),
+                    "limit": integer_property("Maximum number of inbox rows to return.")
+                }),
+                vec![],
+            ),
+            mcp_annotations(true, false, false, false),
+        ),
+        mcp_tool(
+            "codex_show",
+            "Show Codex Thread",
+            "Read one Codex thread with derived bridge state and recent local actions.",
+            mcp_schema(
+                json!({
+                    "threadId": string_property("Codex thread id to read.")
+                }),
+                vec!["threadId"],
+            ),
+            mcp_annotations(true, false, false, false),
+        ),
+        mcp_tool(
+            "codex_new",
+            "Start Codex Thread",
+            "Start a new Codex thread, optionally sending an initial message.",
+            action_schema(json!({
+                "cwd": string_property("Optional working directory for the new thread."),
+                "message": string_property("Optional initial user message."),
+                "dryRun": bool_property("Return the action shape without contacting Codex.")
+            }), vec![]),
+            mcp_annotations(false, false, false, true),
+        ),
+        mcp_tool(
+            "codex_fork",
+            "Fork Codex Thread",
+            "Fork an existing Codex thread, optionally sending a follow-up message to the fork.",
+            action_schema(json!({
+                "threadId": string_property("Codex thread id to fork."),
+                "message": string_property("Optional message to send to the fork."),
+                "dryRun": bool_property("Return the action shape without contacting Codex.")
+            }), vec!["threadId"]),
+            mcp_annotations(false, false, false, true),
+        ),
+        mcp_tool(
+            "codex_reply",
+            "Reply To Codex Thread",
+            "Resume a waiting Codex thread and send a user reply.",
+            action_schema(json!({
+                "threadId": string_property("Codex thread id to resume."),
+                "message": string_property("Reply text to send."),
+                "dryRun": bool_property("Return the action shape without contacting Codex.")
+            }), vec!["threadId", "message"]),
+            mcp_annotations(false, false, false, true),
+        ),
+        mcp_tool(
+            "codex_approve",
+            "Approve Codex Prompt",
+            "Approve or deny a waiting Codex approval prompt by sending YES or NO.",
+            action_schema(json!({
+                "threadId": string_property("Codex thread id to resume."),
+                "decision": enum_property("Approval decision.", vec!["approve", "deny"]),
+                "dryRun": bool_property("Return the action shape without contacting Codex.")
+            }), vec!["threadId", "decision"]),
+            mcp_annotations(false, false, false, true),
+        ),
+        mcp_tool(
+            "codex_archive",
+            "Archive Codex Threads",
+            "Archive explicit threads or a filtered inbox selection. Bulk filtered archive requires yes=true or dryRun=true.",
+            mcp_schema(
+                json!({
+                    "threadIds": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Explicit thread ids to archive."
+                    },
+                    "project": string_property("Optional project filter for inbox selection."),
+                    "status": string_property("Optional status filter for inbox selection."),
+                    "attention": string_property("Optional attention filter for inbox selection."),
+                    "limit": integer_property("Maximum number of filtered inbox rows to archive."),
+                    "dryRun": bool_property("Return selected targets without archiving."),
+                    "yes": bool_property("Required for non-dry-run filtered bulk archive.")
+                }),
+                vec![],
+            ),
+            mcp_annotations(false, true, false, true),
+        ),
+        mcp_tool(
+            "codex_unarchive",
+            "Unarchive Codex Thread",
+            "Unarchive one Codex thread.",
+            mcp_schema(
+                json!({
+                    "threadId": string_property("Codex thread id to unarchive."),
+                    "dryRun": bool_property("Return the action shape without contacting Codex.")
+                }),
+                vec!["threadId"],
+            ),
+            mcp_annotations(false, false, false, true),
+        ),
+        mcp_tool(
+            "codex_away",
+            "Manage Codex Away Mode",
+            "Turn away mode on or off, or read its current state.",
+            mcp_schema(
+                json!({
+                    "action": enum_property("Away-mode action.", vec!["on", "off", "status"])
+                }),
+                vec!["action"],
+            ),
+            mcp_annotations(false, false, true, false),
+        ),
+        mcp_tool(
+            "codex_notify_away",
+            "Build Away Notifications",
+            "Build away-mode notification summaries from synced Codex thread state.",
+            mcp_schema(
+                json!({
+                    "completed": bool_property("Include completed thread updates. Defaults to true."),
+                    "markDelivered": bool_property("Mark emitted notifications as delivered.")
+                }),
+                vec![],
+            ),
+            mcp_annotations(false, false, false, true),
+        ),
+    ]
+}
+
+fn mcp_tool(
+    name: &str,
+    title: &str,
+    description: &str,
+    input_schema: Value,
+    annotations: Value,
+) -> Value {
+    json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": input_schema,
+        "annotations": annotations
+    })
+}
+
+fn mcp_schema(properties: Value, required: Vec<&str>) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false
+    })
+}
+
+fn action_schema(mut properties: Value, required: Vec<&str>) -> Value {
+    if let Some(object) = properties.as_object_mut() {
+        object.insert(
+            "follow".to_string(),
+            bool_property("Collect a short follow result after the action."),
+        );
+        object.insert(
+            "stream".to_string(),
+            bool_property("Include follow events in the returned action result."),
+        );
+        object.insert(
+            "durationMs".to_string(),
+            integer_property("Follow duration in milliseconds."),
+        );
+        object.insert(
+            "pollIntervalMs".to_string(),
+            integer_property("Follow poll interval in milliseconds."),
+        );
+        object.insert(
+            "events".to_string(),
+            json!({
+                "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" } }
+                ],
+                "description": "Optional follow event filter."
+            }),
+        );
+    }
+    mcp_schema(properties, required)
+}
+
+fn mcp_annotations(
+    read_only: bool,
+    destructive: bool,
+    idempotent: bool,
+    open_world: bool,
+) -> Value {
+    json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": open_world
+    })
+}
+
+fn string_property(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "description": description
+    })
+}
+
+fn bool_property(description: &str) -> Value {
+    json!({
+        "type": "boolean",
+        "description": description
+    })
+}
+
+fn integer_property(description: &str) -> Value {
+    json!({
+        "type": "integer",
+        "minimum": 1,
+        "description": description
+    })
+}
+
+fn enum_property(description: &str, values: Vec<&str>) -> Value {
+    json!({
+        "type": "string",
+        "enum": values,
+        "description": description
+    })
+}
+
 struct CodexAppServerClient {
     child: Child,
     stdin: ChildStdin,
@@ -4007,6 +5259,313 @@ mod tests {
         let help = command.render_long_help().to_string();
         assert!(help.contains("Inspect Codex setup"));
         assert!(help.contains("Stream thread updates"));
+    }
+
+    #[test]
+    fn cli_accepts_mcp_server_command() {
+        let parsed = Cli::try_parse_from(["codex-hermes-bridge", "mcp"]);
+        assert!(parsed.is_ok(), "mcp command should parse: {parsed:?}");
+
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Run a stdio MCP server for Hermes"));
+    }
+
+    #[test]
+    fn cli_accepts_hermes_install_command() {
+        let parsed = Cli::try_parse_from([
+            "codex-hermes-bridge",
+            "hermes",
+            "install",
+            "--server-name",
+            "codex",
+            "--hermes-command",
+            "hermes-se",
+            "--bridge-command",
+            "codex-hermes-bridge",
+            "--dry-run",
+        ]);
+        assert!(parsed.is_ok(), "hermes install should parse: {parsed:?}");
+    }
+
+    #[test]
+    fn hermes_install_dry_run_builds_mcp_add_command() {
+        let result = run_hermes_install("codex", "hermes-se", "codex-hermes-bridge", true)
+            .expect("dry-run install result");
+
+        assert_eq!(result["action"], "hermes_install");
+        assert_eq!(result["dryRun"], true);
+        assert_eq!(result["hermesCommand"], "hermes-se");
+        assert_eq!(
+            result["args"],
+            json!([
+                "mcp",
+                "add",
+                "codex",
+                "--command",
+                "codex-hermes-bridge",
+                "--args",
+                "mcp"
+            ])
+        );
+    }
+
+    #[test]
+    fn mcp_initialize_advertises_tools_capability() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "hermes-test", "version": "1.0.0" }
+            }
+        }))
+        .expect("initialize response");
+
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(
+            response["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["resources"]["listChanged"],
+            false
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["prompts"]["listChanged"],
+            false
+        );
+        assert_eq!(
+            response["result"]["serverInfo"]["name"],
+            "codex-hermes-bridge"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_list_exposes_codex_control_surface_without_watch() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .expect("tools/list response");
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<BTreeSet<_>>();
+
+        for expected in [
+            "codex_doctor",
+            "codex_threads",
+            "codex_inbox",
+            "codex_waiting",
+            "codex_show",
+            "codex_new",
+            "codex_reply",
+            "codex_approve",
+            "codex_fork",
+            "codex_archive",
+            "codex_unarchive",
+            "codex_away",
+            "codex_notify_away",
+        ] {
+            assert!(names.contains(expected), "missing MCP tool {expected}");
+        }
+        assert!(!names.contains("codex_watch"));
+
+        let doctor = tools
+            .iter()
+            .find(|tool| tool["name"] == "codex_doctor")
+            .expect("doctor tool");
+        assert_eq!(doctor["annotations"]["readOnlyHint"], true);
+
+        let archive = tools
+            .iter()
+            .find(|tool| tool["name"] == "codex_archive")
+            .expect("archive tool");
+        assert_eq!(archive["annotations"]["destructiveHint"], true);
+
+        let reply = tools
+            .iter()
+            .find(|tool| tool["name"] == "codex_reply")
+            .expect("reply tool");
+        assert_eq!(
+            reply["inputSchema"]["required"],
+            json!(["threadId", "message"])
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_returns_structured_dry_run_result() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "codex_reply",
+                "arguments": {
+                    "threadId": "thr_1",
+                    "message": "ship it",
+                    "dryRun": true
+                }
+            }
+        }))
+        .expect("tools/call response");
+
+        let result = &response["result"];
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["action"], "reply");
+        assert_eq!(result["structuredContent"]["dry_run"], true);
+        assert_eq!(result["structuredContent"]["thread_id"], "thr_1");
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"action\": \"reply\""));
+    }
+
+    #[test]
+    fn mcp_tool_errors_return_tool_result_errors() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "codex_reply",
+                "arguments": {
+                    "threadId": "thr_1",
+                    "dryRun": true
+                }
+            }
+        }))
+        .expect("tools/call response");
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("argument message is required"));
+    }
+
+    #[test]
+    fn mcp_stdio_server_handles_handshake_discovery_and_dry_run_call() {
+        let input = [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": MCP_PROTOCOL_VERSION }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "codex_approve",
+                    "arguments": {
+                        "threadId": "thr_2",
+                        "decision": "approve",
+                        "dryRun": true
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut output = Vec::new();
+
+        run_mcp_server(std::io::Cursor::new(input), &mut output).expect("stdio MCP run");
+
+        let lines = String::from_utf8(output)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0]["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
+        assert!(lines[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "codex_approve"));
+        assert_eq!(lines[2]["result"]["structuredContent"]["action"], "approve");
+        assert_eq!(lines[2]["result"]["structuredContent"]["sent_text"], "YES");
+    }
+
+    #[test]
+    fn mcp_resources_list_exposes_thread_context_resources() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "resources/list",
+            "params": {}
+        }))
+        .expect("resources/list response");
+
+        let resources = response["result"]["resources"]
+            .as_array()
+            .expect("resources array");
+        assert!(resources
+            .iter()
+            .any(|resource| resource["uri"] == "codex://inbox"));
+        assert!(resources
+            .iter()
+            .any(|resource| resource["uri"] == "codex://waiting"));
+    }
+
+    #[test]
+    fn mcp_prompts_list_and_get_codex_reply_prompt() {
+        let list = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "prompts/list",
+            "params": {}
+        }))
+        .expect("prompts/list response");
+        assert!(list["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt["name"] == "codex_reply"));
+
+        let get = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "prompts/get",
+            "params": {
+                "name": "codex_reply",
+                "arguments": {
+                    "threadId": "thr_1",
+                    "message": "Continue with tests."
+                }
+            }
+        }))
+        .expect("prompts/get response");
+        let text = get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("prompt text");
+        assert!(text.contains("codex_reply"));
+        assert!(text.contains("thr_1"));
+        assert!(text.contains("Continue with tests."));
     }
 
     #[test]

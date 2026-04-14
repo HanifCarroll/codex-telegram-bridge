@@ -22,6 +22,7 @@ The current public surface is intentionally focused on:
 - event streaming (`follow`, `watch`)
 - archive flows (`archive`, `unarchive`)
 - away-mode summaries (`away`, `notify-away`)
+- Hermes MCP integration (`mcp`, `hermes install`)
 
 If you want to add new commands or broaden the product surface, open an issue first.
 
@@ -41,3 +42,4 @@ Before opening a PR, make sure:
 - `cargo clippy --all-targets -- -D warnings` passes
 - `cargo package --allow-dirty --target-dir target/package-check` verifies the release package
 - docs/examples still match the CLI surface
+- MCP tool schemas and Hermes setup docs still match the implemented tool surface

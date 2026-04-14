@@ -10,6 +10,7 @@ This repo is currently focused on a small stable surface:
 - stream thread updates (`follow`, `watch`)
 - archive or unarchive threads (`archive`, `unarchive`)
 - emit away-mode summaries (`away`, `notify-away`)
+- expose a local MCP control plane for Hermes (`mcp`, `hermes install`)
 
 Everything documented below is intended to be part of that public surface.
 
@@ -25,6 +26,12 @@ Install the binary:
 
 ```bash
 cargo install --path .
+```
+
+Install from Git:
+
+```bash
+cargo install --git https://github.com/hanifcarroll/codex-hermes-bridge
 ```
 
 Run through the wrapper without installing:
@@ -57,6 +64,21 @@ Run a one-shot watch pass and return normalized events:
 ```bash
 codex-hermes-bridge watch --once
 ```
+
+Register the bridge with Hermes as an MCP server:
+
+```bash
+codex-hermes-bridge hermes install --dry-run
+codex-hermes-bridge hermes install
+```
+
+If you use a profile wrapper, pass it explicitly:
+
+```bash
+codex-hermes-bridge hermes install --hermes-command hermes-se
+```
+
+Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools.
 
 ## Commands
 
@@ -155,6 +177,20 @@ codex-hermes-bridge away off
 
 `notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply, approval, and completed-thread prompts. Completed-thread notifications are included by default; pass `--no-completed` to only emit active attention prompts.
 
+### Hermes MCP
+
+Run a stdio MCP server that exposes Codex thread tools to Hermes:
+
+```bash
+codex-hermes-bridge mcp
+```
+
+The MCP server exposes structured tools for `doctor`, `threads`, `inbox`, `waiting`, `show`, `new`, `fork`, `reply`, `approve`, `archive`, `unarchive`, `away`, and `notify-away`. It also exposes resources for thread context and prompts for safe inbox/reply/approval workflows.
+
+`watch` is intentionally not exposed as an MCP tool. It is a long-running event stream and belongs in the daemon lane with `watch --exec`, not in the request/response tool lane.
+
+See [docs/hermes.md](docs/hermes.md) for the Hermes-first setup guide.
+
 ## Hook examples
 
 `watch --exec` pipes one event at a time to the given command on stdin. Hook stdout and stderr pass through to the terminal, and a nonzero hook exit fails the bridge command.
@@ -227,5 +263,6 @@ Example `follow_snapshot` event:
 ## Notes
 
 - Hook commands are arbitrary local code. Only run trusted commands with `watch --exec`.
+- MCP tools can read and mutate local Codex threads. Only register this server with trusted local agents.
 - The bridge stores local state in its SQLite cache so repeated commands can reconcile thread state efficiently.
 - `doctor` is the fastest way to verify that the Codex binary can actually be resolved from your environment.
