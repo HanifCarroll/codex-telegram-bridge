@@ -153,6 +153,8 @@ enum Commands {
     NotifyAway {
         #[arg(long, default_value_t = true)]
         completed: bool,
+        #[arg(long, default_value_t = false)]
+        mark_delivered: bool,
     },
     Sync {
         #[arg(long, default_value_t = 50)]
@@ -824,7 +826,10 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Commands::NotifyAway { completed } => {
+        Commands::NotifyAway {
+            completed,
+            mark_delivered,
+        } => {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
@@ -832,7 +837,7 @@ fn run() -> Result<()> {
                 let mut client = CodexAppServerClient::connect_with_options(true)?;
                 sync_state_from_live(&mut client, &conn, now, 50, true)?;
             }
-            let result = build_notify_away_from_db(&conn, now, completed)?;
+            let result = build_notify_away_from_db(&conn, now, completed, mark_delivered)?;
             println!("{}", serde_json::to_string(&result)?);
         }
         Commands::Sync { limit } => {
@@ -4276,6 +4281,7 @@ fn build_notify_away_from_db(
     conn: &Connection,
     now: u64,
     include_completed: bool,
+    mark_delivered: bool,
 ) -> Result<Value> {
     let away_status = get_away_mode(conn)?;
     let away = away_status
@@ -4295,8 +4301,8 @@ fn build_notify_away_from_db(
     }
     let away_session_id = away_session_id.unwrap();
 
-    let waiting = list_waiting_from_db(conn, None, 0)?;
-    let inbox = list_inbox_from_db(conn, now, None, None, None, None, 0)?;
+    let waiting = list_waiting_from_db(conn, None, 1_000)?;
+    let inbox = list_inbox_from_db(conn, now, None, None, None, None, 10_000)?;
     let mut candidates = Vec::new();
 
     for thread in waiting.threads {
@@ -4345,10 +4351,20 @@ fn build_notify_away_from_db(
         if item.attention_reason == "needs_reply" || item.attention_reason == "pending_approval" {
             continue;
         }
+        let seen_during_away = item.last_seen_at.unwrap_or(0) >= away_started_at;
+        let has_preview = item
+            .delivery_preview
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
         let kind = if item.attention_reason == "completed" {
             "thread_completed"
-        } else {
+        } else if item.attention_reason == "updated"
+            || (seen_during_away && has_preview && item.attention_reason == "active")
+        {
             "thread_updated"
+        } else {
+            continue;
         };
         let delivery_key = format!(
             "{}:{}:{}:{}:{}",
@@ -4384,22 +4400,33 @@ fn build_notify_away_from_db(
         });
     }
 
-    let mut stmt = conn.prepare(
+    let raw = match conn.prepare(
         "SELECT event_key, thread_id, event_type, observed_at, payload_json
          FROM thread_events
          WHERE observed_at >= ?1
          ORDER BY observed_at ASC",
-    )?;
-    let rows = stmt.query_map(params![to_sql_i64(away_started_at)?], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    })?;
-    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    ) {
+        Ok(mut stmt) => {
+            let rows = stmt.query_map(params![to_sql_i64(away_started_at)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no such table: thread_events") {
+                Vec::new()
+            } else {
+                return Err(error.into());
+            }
+        }
+    };
     for (event_key, thread_id, event_type, _observed_at, payload_json) in raw {
         if event_type == "thread_completed" && !include_completed {
             continue;
@@ -4469,17 +4496,19 @@ fn build_notify_away_from_db(
         if exists.is_some() {
             continue;
         }
-        conn.execute(
-            "INSERT OR IGNORE INTO notify_delivery_log(delivery_key, away_session_id, thread_id, notification_type, delivered_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                candidate.delivery_key,
-                away_session_id,
-                candidate.thread_id,
-                candidate.kind,
-                to_sql_i64(now)?
-            ],
-        )?;
+        if mark_delivered {
+            conn.execute(
+                "INSERT OR IGNORE INTO notify_delivery_log(delivery_key, away_session_id, thread_id, notification_type, delivered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    candidate.delivery_key,
+                    away_session_id,
+                    candidate.thread_id,
+                    candidate.kind,
+                    to_sql_i64(now)?
+                ],
+            )?;
+        }
         notifications.push(json!({
             "type": candidate.kind,
             "threadId": candidate.thread_id,
@@ -5569,7 +5598,7 @@ raise SystemExit(1)
             .expect("record action");
         set_away_mode(&conn, true, 1000).expect("away on");
 
-        let notify = build_notify_away_from_db(&conn, 1400, true).expect("notify");
+        let notify = build_notify_away_from_db(&conn, 1400, true, true).expect("notify");
         let notifications = notify["notifications"].as_array().unwrap();
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0]["threadId"], "thr_done");
@@ -5584,7 +5613,7 @@ raise SystemExit(1)
         let cli = Cli::parse_from(["codex-hermes-bridge", "notify-away"]);
 
         match cli.command {
-            Commands::NotifyAway { completed } => assert!(completed),
+            Commands::NotifyAway { completed, .. } => assert!(completed),
             _ => panic!("expected notify-away command"),
         }
     }
@@ -5651,7 +5680,7 @@ raise SystemExit(1)
         );
         upsert_thread_snapshot(&conn, &completed, 4000).expect("upsert completed");
 
-        let notify = build_notify_away_from_db(&conn, 5000, true).expect("notify");
+        let notify = build_notify_away_from_db(&conn, 5000, true, true).expect("notify");
         let notifications = notify["notifications"].as_array().unwrap();
 
         assert!(notifications.iter().any(|notification| {
@@ -5674,13 +5703,13 @@ raise SystemExit(1)
         completed.last_preview = Some("First summary".to_string());
         upsert_thread_snapshot(&conn, &completed, 3000).expect("upsert first");
 
-        let first = build_notify_away_from_db(&conn, 4000, true).expect("first notify");
+        let first = build_notify_away_from_db(&conn, 4000, true, true).expect("first notify");
         assert_eq!(first["notifications"].as_array().unwrap().len(), 1);
 
         completed.last_preview = Some("Second summary".to_string());
         upsert_thread_snapshot(&conn, &completed, 5000).expect("upsert second");
 
-        let second = build_notify_away_from_db(&conn, 6000, true).expect("second notify");
+        let second = build_notify_away_from_db(&conn, 6000, true, true).expect("second notify");
         let notifications = second["notifications"].as_array().unwrap();
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0]["text"]
@@ -5708,7 +5737,7 @@ raise SystemExit(1)
         ));
         upsert_thread_snapshot(&conn, &completed, 3000).expect("upsert completed");
 
-        let notify = build_notify_away_from_db(&conn, 4000, true).expect("notify");
+        let notify = build_notify_away_from_db(&conn, 4000, true, true).expect("notify");
         let text = notify["notifications"][0]["text"].as_str().unwrap();
 
         assert!(text.contains("The important final line survives."));
@@ -5746,7 +5775,7 @@ raise SystemExit(1)
             .expect("updated_at");
         assert_eq!(updated_at, 1_776_047_900_000);
 
-        let notify = build_notify_away_from_db(&conn, 600, true).expect("notify");
+        let notify = build_notify_away_from_db(&conn, 600, true, true).expect("notify");
         let notifications = notify["notifications"].as_array().unwrap();
         assert!(notifications.iter().any(|notification| {
             notification["type"] == "thread_completed" && notification["threadId"] == "thr_seconds"
@@ -5805,7 +5834,7 @@ raise SystemExit(1)
         set_setting_text(&conn, "away_session_id", "session-1").expect("set away session");
         set_setting(&conn, "away_started_at", 1000).expect("set away started at");
 
-        let first = build_notify_away_from_db(&conn, 2500, true).expect("first notify");
+        let first = build_notify_away_from_db(&conn, 2500, true, true).expect("first notify");
         assert_eq!(first["action"], "notify-away");
         assert_eq!(first["notifications"].as_array().unwrap().len(), 1);
         assert!(first["notifications"][0]["text"]
@@ -5813,7 +5842,7 @@ raise SystemExit(1)
             .unwrap()
             .contains("Tell me how you want me to reply"));
 
-        let second = build_notify_away_from_db(&conn, 2600, true).expect("second notify");
+        let second = build_notify_away_from_db(&conn, 2600, true, true).expect("second notify");
         assert_eq!(second["notifications"].as_array().unwrap().len(), 0);
     }
 
