@@ -4,10 +4,12 @@ use notify::Watcher as _;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -211,7 +213,7 @@ enum AwayCommands {
 
 #[derive(Subcommand, Debug)]
 enum HermesCommands {
-    #[command(about = "Register this bridge as a Hermes MCP server")]
+    #[command(about = "Register this bridge with Hermes MCP and optional notification delivery")]
     Install {
         #[arg(long, default_value = "codex")]
         server_name: String,
@@ -219,8 +221,27 @@ enum HermesCommands {
         hermes_command: String,
         #[arg(long, default_value = "codex-hermes-bridge")]
         bridge_command: String,
+        #[arg(long, default_value = "codex-watch")]
+        webhook_name: String,
+        #[arg(long, default_value = DEFAULT_HERMES_WEBHOOK_EVENTS)]
+        webhook_events: String,
+        #[arg(long)]
+        webhook_deliver: Option<String>,
+        #[arg(long)]
+        webhook_deliver_chat_id: Option<String>,
+        #[arg(long)]
+        webhook_secret: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+    },
+    #[command(about = "Post one watch event to a signed Hermes webhook")]
+    PostWebhook {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        secret: String,
+        #[arg(long, default_value_t = 10000)]
+        timeout_ms: u64,
     },
 }
 
@@ -1047,10 +1068,37 @@ fn run() -> Result<()> {
                 server_name,
                 hermes_command,
                 bridge_command,
+                webhook_name,
+                webhook_events,
+                webhook_deliver,
+                webhook_deliver_chat_id,
+                webhook_secret,
                 dry_run,
             } => {
+                let result = run_hermes_install(HermesInstallOptions {
+                    server_name: &server_name,
+                    hermes_command: &hermes_command,
+                    bridge_command: &bridge_command,
+                    webhook_name: &webhook_name,
+                    webhook_events: &webhook_events,
+                    webhook_deliver: webhook_deliver.as_deref(),
+                    webhook_deliver_chat_id: webhook_deliver_chat_id.as_deref(),
+                    webhook_secret: webhook_secret.as_deref(),
+                    dry_run,
+                })?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            HermesCommands::PostWebhook {
+                url,
+                secret,
+                timeout_ms,
+            } => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let event: Value = serde_json::from_str(input.trim())
+                    .context("failed to parse watch event JSON from stdin")?;
                 let result =
-                    run_hermes_install(&server_name, &hermes_command, &bridge_command, dry_run)?;
+                    post_hermes_webhook(&url, &secret, &event, Duration::from_millis(timeout_ms))?;
                 println!("{}", serde_json::to_string(&result)?);
             }
         },
@@ -3718,69 +3766,536 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
         .collect())
 }
 
-fn run_hermes_install(
-    server_name: &str,
-    hermes_command: &str,
-    bridge_command: &str,
+const DEFAULT_HERMES_WEBHOOK_EVENTS: &str = "thread_waiting,thread_completed,thread_status_changed";
+
+const HERMES_WEBHOOK_PROMPT: &str = r#"Codex changed without you asking.
+
+Use the event payload to send Hanif a concise notification. If the event says Codex needs a reply or approval, ask for the exact reply or decision. If Hanif responds, use the Codex MCP tools for this same thread_id.
+
+If reply_route_marker is present in the payload, include that exact value as the final line so Hermes can route a platform reply back to the Codex thread.
+
+Event payload:
+{__raw__}"#;
+
+#[derive(Debug, Clone, Copy)]
+struct HermesInstallOptions<'a> {
+    server_name: &'a str,
+    hermes_command: &'a str,
+    bridge_command: &'a str,
+    webhook_name: &'a str,
+    webhook_events: &'a str,
+    webhook_deliver: Option<&'a str>,
+    webhook_deliver_chat_id: Option<&'a str>,
+    webhook_secret: Option<&'a str>,
     dry_run: bool,
-) -> Result<Value> {
-    if server_name.trim().is_empty() {
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HermesWebhookSubscription {
+    url: Option<String>,
+    secret: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpTarget {
+    host: String,
+    port: u16,
+    path: String,
+    host_header: String,
+}
+
+fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
+    let server_name = options.server_name.trim();
+    let hermes_command = options.hermes_command.trim();
+    let bridge_command = options.bridge_command.trim();
+    let webhook_name = options.webhook_name.trim();
+    let webhook_events = options.webhook_events.trim();
+
+    if server_name.is_empty() {
         bail!("server name cannot be empty");
     }
-    if hermes_command.trim().is_empty() {
+    if hermes_command.is_empty() {
         bail!("hermes command cannot be empty");
     }
-    if bridge_command.trim().is_empty() {
+    if bridge_command.is_empty() {
         bail!("bridge command cannot be empty");
     }
+    if webhook_name.is_empty() {
+        bail!("webhook name cannot be empty");
+    }
+    if webhook_events.is_empty() {
+        bail!("webhook events cannot be empty");
+    }
 
-    let args = vec![
+    let mcp_args = vec![
         "mcp".to_string(),
         "add".to_string(),
-        server_name.trim().to_string(),
+        server_name.to_string(),
         "--command".to_string(),
-        bridge_command.trim().to_string(),
+        bridge_command.to_string(),
         "--args".to_string(),
         "mcp".to_string(),
     ];
+    let planned_webhook_url = default_hermes_webhook_url(webhook_name);
+    let webhook_secret = options
+        .webhook_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let planned_secret = webhook_secret.unwrap_or("<secret printed by hermes webhook subscribe>");
+    let planned_watcher_command = hermes_watcher_command(
+        bridge_command,
+        webhook_events,
+        &planned_webhook_url,
+        planned_secret,
+    );
+    let webhook_deliver = options
+        .webhook_deliver
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let webhook_deliver_chat_id = options
+        .webhook_deliver_chat_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let webhook_args = webhook_deliver.map(|deliver| {
+        hermes_webhook_subscribe_args(
+            webhook_name,
+            webhook_events,
+            deliver,
+            webhook_deliver_chat_id,
+            webhook_secret,
+        )
+    });
+
     let base = json!({
         "ok": true,
         "action": "hermes_install",
-        "dryRun": dry_run,
-        "serverName": server_name.trim(),
-        "hermesCommand": hermes_command.trim(),
-        "bridgeCommand": bridge_command.trim(),
-        "args": args.clone(),
-        "nextStep": "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
+        "dryRun": options.dry_run,
+        "serverName": server_name,
+        "hermesCommand": hermes_command,
+        "bridgeCommand": bridge_command,
+        "args": mcp_args.clone(),
+        "mcp": {
+            "configured": true,
+            "args": mcp_args.clone(),
+            "nextStep": "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
+        },
+        "notificationLane": {
+            "configured": webhook_args.is_some(),
+            "webhookName": webhook_name,
+            "events": webhook_events,
+            "deliver": webhook_deliver,
+            "deliverChatId": webhook_deliver_chat_id,
+            "webhookUrl": planned_webhook_url,
+            "webhookArgs": webhook_args.clone(),
+            "watcherCommand": planned_watcher_command,
+            "nextStep": if webhook_args.is_some() {
+                "Run watcherCommand as a long-lived local process so Codex changes proactively notify Hermes."
+            } else {
+                "Pass --webhook-deliver, for example --webhook-deliver telegram, to install proactive Hermes notifications."
+            }
+        },
+        "nextStep": "Restart Hermes for MCP discovery, then run notificationLane.watcherCommand if notificationLane.configured is true."
     });
-    if dry_run {
+    if options.dry_run {
         return Ok(base);
     }
 
-    let output = Command::new(hermes_command.trim())
-        .args(&args)
+    let mcp_output = Command::new(hermes_command)
+        .args(&mcp_args)
         .output()
         .with_context(|| format!("failed to run {hermes_command} mcp add"))?;
-    if !output.status.success() {
+    if !mcp_output.status.success() {
         bail!(
             "Hermes MCP registration failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            mcp_output.status,
+            String::from_utf8_lossy(&mcp_output.stderr).trim()
         );
     }
+
+    let notification_result = if let Some(webhook_args) = webhook_args {
+        let output = Command::new(hermes_command)
+            .args(&webhook_args)
+            .output()
+            .with_context(|| format!("failed to run {hermes_command} webhook subscribe"))?;
+        if !output.status.success() {
+            bail!(
+                "Hermes webhook subscription failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let parsed = parse_hermes_webhook_subscribe_output(&stdout);
+        let webhook_url = parsed
+            .url
+            .clone()
+            .unwrap_or_else(|| default_hermes_webhook_url(webhook_name));
+        let resolved_secret = webhook_secret
+            .map(str::to_string)
+            .or(parsed.secret.clone())
+            .context("Hermes webhook subscription did not print a secret; pass --webhook-secret")?;
+        let watcher_command = hermes_watcher_command(
+            bridge_command,
+            webhook_events,
+            &webhook_url,
+            &resolved_secret,
+        );
+        Some(json!({
+            "configured": true,
+            "args": webhook_args,
+            "stdout": stdout,
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            "webhookUrl": webhook_url,
+            "watcherCommand": watcher_command,
+            "parsed": {
+                "url": parsed.url,
+                "secret": parsed.secret.map(|_| "<redacted>")
+            }
+        }))
+    } else {
+        None
+    };
 
     Ok(json!({
         "ok": true,
         "action": "hermes_install",
         "dryRun": false,
-        "serverName": server_name.trim(),
-        "hermesCommand": hermes_command.trim(),
-        "bridgeCommand": bridge_command.trim(),
-        "args": args,
-        "stdout": String::from_utf8_lossy(&output.stdout).trim(),
-        "stderr": String::from_utf8_lossy(&output.stderr).trim(),
-        "nextStep": "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
+        "serverName": server_name,
+        "hermesCommand": hermes_command,
+        "bridgeCommand": bridge_command,
+        "args": mcp_args,
+        "mcp": {
+            "configured": true,
+            "stdout": String::from_utf8_lossy(&mcp_output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&mcp_output.stderr).trim()
+        },
+        "notificationLane": notification_result.unwrap_or_else(|| json!({
+            "configured": false,
+            "nextStep": "Pass --webhook-deliver, for example --webhook-deliver telegram, to install proactive Hermes notifications."
+        })),
+        "nextStep": "Restart Hermes for MCP discovery, then run notificationLane.watcherCommand if notificationLane.configured is true."
     }))
+}
+
+fn hermes_webhook_subscribe_args(
+    webhook_name: &str,
+    webhook_events: &str,
+    deliver: &str,
+    deliver_chat_id: Option<&str>,
+    secret: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "webhook".to_string(),
+        "subscribe".to_string(),
+        webhook_name.to_string(),
+        "--description".to_string(),
+        "Proactive Codex thread notifications from codex-hermes-bridge".to_string(),
+        "--events".to_string(),
+        webhook_events.to_string(),
+        "--prompt".to_string(),
+        HERMES_WEBHOOK_PROMPT.to_string(),
+        "--deliver".to_string(),
+        deliver.to_string(),
+    ];
+    if let Some(chat_id) = deliver_chat_id {
+        args.push("--deliver-chat-id".to_string());
+        args.push(chat_id.to_string());
+    }
+    if let Some(secret) = secret {
+        args.push("--secret".to_string());
+        args.push(secret.to_string());
+    }
+    args
+}
+
+fn default_hermes_webhook_url(webhook_name: &str) -> String {
+    format!("http://localhost:8644/webhooks/{webhook_name}")
+}
+
+fn hermes_watcher_command(
+    bridge_command: &str,
+    events: &str,
+    webhook_url: &str,
+    webhook_secret: &str,
+) -> String {
+    let inner = format!(
+        "{} hermes post-webhook --url {} --secret {}",
+        shell_quote(bridge_command),
+        shell_quote(webhook_url),
+        shell_quote(webhook_secret)
+    );
+    format!(
+        "{} watch --events {} --exec {}",
+        shell_quote(bridge_command),
+        shell_quote(events),
+        shell_quote(&inner)
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ',' | ':' | '=')
+        })
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn parse_hermes_webhook_subscribe_output(output: &str) -> HermesWebhookSubscription {
+    let mut subscription = HermesWebhookSubscription {
+        url: None,
+        secret: None,
+    };
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if (lower.starts_with("url:") || lower.starts_with("webhook url:"))
+            && subscription.url.is_none()
+        {
+            if let Some((_, value)) = trimmed.split_once(':') {
+                subscription.url = Some(value.trim().to_string());
+            }
+        } else if lower.starts_with("secret:") && subscription.secret.is_none() {
+            if let Some((_, value)) = trimmed.split_once(':') {
+                subscription.secret = Some(value.trim().to_string());
+            }
+        }
+    }
+    subscription
+}
+
+fn post_hermes_webhook(url: &str, secret: &str, event: &Value, timeout: Duration) -> Result<Value> {
+    if secret.trim().is_empty() {
+        bail!("webhook secret cannot be empty");
+    }
+    let target = parse_http_url(url)?;
+    let payload = hermes_webhook_payload(event);
+    let body = serde_json::to_vec(&payload)?;
+    let event_type = payload
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or("codex_event")
+        .to_string();
+    let delivery_id = hermes_webhook_delivery_id(event);
+    let signature = hmac_sha256_hex(secret.trim().as_bytes(), &body);
+    let mut stream = TcpStream::connect((target.host.as_str(), target.port))
+        .with_context(|| format!("failed to connect to Hermes webhook at {url}"))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Hub-Signature-256: sha256={}\r\nX-GitHub-Event: {}\r\nX-GitHub-Delivery: {}\r\nConnection: close\r\n\r\n",
+        target.path,
+        target.host_header,
+        body.len(),
+        signature,
+        event_type,
+        delivery_id
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let status_line = response.lines().next().unwrap_or_default().to_string();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .context("Hermes webhook response did not include an HTTP status")?;
+    if !(200..300).contains(&status_code) {
+        bail!("Hermes webhook returned {status_line}");
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "hermes_post_webhook",
+        "eventType": event_type,
+        "deliveryId": delivery_id,
+        "statusCode": status_code,
+        "statusLine": status_line
+    }))
+}
+
+fn parse_http_url(url: &str) -> Result<HttpTarget> {
+    let trimmed = url.trim();
+    let rest = trimmed
+        .strip_prefix("http://")
+        .context("Hermes webhook URL must use http://")?;
+    let (authority, path_suffix) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.is_empty() {
+        bail!("Hermes webhook URL is missing a host");
+    }
+    if authority.contains('@') {
+        bail!("Hermes webhook URL must not include credentials");
+    }
+    let (host, port, explicit_port) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .context("IPv6 webhook URL host is missing closing bracket")?;
+        let host = authority[1..end].to_string();
+        let suffix = &authority[(end + 1)..];
+        let port = if let Some(raw) = suffix.strip_prefix(':') {
+            raw.parse::<u16>()
+                .with_context(|| format!("invalid webhook port: {raw}"))?
+        } else if suffix.is_empty() {
+            80
+        } else {
+            bail!("invalid webhook URL authority: {authority}");
+        };
+        (host, port, port != 80)
+    } else if let Some((host, raw_port)) = authority.rsplit_once(':') {
+        if host.is_empty() {
+            bail!("Hermes webhook URL is missing a host");
+        }
+        let port = raw_port
+            .parse::<u16>()
+            .with_context(|| format!("invalid webhook port: {raw_port}"))?;
+        (host.to_string(), port, port != 80)
+    } else {
+        (authority.to_string(), 80, false)
+    };
+    if host.trim().is_empty() {
+        bail!("Hermes webhook URL is missing a host");
+    }
+    let path = format!("/{}", path_suffix);
+    let host_header = if explicit_port {
+        if authority.starts_with('[') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
+    } else {
+        host.clone()
+    };
+    Ok(HttpTarget {
+        host,
+        port,
+        path,
+        host_header,
+    })
+}
+
+fn hermes_webhook_payload(event: &Value) -> Value {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("codex_event");
+    let thread_id = event_thread_id(event);
+    let reply_route = thread_id.as_ref().map(|thread_id| {
+        json!({
+            "route_kind": "codex_reply",
+            "thread_id": thread_id
+        })
+    });
+    json!({
+        "event_type": event_type,
+        "source": "codex-hermes-bridge",
+        "thread_id": thread_id,
+        "route_kind": "codex_reply",
+        "reply_route": reply_route,
+        "reply_route_marker": reply_route.as_ref().map(|route| {
+            format!("THREAD_ROUTE {}", serde_json::to_string(route).unwrap_or_default())
+        }),
+        "event": event
+    })
+}
+
+fn event_thread_id(event: &Value) -> Option<String> {
+    event
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| event.pointer("/thread/threadId").and_then(Value::as_str))
+        .or_else(|| event.pointer("/thread/id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn hermes_webhook_delivery_id(event: &Value) -> String {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("codex_event");
+    let thread_id = event_thread_id(event).unwrap_or_else(|| "unknown".to_string());
+    let discriminator = event
+        .get("eventKey")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            event
+                .get("updatedAt")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+        })
+        .or_else(|| {
+            event
+                .get("observedAt")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+        })
+        .unwrap_or_else(|| {
+            serde_json::to_string(event)
+                .map(|raw| sha256_hex(raw.as_bytes()))
+                .unwrap_or_else(|_| "event".to_string())
+        });
+    sanitize_delivery_id(&format!("codex:{event_type}:{thread_id}:{discriminator}"))
+}
+
+fn sanitize_delivery_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        let digest = Sha256::digest(key);
+        key_block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut outer_key_pad = [0u8; BLOCK_SIZE];
+    let mut inner_key_pad = [0u8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        outer_key_pad[i] = key_block[i] ^ 0x5c;
+        inner_key_pad[i] = key_block[i] ^ 0x36;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_key_pad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_key_pad);
+    outer.update(inner_hash);
+    hex_lower(&outer.finalize())
+}
+
+fn sha256_hex(message: &[u8]) -> String {
+    hex_lower(&Sha256::digest(message))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -5289,9 +5804,58 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_hermes_notification_install_flags() {
+        let parsed = Cli::try_parse_from([
+            "codex-hermes-bridge",
+            "hermes",
+            "install",
+            "--hermes-command",
+            "hermes-se",
+            "--webhook-deliver",
+            "telegram",
+            "--webhook-deliver-chat-id",
+            "12345",
+            "--webhook-secret",
+            "test-secret",
+            "--dry-run",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "hermes install should accept notification lane flags: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn cli_accepts_hermes_post_webhook_command() {
+        let parsed = Cli::try_parse_from([
+            "codex-hermes-bridge",
+            "hermes",
+            "post-webhook",
+            "--url",
+            "http://localhost:8644/webhooks/codex-watch",
+            "--secret",
+            "test-secret",
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "hermes post-webhook should parse: {parsed:?}"
+        );
+    }
+
+    #[test]
     fn hermes_install_dry_run_builds_mcp_add_command() {
-        let result = run_hermes_install("codex", "hermes-se", "codex-hermes-bridge", true)
-            .expect("dry-run install result");
+        let result = run_hermes_install(HermesInstallOptions {
+            server_name: "codex",
+            hermes_command: "hermes-se",
+            bridge_command: "codex-hermes-bridge",
+            webhook_name: "codex-watch",
+            webhook_events: DEFAULT_HERMES_WEBHOOK_EVENTS,
+            webhook_deliver: None,
+            webhook_deliver_chat_id: None,
+            webhook_secret: None,
+            dry_run: true,
+        })
+        .expect("dry-run install result");
 
         assert_eq!(result["action"], "hermes_install");
         assert_eq!(result["dryRun"], true);
@@ -5308,6 +5872,179 @@ mod tests {
                 "mcp"
             ])
         );
+    }
+
+    #[test]
+    fn hermes_install_dry_run_builds_notification_lane() {
+        let result = run_hermes_install(HermesInstallOptions {
+            server_name: "codex",
+            hermes_command: "hermes-se",
+            bridge_command: "codex-hermes-bridge",
+            webhook_name: "codex-watch",
+            webhook_events: DEFAULT_HERMES_WEBHOOK_EVENTS,
+            webhook_deliver: Some("telegram"),
+            webhook_deliver_chat_id: Some("12345"),
+            webhook_secret: Some("test-secret"),
+            dry_run: true,
+        })
+        .expect("dry-run install result");
+
+        assert_eq!(result["notificationLane"]["configured"], true);
+        assert_eq!(result["notificationLane"]["deliver"], "telegram");
+        assert_eq!(
+            result["notificationLane"]["webhookUrl"],
+            "http://localhost:8644/webhooks/codex-watch"
+        );
+        assert_eq!(
+            result["notificationLane"]["webhookArgs"],
+            json!([
+                "webhook",
+                "subscribe",
+                "codex-watch",
+                "--description",
+                "Proactive Codex thread notifications from codex-hermes-bridge",
+                "--events",
+                DEFAULT_HERMES_WEBHOOK_EVENTS,
+                "--prompt",
+                HERMES_WEBHOOK_PROMPT,
+                "--deliver",
+                "telegram",
+                "--deliver-chat-id",
+                "12345",
+                "--secret",
+                "test-secret"
+            ])
+        );
+        let watcher = result["notificationLane"]["watcherCommand"]
+            .as_str()
+            .expect("watcher command");
+        assert!(watcher.contains("watch --events"));
+        assert!(watcher.contains("hermes post-webhook"));
+        assert!(watcher.contains("--secret test-secret"));
+    }
+
+    #[test]
+    fn parse_hermes_webhook_subscribe_output_extracts_url_and_secret() {
+        let parsed = parse_hermes_webhook_subscribe_output(
+            "Subscribed.\nURL: http://localhost:8644/webhooks/codex-watch\nSecret: abc123\n",
+        );
+
+        assert_eq!(
+            parsed,
+            HermesWebhookSubscription {
+                url: Some("http://localhost:8644/webhooks/codex-watch".to_string()),
+                secret: Some("abc123".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_http_url_handles_localhost_webhook() {
+        let parsed =
+            parse_http_url("http://localhost:8644/webhooks/codex-watch").expect("parsed URL");
+
+        assert_eq!(
+            parsed,
+            HttpTarget {
+                host: "localhost".to_string(),
+                port: 8644,
+                path: "/webhooks/codex-watch".to_string(),
+                host_header: "localhost:8644".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_hex_matches_known_vector() {
+        assert_eq!(
+            hmac_sha256_hex(b"key", b"The quick brown fox jumps over the lazy dog"),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn hermes_webhook_payload_includes_reply_route_marker() {
+        let payload = hermes_webhook_payload(&json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "thread": {
+                "displayName": "Needs reply"
+            }
+        }));
+
+        assert_eq!(payload["event_type"], "thread_waiting");
+        assert_eq!(payload["thread_id"], "thr_1");
+        assert_eq!(payload["reply_route"]["route_kind"], "codex_reply");
+        assert_eq!(payload["reply_route"]["thread_id"], "thr_1");
+        assert_eq!(
+            payload["reply_route_marker"],
+            "THREAD_ROUTE {\"route_kind\":\"codex_reply\",\"thread_id\":\"thr_1\"}"
+        );
+    }
+
+    #[test]
+    fn post_hermes_webhook_posts_signed_request_to_local_server() {
+        fn header_end(data: &[u8]) -> Option<usize> {
+            data.windows(4).position(|window| window == b"\r\n\r\n")
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept webhook request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert_ne!(read, 0, "client closed before request completed");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = header_end(&request) {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .and_then(|raw| raw.parse::<usize>().ok())
+                        })
+                        .expect("content length");
+                    if request.len() >= end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nOK")
+                .expect("write response");
+            String::from_utf8(request).expect("request utf8")
+        });
+
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 42
+        });
+        let result = post_hermes_webhook(
+            &format!("http://{addr}/webhooks/codex-watch"),
+            "test-secret",
+            &event,
+            Duration::from_secs(2),
+        )
+        .expect("post webhook");
+        let request = server.join().expect("server thread");
+        let (headers, body) = request.split_once("\r\n\r\n").expect("request body");
+        let expected_signature = hmac_sha256_hex(b"test-secret", body.as_bytes());
+        let payload: Value = serde_json::from_str(body).expect("payload json");
+
+        assert_eq!(result["statusCode"], 202);
+        assert!(headers.starts_with("POST /webhooks/codex-watch HTTP/1.1"));
+        assert!(headers.contains("X-GitHub-Event: thread_waiting"));
+        assert!(headers.contains("X-GitHub-Delivery: codex-thread_waiting-thr_1-42"));
+        assert!(headers.contains(&format!("X-Hub-Signature-256: sha256={expected_signature}")));
+        assert_eq!(payload["event_type"], "thread_waiting");
+        assert_eq!(payload["thread_id"], "thr_1");
     }
 
     #[test]

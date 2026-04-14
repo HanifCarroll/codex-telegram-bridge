@@ -13,5 +13,6 @@ Initial OSS release candidate.
 - Emit away-mode notification summaries with `away` and `notify-away`.
 - Expose a stdio MCP server for Hermes with structured Codex control tools.
 - Expose MCP resources and prompts for Codex thread context and safer Hermes workflows.
-- Add a `hermes install` helper that registers the bridge through `hermes mcp add`.
+- Add a `hermes install` helper that registers the bridge through `hermes mcp add` and can subscribe a Hermes webhook notification route.
+- Add `hermes post-webhook` so `watch --exec` can push signed Codex change events into Hermes proactively.
 - Include generic hook examples for printing events and sending Telegram notifications.

@@ -11,6 +11,7 @@ This repo is currently focused on a small stable surface:
 - archive or unarchive threads (`archive`, `unarchive`)
 - emit away-mode summaries (`away`, `notify-away`)
 - expose a local MCP control plane for Hermes (`mcp`, `hermes install`)
+- push Codex watch events into Hermes through signed local webhooks (`hermes post-webhook`)
 
 Everything documented below is intended to be part of that public surface.
 
@@ -65,11 +66,14 @@ Run a one-shot watch pass and return normalized events:
 codex-hermes-bridge watch --once
 ```
 
-Register the bridge with Hermes as an MCP server:
+Register the bridge with Hermes. This installs the MCP control lane. Add `--webhook-deliver` to also install the proactive notification lane:
 
 ```bash
 codex-hermes-bridge hermes install --dry-run
 codex-hermes-bridge hermes install
+codex-hermes-bridge hermes install \
+  --webhook-deliver telegram \
+  --webhook-deliver-chat-id <chat-id>
 ```
 
 If you use a profile wrapper, pass it explicitly:
@@ -78,7 +82,7 @@ If you use a profile wrapper, pass it explicitly:
 codex-hermes-bridge hermes install --hermes-command hermes-se
 ```
 
-Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools.
+Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools. If you installed the notification lane, run the printed `notificationLane.watcherCommand` as a long-lived local process. That command is what makes Codex changes notify Hermes without Hermes asking first.
 
 ## Commands
 
@@ -150,6 +154,18 @@ Useful flags:
 - `--events <csv>`: filter emitted events
 - `--exec <command>`: pipe each emitted event to a hook command on stdin
 
+### Push watch events to Hermes
+
+`hermes post-webhook` reads one watch event from stdin, wraps it for Hermes, signs it with `X-Hub-Signature-256`, and posts it to a local Hermes webhook route.
+
+```bash
+codex-hermes-bridge watch \
+  --events thread_waiting,thread_completed,thread_status_changed \
+  --exec 'codex-hermes-bridge hermes post-webhook --url http://localhost:8644/webhooks/codex-watch --secret <secret>'
+```
+
+Use `codex-hermes-bridge hermes install --webhook-deliver ...` to generate the exact command for your Hermes profile.
+
 ### Archive threads
 
 Archive explicit threads or selected inbox rows.
@@ -187,7 +203,7 @@ codex-hermes-bridge mcp
 
 The MCP server exposes structured tools for `doctor`, `threads`, `inbox`, `waiting`, `show`, `new`, `fork`, `reply`, `approve`, `archive`, `unarchive`, `away`, and `notify-away`. It also exposes resources for thread context and prompts for safe inbox/reply/approval workflows.
 
-`watch` is intentionally not exposed as an MCP tool. It is a long-running event stream and belongs in the daemon lane with `watch --exec`, not in the request/response tool lane.
+`watch` is intentionally not exposed as an MCP tool. It is a long-running event stream and belongs in the notification lane with `watch --exec`, not in the request/response tool lane.
 
 See [docs/hermes.md](docs/hermes.md) for the Hermes-first setup guide.
 
