@@ -4374,8 +4374,8 @@ fn build_notify_away_from_db(
             item.updated_at.unwrap_or(0),
             item.delivery_preview.clone().unwrap_or_default()
         );
-        let summary = if kind == "thread_completed" {
-            preserve_message_body(item.delivery_preview.as_deref(), 3500)
+        let summary = if kind == "thread_completed" || kind == "thread_updated" {
+            preserve_message_body(item.delivery_preview.as_deref(), 20_000)
         } else {
             item.last_preview.clone()
         };
