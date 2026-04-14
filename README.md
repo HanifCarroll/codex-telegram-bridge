@@ -1,21 +1,17 @@
 # codex-hermes-bridge
 
-Rust implementation of `codex-hermes-bridge`: a CLI bridge for inspecting Codex threads, relaying actions, and streaming JSON events for automation.
+`codex-hermes-bridge` is a Rust CLI for inspecting Codex threads, replying or approving when Codex needs attention, and streaming normalized JSON events for automation.
 
-## Current model
+## Stable public surface
 
-Stable product path:
-- thread inspection and actions (`threads`, `show`, `reply`, `approve`, `waiting`, `sync`)
-- event streaming via `follow` and `watch`
-- hook integration via `watch --exec`
-- safe archive/unarchive flows with dry-run support
-- away-mode notification summaries via `notify-away`, including completed threads by default
+This repo is currently focused on a small stable surface:
+- inspect threads and waiting work (`threads`, `show`, `waiting`, `inbox`, `sync`)
+- take action on a thread (`reply`, `approve`)
+- stream thread updates (`follow`, `watch`)
+- archive or unarchive threads (`archive`, `unarchive`)
+- emit away-mode summaries (`away`, `notify-away`)
 
-Experimental path:
-- `follow --experimental-realtime`
-- negotiates `experimentalApi: true`
-- attempts dedicated `thread/realtime/*` methods
-- should be treated as research/early-adopter functionality, not the backbone
+Everything documented below is intended to be part of that public surface.
 
 ## Install
 
@@ -25,7 +21,7 @@ Build locally:
 cargo build
 ```
 
-Install the Rust binary:
+Install the binary:
 
 ```bash
 cargo install --path .
@@ -37,25 +33,65 @@ Run through the wrapper without installing:
 bin/codex-hermes-bridge --help
 ```
 
-The wrapper builds `target/debug/codex-hermes-bridge` on first use and then execs it.
+The wrapper prefers `target/release/codex-hermes-bridge`, falls back to `target/debug/codex-hermes-bridge`, and builds the release binary on first use.
 
-Codex binary resolution checks each candidate with `codex --version`.
-If `CODEX_BIN` points at a missing or broken executable, the bridge skips it and falls back to workspace-local, platform-known Codex.app installs, then PATH.
-Prefer the bundled Codex.app binary for desktop automation; stale global CLI installs can be incompatible with the app's state database.
+`codex-hermes-bridge` resolves the Codex binary by checking each candidate with `codex --version`.
+If `CODEX_BIN` points at a missing or broken executable, the bridge skips it and falls back to other known candidates before using `PATH`.
+
+## Quick start
+
+Inspect the current Codex setup:
+
+```bash
+codex-hermes-bridge doctor
+```
+
+List recent threads:
+
+```bash
+codex-hermes-bridge threads --limit 5
+```
+
+Run a one-shot watch pass and return normalized events:
+
+```bash
+codex-hermes-bridge watch --once
+```
 
 ## Commands
 
+### Inspect threads
+
+```bash
+codex-hermes-bridge threads --limit 25
+codex-hermes-bridge show <threadId>
+codex-hermes-bridge waiting --limit 25
+codex-hermes-bridge sync --limit 50
+```
+
+### Reply or approve
+
+```bash
+codex-hermes-bridge reply <threadId> --message "please continue"
+codex-hermes-bridge approve <threadId> --decision approve
+```
+
 ### Follow a thread
 
-Stream JSON events for a thread.
+Stream normalized JSON events for a thread.
 
 ```bash
 codex-hermes-bridge follow <threadId>
 codex-hermes-bridge follow <threadId> --message "please continue" --duration 3000
 codex-hermes-bridge follow <threadId> --poll-interval 500
 codex-hermes-bridge follow <threadId> --events follow_snapshot,item_completed
-codex-hermes-bridge follow <threadId> --experimental-realtime
 ```
+
+Useful flags:
+- `--message <text>`: starts a turn before following
+- `--duration <ms>`: follow window length
+- `--poll-interval <ms>`: periodic thread snapshot refresh cadence
+- `--events <csv>`: only emit matching event types
 
 ### Composed follow flows
 
@@ -76,30 +112,21 @@ For live JSONL streaming instead, add `--stream`:
 codex-hermes-bridge new --message "start work" --follow --stream --events follow_snapshot,item_completed
 ```
 
-Useful flags:
-- `--message <text>`: starts a turn before following
-- `--duration <ms>`: follow window length
-- `--poll-interval <ms>`: periodic thread snapshot refresh cadence
-- `--events <csv>`: only emit matching event types
-- `--experimental-realtime`: opt into experimental realtime probing
-
 ### Watch for changes
 
-Stream JSON events from sync reconciliation plus normalized live notifications.
+Stream normalized JSON events from sync reconciliation.
 
 ```bash
 codex-hermes-bridge watch
 codex-hermes-bridge watch --once
 codex-hermes-bridge watch --events thread_waiting,thread_completed,item_completed
-codex-hermes-bridge watch --exec "python3 examples/hermes-codex-hook.py"
+codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
 ```
 
 Useful flags:
 - `--once`: run one sync pass and return JSON
 - `--events <csv>`: filter emitted events
 - `--exec <command>`: pipe each emitted event to a hook command on stdin
-
-The app-server reader runs continuously while the client is alive, so live notifications that arrive between request/response cycles are still available to `follow`, `watch`, and hooks.
 
 ### Archive threads
 
@@ -109,6 +136,7 @@ Archive explicit threads or selected inbox rows.
 codex-hermes-bridge archive --thread-id thr_123 --dry-run
 codex-hermes-bridge archive --project my-app --status idle --dry-run
 codex-hermes-bridge archive --project my-app --status idle --yes
+codex-hermes-bridge unarchive thr_123 --dry-run
 ```
 
 Archive commands that select from the inbox are treated as bulk operations.
@@ -116,23 +144,45 @@ They require `--dry-run` or `--yes`; explicit thread IDs do not require the bulk
 
 ### Away mode
 
-Track when the user is away and emit attention-needed summaries.
+Track when you are away and emit attention-needed summaries.
 
 ```bash
 codex-hermes-bridge away on
 codex-hermes-bridge notify-away
+codex-hermes-bridge notify-away --no-completed
 codex-hermes-bridge away off
 ```
 
-`notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply, approval, and completed-thread prompts.
-Completion notifications are included by default so an away-mode relay can report finished Codex work without requiring an extra flag.
-Completed-thread summaries keep the final answer body for relay delivery and dedupe on content changes, not only timestamps.
+`notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply, approval, and completed-thread prompts. Completed-thread notifications are included by default; pass `--no-completed` to only emit active attention prompts.
+
+## Hook examples
+
+`watch --exec` pipes one event at a time to the given command on stdin. Hook stdout and stderr pass through to the terminal, and a nonzero hook exit fails the bridge command.
+
+### Print matching events
+
+```bash
+codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
+```
+
+### Send Telegram notifications
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=...
+codex-hermes-bridge watch --exec "python3 examples/notify-telegram.py"
+```
+
+The Telegram example expects:
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+Do not hardcode secrets in the example file or commit them to the repo.
 
 ## Event schema
 
-The stream is newline-delimited JSON. Event types currently include:
-
-Stable watch/follow events:
+The stream is newline-delimited JSON.
+Common stable event types include:
 - `watch_started`
 - `thread_waiting`
 - `thread_completed`
@@ -146,16 +196,7 @@ Stable watch/follow events:
 - `follow_turn_started`
 - `thread_error`
 
-Experimental realtime events:
-- `follow_realtime_started`
-- `follow_realtime_error`
-- `follow_realtime_stopped`
-- `follow_realtime_stop_error`
-- `follow_realtime_unavailable`
-
-### Common stable event examples
-
-`thread_waiting`
+Example `thread_waiting` event:
 
 ```json
 {
@@ -170,22 +211,7 @@ Experimental realtime events:
 }
 ```
 
-`thread_status_changed`
-
-```json
-{
-  "type": "thread_status_changed",
-  "threadId": "thr_123",
-  "status": { "type": "active", "activeFlags": [] },
-  "raw": { "method": "thread/status/changed", "params": { "threadId": "thr_123" } },
-  "thread": {
-    "threadId": "thr_123",
-    "name": "Need reply"
-  }
-}
-```
-
-`follow_snapshot`
+Example `follow_snapshot` event:
 
 ```json
 {
@@ -198,53 +224,8 @@ Experimental realtime events:
 }
 ```
 
-### Filtering
+## Notes
 
-Use CSV event names.
-
-```bash
---events thread_waiting,thread_completed,item_completed
---events follow_snapshot,follow_realtime_error
-```
-
-### Realtime readiness doctor
-
-Probe whether a thread can be read/followed/realtime-started in the current app-server context.
-
-```bash
-codex-hermes-bridge doctor realtime <threadId>
-codex-hermes-bridge doctor realtime <threadId> --experimental-realtime
-```
-
-This reports per-step readiness for:
-- `read_with_turns`
-- `read_without_turns`
-- `realtime_start`
-- `realtime_stop`
-
-Known classified backend failures include:
-- `thread_not_loaded`
-- `thread_not_materialized`
-- `thread_no_rollout`
-- `experimental_api_required`
-
-## Experimental API
-
-The bridge can negotiate the Codex app-server capability:
-
-```json
-{ "experimentalApi": true }
-```
-
-This appears to unlock access to dedicated realtime methods like:
-- `thread/realtime/start`
-- `thread/realtime/stop`
-
-Important:
-- this is not treated as stable product infrastructure
-- successful capability negotiation does not guarantee the target thread is usable in realtime mode
-- current bridge behavior exposes the result clearly rather than hiding failures
-
-## Product recommendation
-
-Use stable `watch` plus stable `follow` as the main app surface. Use experimental realtime only for probing, research, and early-adopter workflows.
+- Hook commands are arbitrary local code. Only run trusted commands with `watch --exec`.
+- The bridge stores local state in its SQLite cache so repeated commands can reconcile thread state efficiently.
+- `doctor` is the fastest way to verify that the Codex binary can actually be resolved from your environment.

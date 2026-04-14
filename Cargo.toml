@@ -2,6 +2,12 @@
 name = "codex-hermes-bridge"
 version = "0.1.0"
 edition = "2021"
+description = "Rust CLI for inspecting Codex threads, taking action on waiting threads, and streaming normalized automation events"
+license = "MIT"
+repository = "https://github.com/hanifcarroll/codex-hermes-bridge"
+rust-version = "1.81"
+keywords = ["codex", "cli", "automation", "threads", "agent"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
