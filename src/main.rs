@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use notify::Watcher as _;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -85,6 +85,11 @@ enum Commands {
         exec: Option<String>,
         #[arg(long)]
         events: Option<String>,
+    },
+    #[command(about = "Run and manage the proactive Hermes notification daemon")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
     },
     #[command(about = "Emit away-mode notification summaries")]
     NotifyAway {
@@ -239,9 +244,62 @@ enum HermesCommands {
         #[arg(long)]
         url: String,
         #[arg(long)]
-        secret: String,
+        secret: Option<String>,
         #[arg(long, default_value_t = 10000)]
         timeout_ms: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommands {
+    #[command(about = "Run the proactive Hermes notification daemon")]
+    Run {
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        #[arg(long = "poll-interval", default_value_t = 1500)]
+        poll_interval: u64,
+        #[arg(long, default_value_t = 10000)]
+        timeout_ms: u64,
+    },
+    #[command(about = "Install the proactive notification daemon as a user service")]
+    Install {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        label: String,
+        #[arg(long, default_value = "codex-hermes-bridge")]
+        bridge_command: String,
+    },
+    #[command(about = "Uninstall the proactive notification daemon user service")]
+    Uninstall {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        label: String,
+    },
+    #[command(about = "Start the proactive notification daemon user service")]
+    Start {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        label: String,
+    },
+    #[command(about = "Stop the proactive notification daemon user service")]
+    Stop {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        label: String,
+    },
+    #[command(about = "Show proactive notification daemon status")]
+    Status {
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        label: String,
+    },
+    #[command(about = "Show proactive notification daemon log paths")]
+    Logs {
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        label: String,
     },
 }
 
@@ -632,6 +690,43 @@ fn run() -> Result<()> {
                 }
             }
         }
+        Commands::Daemon { command } => match command {
+            DaemonCommands::Run {
+                once,
+                poll_interval,
+                timeout_ms,
+            } => {
+                run_daemon(once, poll_interval, Duration::from_millis(timeout_ms))?;
+            }
+            DaemonCommands::Install {
+                dry_run,
+                label,
+                bridge_command,
+            } => {
+                let result = install_daemon_service(&label, &bridge_command, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DaemonCommands::Uninstall { dry_run, label } => {
+                let result = uninstall_daemon_service(&label, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DaemonCommands::Start { dry_run, label } => {
+                let result = start_daemon_service(&label, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DaemonCommands::Stop { dry_run, label } => {
+                let result = stop_daemon_service(&label, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DaemonCommands::Status { label } => {
+                let result = daemon_service_status(&label)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DaemonCommands::Logs { label } => {
+                let result = daemon_service_logs(&label)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+        },
         Commands::NotifyAway {
             completed,
             mark_delivered,
@@ -1097,6 +1192,10 @@ fn run() -> Result<()> {
                 std::io::stdin().read_to_string(&mut input)?;
                 let event: Value = serde_json::from_str(input.trim())
                     .context("failed to parse watch event JSON from stdin")?;
+                let secret = match secret {
+                    Some(secret) => secret,
+                    None => load_daemon_config()?.webhook_secret,
+                };
                 let result =
                     post_hermes_webhook(&url, &secret, &event, Duration::from_millis(timeout_ms))?;
                 println!("{}", serde_json::to_string(&result)?);
@@ -1639,6 +1738,18 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           observed_at INTEGER NOT NULL,
           payload_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS outbound_events (
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL,
+          thread_id TEXT,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at INTEGER NOT NULL,
+          last_error TEXT,
+          created_at INTEGER NOT NULL,
+          delivered_at INTEGER
+        );
         CREATE TABLE IF NOT EXISTS actions_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           thread_id TEXT NOT NULL,
@@ -1677,11 +1788,15 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
     Ok(())
 }
 
-fn state_db_path() -> Result<PathBuf> {
+fn state_dir_path() -> Result<PathBuf> {
     let home = env::var("HOME").context("HOME is not set")?;
     let dir = PathBuf::from(home).join(".codex-hermes-bridge");
     fs::create_dir_all(&dir)?;
-    Ok(dir.join("state.db"))
+    Ok(dir)
+}
+
+fn state_db_path() -> Result<PathBuf> {
+    Ok(state_dir_path()?.join("state.db"))
 }
 
 fn get_setting_number(conn: &Connection, key: &str) -> Result<Option<u64>> {
@@ -3766,13 +3881,569 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
         .collect())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DaemonConfig {
+    version: u32,
+    bridge_command: String,
+    webhook_url: String,
+    webhook_secret: String,
+    events: String,
+    deliver: Option<String>,
+    deliver_chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OutboxDeliverySummary {
+    attempted: usize,
+    delivered: usize,
+    failed: usize,
+}
+
+fn daemon_config_path() -> Result<PathBuf> {
+    Ok(state_dir_path()?.join("config.json"))
+}
+
+fn write_daemon_config(config: &DaemonConfig) -> Result<PathBuf> {
+    let path = daemon_config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(config)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(path)
+}
+
+fn load_daemon_config() -> Result<DaemonConfig> {
+    let path = daemon_config_path()?;
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("daemon config not found at {}", path.display()))?;
+    let config: DaemonConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse daemon config at {}", path.display()))?;
+    if config.webhook_url.trim().is_empty() {
+        bail!("daemon config webhookUrl cannot be empty");
+    }
+    if config.webhook_secret.trim().is_empty() {
+        bail!("daemon config webhookSecret cannot be empty");
+    }
+    if config.events.trim().is_empty() {
+        bail!("daemon config events cannot be empty");
+    }
+    Ok(config)
+}
+
+fn redacted_daemon_config(config: &DaemonConfig) -> Value {
+    json!({
+        "version": config.version,
+        "bridgeCommand": config.bridge_command,
+        "webhookUrl": config.webhook_url,
+        "webhookSecret": "<redacted>",
+        "events": config.events,
+        "deliver": config.deliver,
+        "deliverChatId": config.deliver_chat_id
+    })
+}
+
+fn daemon_run_command(bridge_command: &str) -> String {
+    format!("{} daemon run", shell_quote(bridge_command))
+}
+
+fn daemon_run_once_command(bridge_command: &str) -> String {
+    format!("{} daemon run --once", shell_quote(bridge_command))
+}
+
+fn enqueue_outbound_event(conn: &Connection, event: &Value, now: u64) -> Result<bool> {
+    let event_id = hermes_webhook_delivery_id(event);
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("codex_event");
+    let thread_id = event_thread_id(event);
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO outbound_events(event_id, event_type, thread_id, payload_json, status, attempts, next_attempt_at, last_error, created_at, delivered_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, NULL, ?5, NULL)",
+        params![
+            event_id,
+            event_type,
+            thread_id,
+            serde_json::to_string(event)?,
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(inserted > 0)
+}
+
+fn pending_outbound_count(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM outbound_events WHERE status != 'delivered'",
+        [],
+        |row| row.get(0),
+    )?;
+    from_sql_i64(count)
+}
+
+fn retry_delay_ms(attempts: u64) -> u64 {
+    let exponent = attempts.saturating_sub(1).min(8);
+    (1u64 << exponent) * 1000
+}
+
+fn deliver_due_outbound_events<F>(
+    conn: &Connection,
+    now: u64,
+    limit: usize,
+    mut sender: F,
+) -> Result<OutboxDeliverySummary>
+where
+    F: FnMut(&Value) -> Result<Value>,
+{
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT event_id, payload_json, attempts
+             FROM outbound_events
+             WHERE status != 'delivered' AND next_attempt_at <= ?1
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![to_sql_i64(now)?, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let mut summary = OutboxDeliverySummary {
+        attempted: 0,
+        delivered: 0,
+        failed: 0,
+    };
+    for (event_id, payload_json, attempts) in rows {
+        summary.attempted += 1;
+        let event: Value = serde_json::from_str(&payload_json)
+            .with_context(|| format!("outbound event {event_id} contains invalid JSON"))?;
+        match sender(&event) {
+            Ok(_) => {
+                conn.execute(
+                    "UPDATE outbound_events
+                     SET status = 'delivered', attempts = attempts + 1, delivered_at = ?2, last_error = NULL
+                     WHERE event_id = ?1",
+                    params![event_id, to_sql_i64(now)?],
+                )?;
+                summary.delivered += 1;
+            }
+            Err(error) => {
+                let next_attempts = from_sql_i64(attempts)?.saturating_add(1);
+                let next_attempt_at = now.saturating_add(retry_delay_ms(next_attempts));
+                conn.execute(
+                    "UPDATE outbound_events
+                     SET status = 'failed', attempts = ?2, next_attempt_at = ?3, last_error = ?4
+                     WHERE event_id = ?1",
+                    params![
+                        event_id,
+                        to_sql_i64(next_attempts)?,
+                        to_sql_i64(next_attempt_at)?,
+                        format!("{error:#}")
+                    ],
+                )?;
+                summary.failed += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn deliver_outbound_events(
+    conn: &Connection,
+    config: &DaemonConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<OutboxDeliverySummary> {
+    deliver_due_outbound_events(conn, now, 100, |event| {
+        post_hermes_webhook(&config.webhook_url, &config.webhook_secret, event, timeout)
+    })
+}
+
+fn daemon_cycle(
+    conn: &Connection,
+    config: &DaemonConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let filter = parse_event_filter(Some(&config.events));
+    let events = match CodexAppServerClient::connect().and_then(|mut client| {
+        let sync_result = sync_state_from_live(&mut client, conn, now, 50, true)?;
+        Ok(watch_events_from_sync_result(
+            &sync_result,
+            client.drain_notifications(),
+            filter.as_ref(),
+        ))
+    }) {
+        Ok(events) => events,
+        Err(error) => filter_watch_events(vec![watch_thread_error_event(&error)], filter.as_ref()),
+    };
+    let mut enqueued = 0usize;
+    for event in &events {
+        if enqueue_outbound_event(conn, event, now)? {
+            enqueued += 1;
+        }
+    }
+    let delivery = deliver_outbound_events(conn, config, now, timeout)?;
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_cycle",
+        "observed": events.len(),
+        "enqueued": enqueued,
+        "delivery": delivery,
+        "pending": pending_outbound_count(conn)?
+    }))
+}
+
+fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
+    let config = load_daemon_config()?;
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    if once {
+        let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "ok": true,
+            "action": "daemon_started",
+            "configPath": daemon_config_path()?.display().to_string(),
+            "events": config.events
+        }))?
+    );
+    let watch_rx = start_codex_watch_receiver().ok();
+    loop {
+        let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
+        println!("{}", serde_json::to_string(&result)?);
+        if let Some(rx) = watch_rx.as_ref() {
+            rx.recv_timeout(Duration::from_millis(poll_interval));
+        } else {
+            thread::sleep(Duration::from_millis(poll_interval));
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DaemonServiceSpec {
+    service_path: PathBuf,
+    stdout_log: PathBuf,
+    stderr_log: PathBuf,
+    unit_name: String,
+    contents: String,
+    install_command: String,
+    uninstall_command: String,
+    start_command: String,
+    stop_command: String,
+    status_command: String,
+}
+
+fn validate_daemon_label(label: &str) -> Result<&str> {
+    let trimmed = label.trim();
+    if trimmed.is_empty() {
+        bail!("daemon label cannot be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\'') {
+        bail!("daemon label contains unsupported characters");
+    }
+    Ok(trimmed)
+}
+
+fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<DaemonServiceSpec> {
+    let label = validate_daemon_label(label)?;
+    let bridge_command = bridge_command.trim();
+    if bridge_command.is_empty() {
+        bail!("bridge command cannot be empty");
+    }
+    let service_bridge_command = resolve_service_bridge_command(bridge_command);
+    let state_dir = state_dir_path()?;
+    let stdout_log = state_dir.join("daemon.out.log");
+    let stderr_log = state_dir.join("daemon.err.log");
+    let run_args = [
+        service_bridge_command.clone(),
+        "daemon".to_string(),
+        "run".to_string(),
+    ];
+    if cfg!(target_os = "macos") {
+        let service_path = dirs::home_dir()
+            .context("home directory is not available")?
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{label}.plist"));
+        let args_xml = run_args
+            .iter()
+            .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let contents = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+{}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{}</string>
+    <key>StandardErrorPath</key>
+    <string>{}</string>
+</dict>
+</plist>
+"#,
+            xml_escape(label),
+            args_xml,
+            xml_escape(&stdout_log.display().to_string()),
+            xml_escape(&stderr_log.display().to_string())
+        );
+        let quoted_path = shell_quote(&service_path.display().to_string());
+        let bootstrap_command = format!("launchctl bootstrap gui/$(id -u) {quoted_path}");
+        let kickstart_command =
+            format!("launchctl kickstart -k gui/$(id -u)/{}", shell_quote(label));
+        let bootout_command = format!("launchctl bootout gui/$(id -u)/{}", shell_quote(label));
+        Ok(DaemonServiceSpec {
+            service_path,
+            stdout_log,
+            stderr_log,
+            unit_name: label.to_string(),
+            contents,
+            install_command: bootstrap_command.clone(),
+            uninstall_command: format!("{bootout_command} 2>/dev/null || true"),
+            start_command: format!("{bootstrap_command} 2>/dev/null || {kickstart_command}"),
+            stop_command: bootout_command,
+            status_command: format!("launchctl print gui/$(id -u)/{}", shell_quote(label)),
+        })
+    } else if cfg!(target_os = "linux") {
+        let unit_name = if label.ends_with(".service") {
+            label.to_string()
+        } else {
+            format!("{label}.service")
+        };
+        let service_path = dirs::home_dir()
+            .context("home directory is not available")?
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join(&unit_name);
+        let contents = format!(
+            "[Unit]\nDescription=Codex Hermes Bridge notification daemon\n\n[Service]\nType=simple\nExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            shell_quote(&service_bridge_command),
+            stdout_log.display(),
+            stderr_log.display()
+        );
+        Ok(DaemonServiceSpec {
+            service_path,
+            stdout_log,
+            stderr_log,
+            unit_name: unit_name.clone(),
+            contents,
+            install_command: format!(
+                "systemctl --user daemon-reload && systemctl --user enable --now {}",
+                shell_quote(&unit_name)
+            ),
+            uninstall_command: format!(
+                "systemctl --user disable --now {} 2>/dev/null || true",
+                shell_quote(&unit_name)
+            ),
+            start_command: format!(
+                "systemctl --user daemon-reload && systemctl --user enable --now {}",
+                shell_quote(&unit_name)
+            ),
+            stop_command: format!("systemctl --user stop {}", shell_quote(&unit_name)),
+            status_command: format!("systemctl --user status {}", shell_quote(&unit_name)),
+        })
+    } else {
+        bail!("daemon service install is only supported on macOS launchd and Linux systemd")
+    }
+}
+
+fn resolve_service_bridge_command(bridge_command: &str) -> String {
+    let trimmed = bridge_command.trim();
+    if trimmed.contains('/') {
+        let path = PathBuf::from(trimmed);
+        return if path.is_absolute() {
+            path.display().to_string()
+        } else {
+            env::current_dir()
+                .map(|cwd| cwd.join(path).display().to_string())
+                .unwrap_or_else(|_| trimmed.to_string())
+        };
+    }
+    which::which(trimmed)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+fn install_daemon_service(label: &str, bridge_command: &str, dry_run: bool) -> Result<Value> {
+    let spec = daemon_service_spec(label, bridge_command)?;
+    if !dry_run {
+        if let Some(parent) = spec.service_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&spec.service_path, &spec.contents)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_install",
+        "dryRun": dry_run,
+        "label": spec.unit_name,
+        "servicePath": spec.service_path,
+        "runCommand": daemon_run_command(bridge_command),
+        "installCommand": spec.install_command,
+        "startCommand": spec.start_command,
+        "stopCommand": spec.stop_command,
+        "statusCommand": spec.status_command,
+        "logs": {
+            "stdout": spec.stdout_log,
+            "stderr": spec.stderr_log
+        },
+        "contents": if dry_run { Some(spec.contents) } else { None }
+    }))
+}
+
+fn uninstall_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
+    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let output = if dry_run {
+        None
+    } else {
+        Some(run_shell_command(&spec.uninstall_command)?)
+    };
+    if !dry_run && spec.service_path.exists() {
+        fs::remove_file(&spec.service_path)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_uninstall",
+        "dryRun": dry_run,
+        "label": spec.unit_name,
+        "servicePath": spec.service_path,
+        "uninstallCommand": spec.uninstall_command,
+        "output": output
+    }))
+}
+
+fn run_shell_command(command: &str) -> Result<Value> {
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .with_context(|| format!("failed to run `{command}`"))?;
+    Ok(json!({
+        "status": output.status.code(),
+        "success": output.status.success(),
+        "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+        "stderr": String::from_utf8_lossy(&output.stderr).trim()
+    }))
+}
+
+fn start_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
+    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let command = spec.start_command.clone();
+    let output = if dry_run {
+        None
+    } else {
+        Some(run_shell_command(&command)?)
+    };
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_start",
+        "dryRun": dry_run,
+        "label": spec.unit_name,
+        "command": command,
+        "output": output
+    }))
+}
+
+fn stop_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
+    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let command = spec.stop_command.clone();
+    let output = if dry_run {
+        None
+    } else {
+        Some(run_shell_command(&command)?)
+    };
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_stop",
+        "dryRun": dry_run,
+        "label": spec.unit_name,
+        "command": command,
+        "output": output
+    }))
+}
+
+fn daemon_service_status(label: &str) -> Result<Value> {
+    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let config_path = daemon_config_path()?;
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_status",
+        "label": spec.unit_name,
+        "configPath": config_path,
+        "configExists": config_path.exists(),
+        "servicePath": spec.service_path,
+        "serviceExists": spec.service_path.exists(),
+        "statusCommand": spec.status_command,
+        "logs": {
+            "stdout": spec.stdout_log,
+            "stderr": spec.stderr_log
+        }
+    }))
+}
+
+fn daemon_service_logs(label: &str) -> Result<Value> {
+    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    Ok(json!({
+        "ok": true,
+        "action": "daemon_logs",
+        "label": spec.unit_name,
+        "stdout": spec.stdout_log,
+        "stderr": spec.stderr_log,
+        "tailCommand": format!(
+            "tail -f {} {}",
+            shell_quote(&spec.stdout_log.display().to_string()),
+            shell_quote(&spec.stderr_log.display().to_string())
+        )
+    }))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+const DEFAULT_DAEMON_LABEL: &str = "com.hanifcarroll.codex-hermes-bridge";
 const DEFAULT_HERMES_WEBHOOK_EVENTS: &str = "thread_waiting,thread_completed,thread_status_changed";
 
 const HERMES_WEBHOOK_PROMPT: &str = r#"Codex changed without you asking.
 
 Use the event payload to send Hanif a concise notification. If the event says Codex needs a reply or approval, ask for the exact reply or decision. If Hanif responds, use the Codex MCP tools for this same thread_id.
 
-If reply_route_marker is present in the payload, include that exact value as the final line so Hermes can route a platform reply back to the Codex thread.
+The payload includes structured reply_route metadata. Hermes should persist that metadata against the delivered platform message so a Telegram reply-to-message can call codex_reply for the same thread_id.
 
 Event payload:
 {__raw__}"#;
@@ -3841,13 +4512,15 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
         .webhook_secret
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let planned_secret = webhook_secret.unwrap_or("<secret printed by hermes webhook subscribe>");
-    let planned_watcher_command = hermes_watcher_command(
-        bridge_command,
-        webhook_events,
-        &planned_webhook_url,
-        planned_secret,
-    );
+    let planned_daemon_config = DaemonConfig {
+        version: 1,
+        bridge_command: bridge_command.to_string(),
+        webhook_url: planned_webhook_url.clone(),
+        webhook_secret: "<secret printed by hermes webhook subscribe>".to_string(),
+        events: webhook_events.to_string(),
+        deliver: None,
+        deliver_chat_id: None,
+    };
     let webhook_deliver = options
         .webhook_deliver
         .map(str::trim)
@@ -3886,15 +4559,24 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
             "deliver": webhook_deliver,
             "deliverChatId": webhook_deliver_chat_id,
             "webhookUrl": planned_webhook_url,
-            "webhookArgs": webhook_args.clone(),
-            "watcherCommand": planned_watcher_command,
+            "webhookArgs": webhook_args.as_ref().map(|args| redacted_command_args(args, webhook_secret)),
+            "configPath": daemon_config_path()?.display().to_string(),
+            "config": redacted_daemon_config(&DaemonConfig {
+                deliver: webhook_deliver.map(str::to_string),
+                deliver_chat_id: webhook_deliver_chat_id.map(str::to_string),
+                ..planned_daemon_config.clone()
+            }),
+            "daemonCommand": daemon_run_command(bridge_command),
+            "daemonOnceCommand": daemon_run_once_command(bridge_command),
+            "daemonInstallCommand": format!("{} daemon install --bridge-command {}", shell_quote(bridge_command), shell_quote(bridge_command)),
+            "daemonStatusCommand": format!("{} daemon status", shell_quote(bridge_command)),
             "nextStep": if webhook_args.is_some() {
-                "Run watcherCommand as a long-lived local process so Codex changes proactively notify Hermes."
+                "Run daemonInstallCommand, then daemon start. The daemon stores the Hermes webhook secret in the bridge config instead of a long-lived process argv."
             } else {
                 "Pass --webhook-deliver, for example --webhook-deliver telegram, to install proactive Hermes notifications."
             }
         },
-        "nextStep": "Restart Hermes for MCP discovery, then run notificationLane.watcherCommand if notificationLane.configured is true."
+        "nextStep": "Restart Hermes for MCP discovery, then install and start the notification daemon if notificationLane.configured is true."
     });
     if options.dry_run {
         return Ok(base);
@@ -3934,19 +4616,28 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
             .map(str::to_string)
             .or(parsed.secret.clone())
             .context("Hermes webhook subscription did not print a secret; pass --webhook-secret")?;
-        let watcher_command = hermes_watcher_command(
-            bridge_command,
-            webhook_events,
-            &webhook_url,
-            &resolved_secret,
-        );
+        let daemon_config = DaemonConfig {
+            version: 1,
+            bridge_command: bridge_command.to_string(),
+            webhook_url: webhook_url.clone(),
+            webhook_secret: resolved_secret.clone(),
+            events: webhook_events.to_string(),
+            deliver: webhook_deliver.map(str::to_string),
+            deliver_chat_id: webhook_deliver_chat_id.map(str::to_string),
+        };
+        let config_path = write_daemon_config(&daemon_config)?;
         Some(json!({
             "configured": true,
-            "args": webhook_args,
-            "stdout": stdout,
+            "args": redacted_command_args(&webhook_args, Some(&resolved_secret)),
+            "stdout": redact_secret_text(&stdout, &resolved_secret),
             "stderr": String::from_utf8_lossy(&output.stderr).trim(),
             "webhookUrl": webhook_url,
-            "watcherCommand": watcher_command,
+            "configPath": config_path.display().to_string(),
+            "config": redacted_daemon_config(&daemon_config),
+            "daemonCommand": daemon_run_command(bridge_command),
+            "daemonOnceCommand": daemon_run_once_command(bridge_command),
+            "daemonInstallCommand": format!("{} daemon install --bridge-command {}", shell_quote(bridge_command), shell_quote(bridge_command)),
+            "daemonStatusCommand": format!("{} daemon status", shell_quote(bridge_command)),
             "parsed": {
                 "url": parsed.url,
                 "secret": parsed.secret.map(|_| "<redacted>")
@@ -3973,8 +4664,28 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
             "configured": false,
             "nextStep": "Pass --webhook-deliver, for example --webhook-deliver telegram, to install proactive Hermes notifications."
         })),
-        "nextStep": "Restart Hermes for MCP discovery, then run notificationLane.watcherCommand if notificationLane.configured is true."
+        "nextStep": "Restart Hermes for MCP discovery, then install and start the notification daemon if notificationLane.configured is true."
     }))
+}
+
+fn redacted_command_args(args: &[String], secret: Option<&str>) -> Vec<String> {
+    let mut redacted = args.to_vec();
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+        for arg in &mut redacted {
+            if arg == secret {
+                *arg = "<redacted>".to_string();
+            }
+        }
+    }
+    redacted
+}
+
+fn redact_secret_text(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(secret, "<redacted>")
+    }
 }
 
 fn hermes_webhook_subscribe_args(
@@ -4010,26 +4721,6 @@ fn hermes_webhook_subscribe_args(
 
 fn default_hermes_webhook_url(webhook_name: &str) -> String {
     format!("http://localhost:8644/webhooks/{webhook_name}")
-}
-
-fn hermes_watcher_command(
-    bridge_command: &str,
-    events: &str,
-    webhook_url: &str,
-    webhook_secret: &str,
-) -> String {
-    let inner = format!(
-        "{} hermes post-webhook --url {} --secret {}",
-        shell_quote(bridge_command),
-        shell_quote(webhook_url),
-        shell_quote(webhook_secret)
-    );
-    format!(
-        "{} watch --events {} --exec {}",
-        shell_quote(bridge_command),
-        shell_quote(events),
-        shell_quote(&inner)
-    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -5239,106 +5930,30 @@ fn mcp_tools() -> Vec<Value> {
             mcp_annotations(true, false, false, false),
         ),
         mcp_tool(
-            "codex_new",
-            "Start Codex Thread",
-            "Start a new Codex thread, optionally sending an initial message.",
-            action_schema(json!({
-                "cwd": string_property("Optional working directory for the new thread."),
-                "message": string_property("Optional initial user message."),
-                "dryRun": bool_property("Return the action shape without contacting Codex.")
-            }), vec![]),
-            mcp_annotations(false, false, false, true),
-        ),
-        mcp_tool(
-            "codex_fork",
-            "Fork Codex Thread",
-            "Fork an existing Codex thread, optionally sending a follow-up message to the fork.",
-            action_schema(json!({
-                "threadId": string_property("Codex thread id to fork."),
-                "message": string_property("Optional message to send to the fork."),
-                "dryRun": bool_property("Return the action shape without contacting Codex.")
-            }), vec!["threadId"]),
-            mcp_annotations(false, false, false, true),
-        ),
-        mcp_tool(
             "codex_reply",
             "Reply To Codex Thread",
             "Resume a waiting Codex thread and send a user reply.",
-            action_schema(json!({
-                "threadId": string_property("Codex thread id to resume."),
-                "message": string_property("Reply text to send."),
-                "dryRun": bool_property("Return the action shape without contacting Codex.")
-            }), vec!["threadId", "message"]),
+            action_schema(
+                json!({
+                    "threadId": string_property("Codex thread id to resume."),
+                    "message": string_property("Reply text to send."),
+                    "dryRun": bool_property("Return the action shape without contacting Codex.")
+                }),
+                vec!["threadId", "message"],
+            ),
             mcp_annotations(false, false, false, true),
         ),
         mcp_tool(
             "codex_approve",
             "Approve Codex Prompt",
             "Approve or deny a waiting Codex approval prompt by sending YES or NO.",
-            action_schema(json!({
-                "threadId": string_property("Codex thread id to resume."),
-                "decision": enum_property("Approval decision.", vec!["approve", "deny"]),
-                "dryRun": bool_property("Return the action shape without contacting Codex.")
-            }), vec!["threadId", "decision"]),
-            mcp_annotations(false, false, false, true),
-        ),
-        mcp_tool(
-            "codex_archive",
-            "Archive Codex Threads",
-            "Archive explicit threads or a filtered inbox selection. Bulk filtered archive requires yes=true or dryRun=true.",
-            mcp_schema(
+            action_schema(
                 json!({
-                    "threadIds": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Explicit thread ids to archive."
-                    },
-                    "project": string_property("Optional project filter for inbox selection."),
-                    "status": string_property("Optional status filter for inbox selection."),
-                    "attention": string_property("Optional attention filter for inbox selection."),
-                    "limit": integer_property("Maximum number of filtered inbox rows to archive."),
-                    "dryRun": bool_property("Return selected targets without archiving."),
-                    "yes": bool_property("Required for non-dry-run filtered bulk archive.")
-                }),
-                vec![],
-            ),
-            mcp_annotations(false, true, false, true),
-        ),
-        mcp_tool(
-            "codex_unarchive",
-            "Unarchive Codex Thread",
-            "Unarchive one Codex thread.",
-            mcp_schema(
-                json!({
-                    "threadId": string_property("Codex thread id to unarchive."),
+                    "threadId": string_property("Codex thread id to resume."),
+                    "decision": enum_property("Approval decision.", vec!["approve", "deny"]),
                     "dryRun": bool_property("Return the action shape without contacting Codex.")
                 }),
-                vec!["threadId"],
-            ),
-            mcp_annotations(false, false, false, true),
-        ),
-        mcp_tool(
-            "codex_away",
-            "Manage Codex Away Mode",
-            "Turn away mode on or off, or read its current state.",
-            mcp_schema(
-                json!({
-                    "action": enum_property("Away-mode action.", vec!["on", "off", "status"])
-                }),
-                vec!["action"],
-            ),
-            mcp_annotations(false, false, true, false),
-        ),
-        mcp_tool(
-            "codex_notify_away",
-            "Build Away Notifications",
-            "Build away-mode notification summaries from synced Codex thread state.",
-            mcp_schema(
-                json!({
-                    "completed": bool_property("Include completed thread updates. Defaults to true."),
-                    "markDelivered": bool_property("Mark emitted notifications as delivered.")
-                }),
-                vec![],
+                vec!["threadId", "decision"],
             ),
             mcp_annotations(false, false, false, true),
         ),
@@ -5843,6 +6458,46 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_daemon_lifecycle_commands() {
+        for args in [
+            vec!["codex-hermes-bridge", "daemon", "run", "--once"],
+            vec![
+                "codex-hermes-bridge",
+                "daemon",
+                "install",
+                "--dry-run",
+                "--bridge-command",
+                "codex-hermes-bridge",
+            ],
+            vec!["codex-hermes-bridge", "daemon", "start", "--dry-run"],
+            vec!["codex-hermes-bridge", "daemon", "stop", "--dry-run"],
+            vec!["codex-hermes-bridge", "daemon", "status"],
+            vec!["codex-hermes-bridge", "daemon", "logs"],
+        ] {
+            let parsed = Cli::try_parse_from(args.clone());
+            assert!(
+                parsed.is_ok(),
+                "daemon command should parse: {args:?}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
+        let result = install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/codex-hermes-bridge", true)
+            .expect("daemon install dry run");
+        let expected = env::current_dir()
+            .expect("cwd")
+            .join("bin/codex-hermes-bridge")
+            .display()
+            .to_string();
+        assert!(result["contents"]
+            .as_str()
+            .expect("service contents")
+            .contains(&expected));
+    }
+
+    #[test]
     fn hermes_install_dry_run_builds_mcp_add_command() {
         let result = run_hermes_install(HermesInstallOptions {
             server_name: "codex",
@@ -5912,15 +6567,19 @@ mod tests {
                 "--deliver-chat-id",
                 "12345",
                 "--secret",
-                "test-secret"
+                "<redacted>"
             ])
         );
-        let watcher = result["notificationLane"]["watcherCommand"]
+        let daemon = result["notificationLane"]["daemonCommand"]
             .as_str()
-            .expect("watcher command");
-        assert!(watcher.contains("watch --events"));
-        assert!(watcher.contains("hermes post-webhook"));
-        assert!(watcher.contains("--secret test-secret"));
+            .expect("daemon command");
+        assert_eq!(daemon, "codex-hermes-bridge daemon run");
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("--secret test-secret"),
+            "install output must not ask users to run a long-lived command with a secret argv"
+        );
     }
 
     #[test]
@@ -5979,6 +6638,18 @@ mod tests {
         assert_eq!(
             payload["reply_route_marker"],
             "THREAD_ROUTE {\"route_kind\":\"codex_reply\",\"thread_id\":\"thr_1\"}"
+        );
+    }
+
+    #[test]
+    fn hermes_webhook_prompt_does_not_depend_on_model_echoing_route_markers() {
+        assert!(
+            !HERMES_WEBHOOK_PROMPT.contains("reply_route_marker"),
+            "Telegram reply routing must come from structured webhook metadata, not model output"
+        );
+        assert!(
+            HERMES_WEBHOOK_PROMPT.contains("reply_route"),
+            "prompt should still explain that structured reply metadata exists"
         );
     }
 
@@ -6048,6 +6719,50 @@ mod tests {
     }
 
     #[test]
+    fn outbound_events_dedupe_retry_and_deliver_durably() {
+        let conn = create_state_db_in_memory().expect("db");
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 42
+        });
+
+        assert!(enqueue_outbound_event(&conn, &event, 1000).expect("enqueue"));
+        assert!(
+            !enqueue_outbound_event(&conn, &event, 1001).expect("dedupe"),
+            "same delivery id should not enqueue twice"
+        );
+
+        let failed = deliver_due_outbound_events(&conn, 1000, 10, |_| bail!("Hermes offline"))
+            .expect("failed delivery summary");
+        assert_eq!(
+            failed,
+            OutboxDeliverySummary {
+                attempted: 1,
+                delivered: 0,
+                failed: 1
+            }
+        );
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+
+        let delayed = deliver_due_outbound_events(&conn, 1000, 10, |_| Ok(json!({"ok": true})))
+            .expect("not due summary");
+        assert_eq!(delayed.attempted, 0);
+
+        let delivered = deliver_due_outbound_events(&conn, 2000, 10, |_| Ok(json!({"ok": true})))
+            .expect("delivered summary");
+        assert_eq!(
+            delivered,
+            OutboxDeliverySummary {
+                attempted: 1,
+                delivered: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
+    }
+
+    #[test]
     fn mcp_initialize_advertises_tools_capability() {
         let response = mcp_handle_message(json!({
             "jsonrpc": "2.0",
@@ -6102,30 +6817,31 @@ mod tests {
             "codex_inbox",
             "codex_waiting",
             "codex_show",
-            "codex_new",
             "codex_reply",
             "codex_approve",
+        ] {
+            assert!(names.contains(expected), "missing MCP tool {expected}");
+        }
+        for hidden in [
+            "codex_watch",
+            "codex_new",
             "codex_fork",
             "codex_archive",
             "codex_unarchive",
             "codex_away",
             "codex_notify_away",
         ] {
-            assert!(names.contains(expected), "missing MCP tool {expected}");
+            assert!(
+                !names.contains(hidden),
+                "{hidden} should stay out of the default Hermes MCP surface"
+            );
         }
-        assert!(!names.contains("codex_watch"));
 
         let doctor = tools
             .iter()
             .find(|tool| tool["name"] == "codex_doctor")
             .expect("doctor tool");
         assert_eq!(doctor["annotations"]["readOnlyHint"], true);
-
-        let archive = tools
-            .iter()
-            .find(|tool| tool["name"] == "codex_archive")
-            .expect("archive tool");
-        assert_eq!(archive["annotations"]["destructiveHint"], true);
 
         let reply = tools
             .iter()
@@ -6354,6 +7070,7 @@ mod tests {
             .expect("tables");
         assert!(tables.contains(&"delivery_log".to_string()));
         assert!(tables.contains(&"notify_delivery_log".to_string()));
+        assert!(tables.contains(&"outbound_events".to_string()));
 
         let enabled = set_away_mode(&conn, true, 1234).expect("enable away");
         assert_eq!(enabled["away"], true);

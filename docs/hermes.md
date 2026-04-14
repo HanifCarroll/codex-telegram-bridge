@@ -35,7 +35,7 @@ If your default `hermes` command targets the profile you use, register MCP first
 codex-hermes-bridge hermes install
 ```
 
-For the full product flow, add a Hermes webhook delivery target. The installer registers MCP, subscribes a Hermes webhook, and prints the exact watcher command to run:
+For the full product flow, add a Hermes webhook delivery target. The installer registers MCP, subscribes a Hermes webhook, and writes the daemon config that lets Codex notify Hermes without Hermes asking first:
 
 ```bash
 codex-hermes-bridge hermes install \
@@ -74,7 +74,16 @@ hermes webhook subscribe codex-watch \
   --prompt '<Codex notification prompt>'
 ```
 
-Restart Hermes after registration. Hermes discovers MCP tools when the profile starts. Then run the printed `notificationLane.watcherCommand` as a long-lived local process so Codex changes proactively reach Hermes.
+Restart Hermes after registration. Hermes discovers MCP tools when the profile starts. Then install and start the bridge daemon:
+
+```bash
+codex-hermes-bridge daemon install --dry-run
+codex-hermes-bridge daemon install
+codex-hermes-bridge daemon start
+codex-hermes-bridge daemon status
+```
+
+The daemon reads `~/.codex-hermes-bridge/config.json`, watches Codex state, persists outbound notifications in SQLite, and retries delivery to Hermes until the signed webhook succeeds.
 
 ## Manual Config
 
@@ -126,7 +135,7 @@ codex-hermes-bridge hermes install \
   --dry-run
 ```
 
-The JSON result should include `notificationLane.configured: true` and a `notificationLane.watcherCommand` that calls `codex-hermes-bridge hermes post-webhook`.
+The JSON result should include `notificationLane.configured: true`, `notificationLane.daemonCommand`, and a redacted `notificationLane.config.webhookSecret`.
 
 ## Tool Surface
 
@@ -137,16 +146,10 @@ The MCP server exposes these bridge tools:
 - `codex_inbox`: list actionable inbox rows.
 - `codex_waiting`: list threads waiting on user input or approval.
 - `codex_show`: read one thread with derived state.
-- `codex_new`: start a new thread.
-- `codex_fork`: fork a thread.
 - `codex_reply`: resume and reply to a thread.
 - `codex_approve`: send `YES` or `NO` for an approval prompt.
-- `codex_archive`: archive explicit or filtered thread selections.
-- `codex_unarchive`: unarchive one thread.
-- `codex_away`: manage away-mode state.
-- `codex_notify_away`: build away-mode notification summaries.
 
-`watch` is not exposed as an MCP tool. It is a long-running stream, while MCP tools should return bounded request/response results.
+`watch`, `new`, `fork`, `archive`, `unarchive`, `away`, and `notify-away` are not exposed as default MCP tools. The OSS path keeps MCP focused on bounded control actions while the daemon owns proactive delivery.
 
 ## Resources
 
@@ -173,24 +176,32 @@ Prompts do not mutate Codex. They give Hermes safer phrasing for when and how to
 
 MCP is the control lane: Hermes asks for a bounded action, the bridge returns structured JSON.
 
-`watch --exec` is the notification lane: the bridge stays running, watches Codex state, and pushes each event to a trusted local hook. For Hermes, the trusted hook is `hermes post-webhook`.
+`daemon run` is the notification lane: the bridge stays running, watches Codex state, queues outbound events durably, and posts them to Hermes through signed local webhooks.
 
 Example:
 
 ```bash
-codex-hermes-bridge watch \
-  --events thread_waiting,thread_completed,thread_status_changed \
-  --exec 'codex-hermes-bridge hermes post-webhook --url http://localhost:8644/webhooks/codex-watch --secret <secret>'
+codex-hermes-bridge daemon run --once
+codex-hermes-bridge daemon run
 ```
 
-`hermes post-webhook` signs the payload using the same `X-Hub-Signature-256` convention Hermes' webhook gateway validates. The payload includes:
+`hermes post-webhook` remains available as the low-level signed HTTP poster. If `--secret` is omitted, it reads the secret from the daemon config written by `hermes install --webhook-deliver ...`.
+
+The Hermes webhook payload includes:
 
 - the original Codex watch event
 - `event_type`
 - `thread_id`
-- `reply_route_marker`, when a thread id is available
+- `reply_route`, when a thread id is available
+- `reply_route_marker`, retained only as a backward-compatible field for older Hermes builds
 
-The default Hermes webhook prompt tells Hermes to notify the user and include the reply route marker as the final line. Hermes can then use its platform reply routing and the MCP `codex_reply` or `codex_approve` tools to send the user's response back to Codex.
+Hermes should persist `reply_route` against the delivered Telegram message. When the user replies directly to that Telegram message, Hermes should route the reply text back to the same Codex thread through `codex_reply` or the bridge CLI:
+
+```bash
+codex-hermes-bridge reply <threadId> --message "<telegram reply text>"
+```
+
+Do not depend on the model echoing `THREAD_ROUTE` text in its notification. That was useful for early local experiments, but the release contract is structured route metadata tied to the delivered platform message.
 
 If you do not want Hermes webhook delivery, `watch --exec` can still target another trusted local notifier. Keep scripts outside the public repo when they contain personal chat ids, tokens, or local routing logic.
 
@@ -199,13 +210,13 @@ If you do not want Hermes webhook delivery, `watch --exec` can still target anot
 If your Hermes setup supports custom profile instructions or skills, add a small rule like this:
 
 ```text
-When the user asks about Codex work, use the Codex MCP tools first. Check codex_inbox or codex_waiting before replying or approving. Use codex_reply only when the user gives the exact reply text. Use codex_approve only when the user explicitly approves or denies a prompt. Do not call archive tools without explicit confirmation unless dryRun is true.
+When the user asks about Codex work, use the Codex MCP tools first. Check codex_inbox or codex_waiting before replying or approving. Use codex_reply only when the user gives the exact reply text. Use codex_approve only when the user explicitly approves or denies a prompt.
 ```
 
 ## Security Notes
 
 - This is a local trust boundary. Do not expose `codex-hermes-bridge mcp` on a remote transport.
 - MCP tools can read thread content and perform local Codex actions.
-- The notification lane posts signed events to a local Hermes webhook. Keep webhook secrets out of committed files and shell history where possible.
+- The notification lane posts signed events to a local Hermes webhook. The daemon config stores the webhook secret locally; do not commit `~/.codex-hermes-bridge/config.json`.
 - Keep `sampling.enabled: false` unless you have a specific reason to let this server request model sampling from the client.
-- Use `dryRun: true` for archive, reply, approve, new, fork, and unarchive checks when you want Hermes to show the action shape before mutating Codex.
+- Use `dryRun: true` for reply and approve checks when you want Hermes to show the action shape before mutating Codex.

@@ -8,10 +8,11 @@ This repo is currently focused on a small stable surface:
 - inspect threads and waiting work (`threads`, `show`, `waiting`, `inbox`, `sync`)
 - take action on a thread (`reply`, `approve`)
 - stream thread updates (`follow`, `watch`)
-- archive or unarchive threads (`archive`, `unarchive`)
-- emit away-mode summaries (`away`, `notify-away`)
 - expose a local MCP control plane for Hermes (`mcp`, `hermes install`)
-- push Codex watch events into Hermes through signed local webhooks (`hermes post-webhook`)
+- run a proactive Hermes notification daemon (`daemon run/install/start/stop/status/logs`)
+- push signed local webhook events into Hermes (`hermes post-webhook`, used by the daemon)
+
+The CLI still includes lower-level maintenance commands such as `archive`, `unarchive`, `away`, and `notify-away`, but they are not part of the default Hermes MCP surface for the OSS release path.
 
 Everything documented below is intended to be part of that public surface.
 
@@ -82,7 +83,16 @@ If you use a profile wrapper, pass it explicitly:
 codex-hermes-bridge hermes install --hermes-command hermes-se
 ```
 
-Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools. If you installed the notification lane, run the printed `notificationLane.watcherCommand` as a long-lived local process. That command is what makes Codex changes notify Hermes without Hermes asking first.
+Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools. If you installed the notification lane, install and start the local daemon:
+
+```bash
+codex-hermes-bridge daemon install --dry-run
+codex-hermes-bridge daemon install
+codex-hermes-bridge daemon start
+codex-hermes-bridge daemon status
+```
+
+The daemon is what makes Codex changes notify Hermes without Hermes asking first. `hermes install --webhook-deliver ...` writes the local webhook URL and secret to `~/.codex-hermes-bridge/config.json` with user-only permissions, then `daemon run` reads that config.
 
 ## Commands
 
@@ -154,17 +164,36 @@ Useful flags:
 - `--events <csv>`: filter emitted events
 - `--exec <command>`: pipe each emitted event to a hook command on stdin
 
-### Push watch events to Hermes
+### Proactive Hermes daemon
+
+The daemon watches Codex state, writes outbound notification events to SQLite, and retries delivery to Hermes until Hermes accepts the signed webhook request.
+
+```bash
+codex-hermes-bridge daemon run --once
+codex-hermes-bridge daemon run
+codex-hermes-bridge daemon install --dry-run
+codex-hermes-bridge daemon install
+codex-hermes-bridge daemon start
+codex-hermes-bridge daemon stop
+codex-hermes-bridge daemon status
+codex-hermes-bridge daemon logs
+```
+
+`daemon install` writes a user service:
+
+- macOS: `~/Library/LaunchAgents/com.hanifcarroll.codex-hermes-bridge.plist`
+- Linux: `~/.config/systemd/user/com.hanifcarroll.codex-hermes-bridge.service`
+
+### Manual webhook posting
 
 `hermes post-webhook` reads one watch event from stdin, wraps it for Hermes, signs it with `X-Hub-Signature-256`, and posts it to a local Hermes webhook route.
 
 ```bash
-codex-hermes-bridge watch \
-  --events thread_waiting,thread_completed,thread_status_changed \
-  --exec 'codex-hermes-bridge hermes post-webhook --url http://localhost:8644/webhooks/codex-watch --secret <secret>'
+codex-hermes-bridge hermes post-webhook \
+  --url http://localhost:8644/webhooks/codex-watch < event.json
 ```
 
-Use `codex-hermes-bridge hermes install --webhook-deliver ...` to generate the exact command for your Hermes profile.
+If `--secret` is omitted, the command reads the secret from `~/.codex-hermes-bridge/config.json`.
 
 ### Archive threads
 
@@ -201,9 +230,9 @@ Run a stdio MCP server that exposes Codex thread tools to Hermes:
 codex-hermes-bridge mcp
 ```
 
-The MCP server exposes structured tools for `doctor`, `threads`, `inbox`, `waiting`, `show`, `new`, `fork`, `reply`, `approve`, `archive`, `unarchive`, `away`, and `notify-away`. It also exposes resources for thread context and prompts for safe inbox/reply/approval workflows.
+The default MCP server exposes structured tools for `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve`. It also exposes resources for thread context and prompts for safe inbox/reply/approval workflows.
 
-`watch` is intentionally not exposed as an MCP tool. It is a long-running event stream and belongs in the notification lane with `watch --exec`, not in the request/response tool lane.
+`watch`, `new`, `fork`, `archive`, `unarchive`, `away`, and `notify-away` are intentionally not exposed as default MCP tools. The MCP lane should stay bounded and action-focused; proactive notification belongs in the daemon lane.
 
 See [docs/hermes.md](docs/hermes.md) for the Hermes-first setup guide.
 
