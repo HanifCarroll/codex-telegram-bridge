@@ -1839,6 +1839,14 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           delivered_at INTEGER NOT NULL,
           PRIMARY KEY(event_id, transport)
         );
+        CREATE TABLE IF NOT EXISTS telegram_inbound_log (
+          bot_id TEXT NOT NULL,
+          update_id INTEGER NOT NULL,
+          update_kind TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          processed_at INTEGER NOT NULL,
+          PRIMARY KEY(bot_id, update_id)
+        );
         CREATE TABLE IF NOT EXISTS actions_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           thread_id TEXT NOT NULL,
@@ -4454,6 +4462,43 @@ fn telegram_message_id(message: &Value) -> Option<i64> {
     message.get("message_id").and_then(Value::as_i64)
 }
 
+fn telegram_bot_id(bot_token: &str) -> String {
+    sha256_hex(bot_token.as_bytes())[..16].to_string()
+}
+
+fn telegram_inbound_processed(conn: &Connection, bot_id: &str, update_id: i64) -> Result<bool> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT update_id FROM telegram_inbound_log WHERE bot_id = ?1 AND update_id = ?2",
+            params![bot_id, update_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn record_telegram_inbound_processed(
+    conn: &Connection,
+    bot_id: &str,
+    update_id: i64,
+    update_kind: &str,
+    result: &Value,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO telegram_inbound_log(bot_id, update_id, update_kind, result_json, processed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            bot_id,
+            update_id,
+            update_kind,
+            serde_json::to_string(result)?,
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(())
+}
+
 fn telegram_authorized(
     telegram: &TelegramConfig,
     chat_id: Option<&str>,
@@ -4854,45 +4899,90 @@ fn process_telegram_updates(
     now: u64,
     timeout: Duration,
 ) -> Result<Value> {
-    let key = format!(
-        "telegram_offset:{}",
-        sha256_hex(telegram.bot_token.as_bytes())
-    );
+    let bot_id = telegram_bot_id(&telegram.bot_token);
+    let key = format!("telegram_offset:{bot_id}");
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
     let updates = telegram_get_updates(&telegram.bot_token, offset, 0, timeout)?;
     let updates = telegram_updates_array(&updates)?;
     let mut seen = 0usize;
     let mut replies = 0usize;
     let mut callbacks = 0usize;
+    let mut duplicate = 0usize;
     let mut ignored = 0usize;
     let mut max_update_id = None;
     for update in updates {
         seen += 1;
-        if let Some(update_id) = update.get("update_id").and_then(Value::as_i64) {
+        let update_id = update.get("update_id").and_then(Value::as_i64);
+        if let Some(update_id) = update_id {
             max_update_id =
                 Some(max_update_id.map_or(update_id, |current: i64| current.max(update_id)));
+            if telegram_inbound_processed(conn, &bot_id, update_id)? {
+                duplicate += 1;
+                continue;
+            }
         }
         if let Some(message) = update.get("message") {
             match extract_telegram_reply_route(conn, message, telegram)? {
                 Some(route) => {
-                    send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
+                    let result =
+                        send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn, &bot_id, update_id, "message", &result, now,
+                        )?;
+                    }
                     replies += 1;
                 }
-                None => ignored += 1,
+                None => {
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            &bot_id,
+                            update_id,
+                            "message_ignored",
+                            &json!({ "ignored": true }),
+                            now,
+                        )?;
+                    }
+                    ignored += 1;
+                }
             }
         } else if let Some(callback_query) = update.get("callback_query") {
             match extract_telegram_callback_route(conn, callback_query, telegram)? {
                 Some(route) => {
-                    send_codex_approval_to_thread(conn, &route.thread_id, route.action, now)?;
-                    telegram_answer_callback_query(
+                    let result =
+                        send_codex_approval_to_thread(conn, &route.thread_id, route.action, now)?;
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            &bot_id,
+                            update_id,
+                            "callback_query",
+                            &result,
+                            now,
+                        )?;
+                    }
+                    let _ = telegram_answer_callback_query(
                         telegram,
                         &route.callback_query_id,
                         "Sent to Codex",
                         timeout,
-                    )?;
+                    );
                     callbacks += 1;
                 }
-                None => ignored += 1,
+                None => {
+                    if let Some(update_id) = update_id {
+                        record_telegram_inbound_processed(
+                            conn,
+                            &bot_id,
+                            update_id,
+                            "callback_query_ignored",
+                            &json!({ "ignored": true }),
+                            now,
+                        )?;
+                    }
+                    ignored += 1;
+                }
             }
         }
     }
@@ -4905,6 +4995,7 @@ fn process_telegram_updates(
         "seen": seen,
         "replies": replies,
         "callbacks": callbacks,
+        "duplicate": duplicate,
         "ignored": ignored
     }))
 }
@@ -7976,6 +8067,35 @@ mod tests {
         assert!(
             !transport_delivery_exists(&conn, "event_1", "hermes").expect("lookup"),
             "other transports for the same event must remain pending"
+        );
+    }
+
+    #[test]
+    fn telegram_inbound_log_dedupes_processed_updates_per_bot() {
+        let conn = create_state_db_in_memory().expect("db");
+        let bot_id = telegram_bot_id("123:secret");
+
+        assert!(
+            !telegram_inbound_processed(&conn, &bot_id, 42).expect("lookup"),
+            "update should not start processed"
+        );
+        record_telegram_inbound_processed(
+            &conn,
+            &bot_id,
+            42,
+            "message",
+            &json!({ "threadId": "thr_1" }),
+            1000,
+        )
+        .expect("record inbound update");
+
+        assert!(
+            telegram_inbound_processed(&conn, &bot_id, 42).expect("lookup"),
+            "recorded update should not be processed again"
+        );
+        assert!(
+            !telegram_inbound_processed(&conn, &telegram_bot_id("456:other"), 42).expect("lookup"),
+            "same update id from a different bot token hash must remain independent"
         );
     }
 
