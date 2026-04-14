@@ -5,17 +5,26 @@ import sys
 from pathlib import Path
 
 
+def select_binary(root: Path) -> Path:
+    preferred = root / "target" / "release" / "codex-hermes-bridge"
+    fallback = root / "target" / "debug" / "codex-hermes-bridge"
+    if preferred.exists():
+        return preferred
+    if fallback.exists():
+        return fallback
+    result = subprocess.run(["cargo", "build", "--release"], cwd=root)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+    return preferred
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     os.chdir(root)
 
-    binary = root / "target" / "debug" / "codex-hermes-bridge"
-    if not binary.exists():
-        result = subprocess.run(["cargo", "build"], cwd=root)
-        if result.returncode != 0:
-            return result.returncode
-
-    os.execv(str(binary), [str(binary), *sys.argv[1:]])
+    binary = select_binary(root)
+    argv = [str(binary), *sys.argv[1:]]
+    os.execve(str(binary), argv, os.environ.copy())
     return 1
 
 

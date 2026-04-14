@@ -10,7 +10,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn fixture_path() -> Option<PathBuf> {
     env::var("CODEX_HERMES_BRIDGE_FIXTURE")
@@ -149,7 +151,7 @@ enum Commands {
         events: Option<String>,
     },
     NotifyAway {
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = true)]
         completed: bool,
     },
     Sync {
@@ -447,6 +449,8 @@ struct InboxItem {
     cwd: Option<String>,
     #[serde(rename = "updatedAt")]
     updated_at: Option<u64>,
+    #[serde(rename = "lastSeenAt")]
+    last_seen_at: Option<u64>,
     #[serde(rename = "ageSeconds")]
     age_seconds: Option<u64>,
     #[serde(rename = "statusType")]
@@ -455,6 +459,8 @@ struct InboxItem {
     status_flags: Vec<String>,
     #[serde(rename = "lastPreview")]
     last_preview: Option<String>,
+    #[serde(skip)]
+    delivery_preview: Option<String>,
     #[serde(rename = "promptKind")]
     prompt_kind: Option<String>,
     #[serde(rename = "promptStatus")]
@@ -833,16 +839,26 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
-            let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
+            let result = if let Some(threads) = fixture_threads()? {
+                let mut snapshots = Vec::new();
+                for thread in threads {
+                    snapshots.push(normalize_thread_snapshot(&thread, &thread)?);
+                }
+                reconcile_thread_snapshots(&conn, now, snapshots, false)?
+            } else {
+                let mut client = CodexAppServerClient::connect()?;
+                sync_state_from_live(&mut client, &conn, now, limit, false)?
+            };
             println!("{}", serde_json::to_string(&result)?);
         }
         Commands::Changes => {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50, false)?;
+            if !load_fixture_into_db(&conn, now)? {
+                let mut client = CodexAppServerClient::connect()?;
+                sync_state_from_live(&mut client, &conn, now, 50, false)?;
+            }
             let result = list_changes_since_last_check(&conn, now)?;
             println!(
                 "{}",
@@ -860,8 +876,10 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50, false)?;
+            if !load_fixture_into_db(&conn, now)? {
+                let mut client = CodexAppServerClient::connect()?;
+                sync_state_from_live(&mut client, &conn, now, 50, false)?;
+            }
             let result = list_done_since_last_check(&conn, now)?;
             println!(
                 "{}",
@@ -1045,8 +1063,20 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50, false)?;
+            let fixture_loaded = load_fixture_into_db(&conn, now)?;
+            if !dry_run && targets.is_empty() && !yes {
+                bail!("Refusing bulk archive without --yes or --dry-run");
+            }
+            let mut client = if dry_run {
+                None
+            } else {
+                Some(CodexAppServerClient::connect()?)
+            };
+            if !dry_run && targets.is_empty() && !fixture_loaded {
+                if let Some(client) = client.as_mut() {
+                    sync_state_from_live(client, &conn, now, 50, false)?;
+                }
+            }
             let selection = resolve_archive_targets(
                 &conn,
                 &targets,
@@ -1069,7 +1099,10 @@ fn run() -> Result<()> {
             } else {
                 let mut results = Vec::new();
                 for target in selection.targets {
-                    let result = client.request("thread/archive", json!({ "threadId": target }))?;
+                    let result = client
+                        .as_mut()
+                        .context("archive client missing")?
+                        .request("thread/archive", json!({ "threadId": target }))?;
                     record_action(
                         &conn,
                         &target,
@@ -1371,6 +1404,36 @@ fn compact_text_preview(input: Option<String>, limit: usize) -> Option<String> {
     Some(format!("{}…", truncated.trim_end()))
 }
 
+fn preserve_message_body(input: Option<&str>, limit: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut blank_count = 0;
+    let normalized_newlines = input?.replace("\r\n", "\n");
+    for line in normalized_newlines.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        blank_count = 0;
+        lines.push(trimmed.to_string());
+    }
+    let normalized = lines.join("\n").trim().to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= limit {
+        return Some(normalized);
+    }
+    let kept = normalized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    Some(format!("{}…", kept.trim_end()))
+}
+
 fn derive_project_label(cwd: Option<&str>) -> Option<String> {
     let cwd = cwd?;
     Path::new(cwd)
@@ -1657,6 +1720,15 @@ fn classify_attention(snapshot: &BridgeThreadSnapshot) -> (&'static str, &'stati
         _ if snapshot.last_turn_status.as_deref() == Some("completed") => {
             ("completed", "last_turn_completed")
         }
+        _ if snapshot.last_turn_status.as_deref() == Some("interrupted")
+            && snapshot
+                .last_preview
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false) =>
+        {
+            ("updated", "last_turn_interrupted")
+        }
         _ => ("active", "fallback_active"),
     }
 }
@@ -1665,6 +1737,7 @@ fn classify_waiting_on(reason: &str) -> &'static str {
     match reason {
         "pending_approval" | "needs_reply" => "me",
         "active" => "codex",
+        "updated" => "none",
         _ => "none",
     }
 }
@@ -1674,6 +1747,7 @@ fn classify_suggested_action(reason: &str) -> &'static str {
         "pending_approval" => "approve",
         "needs_reply" => "reply",
         "completed" => "archive",
+        "updated" => "inspect",
         _ => "inspect",
     }
 }
@@ -1681,7 +1755,7 @@ fn classify_suggested_action(reason: &str) -> &'static str {
 fn classify_priority(reason: &str) -> &'static str {
     match reason {
         "pending_approval" => "high",
-        "needs_reply" | "active" => "medium",
+        "needs_reply" | "active" | "updated" => "medium",
         _ => "low",
     }
 }
@@ -1714,12 +1788,14 @@ fn classify_inbox_item(snapshot: &BridgeThreadSnapshot, now: u64) -> InboxItem {
         project: project.clone(),
         cwd: snapshot.cwd.clone(),
         updated_at: snapshot.updated_at,
+        last_seen_at: None,
         age_seconds: snapshot
             .updated_at
             .map(|updated| now.saturating_sub(updated)),
         status_type: snapshot.status_type.clone(),
         status_flags: snapshot.status_flags.clone(),
         last_preview: compact_text_preview(snapshot.last_preview.clone(), 220),
+        delivery_preview: snapshot.last_preview.clone(),
         prompt_kind: snapshot
             .pending_prompt
             .as_ref()
@@ -1851,6 +1927,13 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           notification_type TEXT NOT NULL,
           delivered_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS thread_events (
+          event_key TEXT PRIMARY KEY,
+          thread_id TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          observed_at INTEGER NOT NULL,
+          payload_json TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS actions_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           thread_id TEXT NOT NULL,
@@ -1860,6 +1943,7 @@ fn init_state_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    ensure_column(conn, "threads_cache", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
     Ok(())
@@ -2085,6 +2169,28 @@ fn record_delivery(
     Ok(changed > 0)
 }
 
+fn record_thread_event(
+    conn: &Connection,
+    event_key: &str,
+    thread_id: &str,
+    event_type: &str,
+    observed_at: u64,
+    payload: &Value,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO thread_events(event_key, thread_id, event_type, observed_at, payload_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            event_key,
+            thread_id,
+            event_type,
+            to_sql_i64(observed_at)?,
+            serde_json::to_string(payload)?
+        ],
+    )?;
+    Ok(())
+}
+
 fn reconcile_thread_snapshots(
     conn: &Connection,
     now: u64,
@@ -2117,12 +2223,22 @@ fn reconcile_thread_snapshots(
             let should_emit = !record_deliveries
                 || record_delivery(conn, &event_key, &snapshot.thread_id, "thread_waiting", now)?;
             if should_emit {
-                events.push(json!({
+                let event = json!({
                     "type": "thread_waiting",
                     "threadId": snapshot.thread_id,
                     "promptKind": prompt.kind,
-                    "updatedAt": snapshot.updated_at
-                }));
+                    "updatedAt": snapshot.updated_at,
+                    "lastPreview": snapshot.last_preview,
+                });
+                record_thread_event(
+                    conn,
+                    &event_key,
+                    &snapshot.thread_id,
+                    "thread_waiting",
+                    now,
+                    &event,
+                )?;
+                events.push(event);
             }
         }
 
@@ -2146,11 +2262,21 @@ fn reconcile_thread_snapshots(
                     now,
                 )?;
             if should_emit {
-                events.push(json!({
+                let event = json!({
                     "type": "thread_completed",
                     "threadId": snapshot.thread_id,
-                    "updatedAt": snapshot.updated_at
-                }));
+                    "updatedAt": snapshot.updated_at,
+                    "lastPreview": snapshot.last_preview,
+                });
+                record_thread_event(
+                    conn,
+                    &event_key,
+                    &snapshot.thread_id,
+                    "thread_completed",
+                    now,
+                    &event,
+                )?;
+                events.push(event);
             }
         }
     }
@@ -2443,7 +2569,7 @@ fn list_inbox_from_db(
     limit: u64,
 ) -> Result<InboxResult> {
     let mut stmt = conn.prepare(
-        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.status_type, t.status_flags_json,
+        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.last_seen_at, t.status_type, t.status_flags_json,
                 t.last_turn_status, t.last_preview, p.prompt_kind, p.prompt_status, p.question
          FROM threads_cache t
          LEFT JOIN pending_prompts p ON p.thread_id = t.thread_id
@@ -2455,13 +2581,14 @@ fn list_inbox_from_db(
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<i64>>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, i64>(4)?,
             row.get::<_, String>(5)?,
-            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(6)?,
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, Option<String>>(9)?,
             row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
     let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2473,6 +2600,7 @@ fn list_inbox_from_db(
                 name,
                 cwd,
                 updated_at_raw,
+                last_seen_at_raw,
                 status_type,
                 status_flags_json,
                 last_turn_status,
@@ -2501,6 +2629,7 @@ fn list_inbox_from_db(
                     pending_prompt,
                 };
                 let mut item = classify_inbox_item(&snapshot, now);
+                item.last_seen_at = Some(from_sql_i64(last_seen_at_raw)?);
                 item.recent_action = recent_actions_json(conn, &item.thread_id, 1)?
                     .into_iter()
                     .next();
@@ -2706,7 +2835,7 @@ fn resolve_archive_targets(
             .into_iter()
             .map(|item| item.thread_id)
             .collect::<Vec<_>>(),
-        using_filter_selection: project.is_some() || status.is_some() || attention.is_some(),
+        using_filter_selection: true,
     })
 }
 
@@ -2828,10 +2957,6 @@ fn resolve_codex_binary() -> Result<ResolvedBinary> {
         );
     }
 
-    if let Ok(path_codex) = which::which("codex") {
-        push_candidate(&mut candidates, &mut seen, path_codex, "path");
-    }
-
     if let Some(home) = dirs::home_dir() {
         push_candidate(
             &mut candidates,
@@ -2847,8 +2972,12 @@ fn resolve_codex_binary() -> Result<ResolvedBinary> {
         "platform-known",
     );
 
+    if let Ok(path_codex) = which::which("codex") {
+        push_candidate(&mut candidates, &mut seen, path_codex, "path");
+    }
+
     for candidate in candidates {
-        if candidate.path.is_file() {
+        if codex_candidate_is_usable(&candidate.path) {
             return Ok(candidate);
         }
     }
@@ -2856,6 +2985,53 @@ fn resolve_codex_binary() -> Result<ResolvedBinary> {
     bail!(
         "Could not resolve codex executable. Set CODEX_BIN or install Codex so `codex --version` works in this environment"
     )
+}
+
+fn codex_candidate_is_usable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = fs::metadata(path) else {
+            return false;
+        };
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    codex_candidate_is_usable_with_timeout(path, Duration::from_secs(3))
+}
+
+fn codex_candidate_is_usable_with_timeout(path: &Path, timeout: Duration) -> bool {
+    let Ok(mut child) = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn push_candidate(
@@ -4117,19 +4293,10 @@ fn build_notify_away_from_db(
     if !away || away_session_id.is_none() {
         return Ok(json!({ "ok": true, "action": "notify-away", "notifications": [] }));
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS notify_delivery_log (
-            delivery_key TEXT PRIMARY KEY,
-            away_session_id TEXT NOT NULL,
-            thread_id TEXT NOT NULL,
-            notification_type TEXT NOT NULL,
-            delivered_at INTEGER NOT NULL
-        );",
-    )?;
-
-    let waiting = list_waiting_from_db(conn, None, 100)?;
-    let inbox = list_inbox_from_db(conn, now, None, None, None, None, 100)?;
     let away_session_id = away_session_id.unwrap();
+
+    let waiting = list_waiting_from_db(conn, None, 0)?;
+    let inbox = list_inbox_from_db(conn, now, None, None, None, None, 0)?;
     let mut candidates = Vec::new();
 
     for thread in waiting.threads {
@@ -4137,10 +4304,11 @@ fn build_notify_away_from_db(
             continue;
         }
         let delivery_key = format!(
-            "{}:thread_waiting:{}:{}:{}",
+            "{}:thread_waiting:{}:{}:{}:{}",
             away_session_id,
             thread.thread_id,
-            thread.updated_at.unwrap_or(0),
+            thread.prompt.kind,
+            thread.prompt.status,
             thread.prompt.question.clone().unwrap_or_default()
         );
         candidates.push(NotificationCandidate {
@@ -4164,7 +4332,11 @@ fn build_notify_away_from_db(
     }
 
     for item in inbox.items {
-        if item.updated_at.unwrap_or(0) < away_started_at {
+        let effective_updated_at = item
+            .updated_at
+            .unwrap_or(0)
+            .max(item.last_seen_at.unwrap_or(0));
+        if effective_updated_at < away_started_at {
             continue;
         }
         if item.attention_reason == "completed" && !include_completed {
@@ -4179,12 +4351,18 @@ fn build_notify_away_from_db(
             "thread_updated"
         };
         let delivery_key = format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             away_session_id,
             kind,
             item.thread_id,
-            item.updated_at.unwrap_or(0)
+            item.updated_at.unwrap_or(0),
+            item.delivery_preview.clone().unwrap_or_default()
         );
+        let summary = if kind == "thread_completed" {
+            preserve_message_body(item.delivery_preview.as_deref(), 3500)
+        } else {
+            item.last_preview.clone()
+        };
         candidates.push(NotificationCandidate {
             delivery_key,
             kind,
@@ -4194,13 +4372,86 @@ fn build_notify_away_from_db(
                 display_name: &item.display_name,
                 project: item.project.as_deref().unwrap_or("unknown"),
                 cwd: item.cwd.as_deref(),
-                summary: item.last_preview.as_deref(),
+                summary: summary.as_deref(),
                 detail: None,
                 recent_action: recent_action_label(item.recent_action.as_ref()).as_deref(),
                 next_step: Some(if kind == "thread_completed" {
                     "Tell me if you want me to follow up"
                 } else {
                     "Tell me if you want me to check it"
+                }),
+            }),
+        });
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT event_key, thread_id, event_type, observed_at, payload_json
+         FROM thread_events
+         WHERE observed_at >= ?1
+         ORDER BY observed_at ASC",
+    )?;
+    let rows = stmt.query_map(params![to_sql_i64(away_started_at)?], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (event_key, thread_id, event_type, _observed_at, payload_json) in raw {
+        if event_type == "thread_completed" && !include_completed {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
+        let summary = payload.get("lastPreview").and_then(Value::as_str).map(str::to_string);
+        let exists = candidates.iter().any(|candidate| candidate.delivery_key == event_key);
+        if exists {
+            continue;
+        }
+        let item = conn
+            .query_row(
+                "SELECT name, cwd FROM threads_cache WHERE thread_id = ?1",
+                params![thread_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (name, cwd) = item.unwrap_or((None, None));
+        let project = derive_project_label(cwd.as_deref()).unwrap_or_else(|| "unknown".to_string());
+        let display_name = derive_thread_display_name(
+            name.as_deref(),
+            Some(project.as_str()),
+            summary.as_deref(),
+            &thread_id,
+        );
+        let kind = if event_type == "thread_completed" {
+            "thread_completed"
+        } else {
+            "thread_waiting"
+        };
+        candidates.push(NotificationCandidate {
+            delivery_key: event_key,
+            kind,
+            thread_id: thread_id.clone(),
+            text: render_notification_message(NotificationMessage {
+                kind,
+                display_name: &display_name,
+                project: &project,
+                cwd: cwd.as_deref(),
+                summary: summary.as_deref(),
+                detail: None,
+                recent_action: recent_action_label(recent_actions_json(conn, &thread_id, 1)?.first())
+                    .as_deref(),
+                next_step: Some(if kind == "thread_completed" {
+                    "Tell me if you want me to follow up"
+                } else {
+                    "Tell me how you want me to reply"
                 }),
             }),
         });
@@ -4272,9 +4523,17 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
 struct CodexAppServerClient {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    messages: Receiver<AppServerReaderMessage>,
+    reader: Option<JoinHandle<()>>,
     next_id: u64,
     notifications: Vec<Value>,
+    reader_error: Option<String>,
+}
+
+enum AppServerReaderMessage {
+    Json(Value),
+    Error(String),
+    Closed,
 }
 
 impl CodexAppServerClient {
@@ -4301,12 +4560,16 @@ impl CodexAppServerClient {
             .take()
             .context("failed to open app-server stdout")?;
 
+        let (messages, reader) = spawn_app_server_reader(stdout);
+
         let mut client = Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            messages,
+            reader: Some(reader),
             next_id: 1,
             notifications: Vec::new(),
+            reader_error: None,
         };
 
         let _ = client.request("initialize", initialize_params(experimental_api))?;
@@ -4335,24 +4598,43 @@ impl CodexAppServerClient {
         self.write_message(&envelope)?;
 
         loop {
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line)?;
-            if read == 0 {
-                bail!("codex app-server closed stdout while waiting for {method}");
+            if let Some(error) = self.reader_error.take() {
+                bail!("{error}");
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let parsed: Value = serde_json::from_str(trimmed)
-                .with_context(|| format!("invalid JSON from app-server: {trimmed}"))?;
-            if let Some(result) = handle_app_server_message(&parsed, id, &mut self.notifications)? {
-                return Ok(result);
+            match self.messages.recv() {
+                Ok(AppServerReaderMessage::Json(parsed)) => {
+                    if let Some(result) =
+                        handle_app_server_message(&parsed, id, &mut self.notifications)?
+                    {
+                        return Ok(result);
+                    }
+                }
+                Ok(AppServerReaderMessage::Error(message)) => bail!("{message}"),
+                Ok(AppServerReaderMessage::Closed) | Err(_) => {
+                    bail!("codex app-server closed stdout while waiting for {method}")
+                }
             }
         }
     }
 
     fn drain_notifications(&mut self) -> Vec<Value> {
+        while let Ok(message) = self.messages.try_recv() {
+            match message {
+                AppServerReaderMessage::Json(parsed) => {
+                    if parsed.get("id").is_none()
+                        && parsed.get("method").and_then(Value::as_str).is_some()
+                    {
+                        self.notifications.push(parsed);
+                    }
+                }
+                AppServerReaderMessage::Error(message) => {
+                    if self.reader_error.is_none() {
+                        self.reader_error = Some(message);
+                    }
+                }
+                AppServerReaderMessage::Closed => {}
+            }
+        }
         std::mem::take(&mut self.notifications)
     }
 
@@ -4361,6 +4643,48 @@ impl CodexAppServerClient {
         self.stdin.flush()?;
         Ok(())
     }
+}
+
+fn spawn_app_server_reader(
+    stdout: ChildStdout,
+) -> (Receiver<AppServerReaderMessage>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(AppServerReaderMessage::Closed);
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Value>(trimmed) {
+                        Ok(parsed) => {
+                            let _ = tx.send(AppServerReaderMessage::Json(parsed));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(AppServerReaderMessage::Error(format!(
+                                "invalid JSON from app-server: {trimmed}: {error}"
+                            )));
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(AppServerReaderMessage::Error(format!(
+                        "failed to read app-server stdout: {error}"
+                    )));
+                    break;
+                }
+            }
+        }
+    });
+    (rx, reader)
 }
 
 fn initialize_params(experimental_api: bool) -> Value {
@@ -4407,6 +4731,9 @@ impl Drop for CodexAppServerClient {
         let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -4649,6 +4976,112 @@ mod tests {
         assert_eq!(experimental["clientInfo"]["name"], "codex-hermes-bridge");
     }
 
+    fn env_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_codex_binary_prefers_platform_binary_before_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_test_lock().lock().expect("env lock");
+        let root = std::env::temp_dir().join(format!("codex-resolve-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(root.join("path-bin")).expect("mkdir path bin");
+        std::fs::create_dir_all(home.join("Applications/Codex.app/Contents/Resources"))
+            .expect("mkdir platform bin");
+        let bad_override = root.join("bad-codex");
+        let path_codex = root.join("path-bin/codex");
+        let platform_codex = home.join("Applications/Codex.app/Contents/Resources/codex");
+        std::fs::write(
+            &bad_override,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo bad; exit 42; fi\nexit 42\n",
+        )
+        .expect("write bad override");
+        std::fs::write(
+            &path_codex,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo codex-path-1.0; exit 0; fi\nexit 1\n",
+        )
+        .expect("write path codex");
+        std::fs::write(
+            &platform_codex,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo codex-platform-1.0; exit 0; fi\nexit 1\n",
+        )
+        .expect("write platform codex");
+        for path in [&bad_override, &path_codex, &platform_codex] {
+            let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("chmod");
+        }
+
+        let previous_codex_bin = std::env::var("CODEX_BIN").ok();
+        let previous_path = std::env::var("PATH").ok();
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("CODEX_BIN", &bad_override);
+        std::env::set_var("HOME", &home);
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("path-bin").display(),
+                previous_path.clone().unwrap_or_default()
+            ),
+        );
+
+        let resolved = resolve_codex_binary().expect("resolve codex");
+
+        if let Some(previous) = previous_codex_bin {
+            std::env::set_var("CODEX_BIN", previous);
+        } else {
+            std::env::remove_var("CODEX_BIN");
+        }
+        if let Some(previous) = previous_path {
+            std::env::set_var("PATH", previous);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(previous) = previous_home {
+            std::env::set_var("HOME", previous);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert_eq!(resolved.path, platform_codex);
+        assert_eq!(resolved.source, "platform-known");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_candidate_probe_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("codex-probe-timeout-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir timeout root");
+        let codex_path = root.join("codex");
+        std::fs::write(
+            &codex_path,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then sleep 10; exit 0; fi\nexit 1\n",
+        )
+        .expect("write hanging codex");
+        let mut permissions = std::fs::metadata(&codex_path)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&codex_path, permissions).expect("chmod");
+
+        let started = std::time::Instant::now();
+        let usable =
+            codex_candidate_is_usable_with_timeout(&codex_path, Duration::from_millis(100));
+
+        assert!(!usable);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn app_server_message_parser_preserves_notifications() {
         let mut notifications = Vec::new();
@@ -4670,6 +5103,85 @@ mod tests {
         let parsed =
             handle_app_server_message(&response, 7, &mut notifications).expect("response parse");
         assert_eq!(parsed, Some(json!({ "ok": true })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_server_client_collects_notifications_between_requests() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = env_test_lock().lock().expect("env lock");
+        let root = std::env::temp_dir().join(format!(
+            "codex-async-notification-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir fake codex root");
+        let codex_path = root.join("codex");
+        std::fs::write(
+            &codex_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import time
+
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("codex-fake-async")
+    raise SystemExit(0)
+
+if len(sys.argv) > 1 and sys.argv[1] == "app-server":
+    line = sys.stdin.readline()
+    request = json.loads(line)
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}}), flush=True)
+    time.sleep(0.05)
+    print(json.dumps({
+        "jsonrpc": "2.0",
+        "method": "item/completed",
+        "params": {
+            "threadId": "thr_async",
+            "turnId": "turn_async",
+            "item": {"type": "assistantMessage"}
+        }
+    }), flush=True)
+    time.sleep(1)
+    raise SystemExit(0)
+
+raise SystemExit(1)
+"#,
+        )
+        .expect("write fake codex");
+        let mut permissions = std::fs::metadata(&codex_path)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&codex_path, permissions).expect("chmod fake codex");
+
+        let previous_codex_bin = std::env::var("CODEX_BIN").ok();
+        std::env::set_var("CODEX_BIN", &codex_path);
+        let mut client = CodexAppServerClient::connect().expect("connect fake codex");
+        if let Some(previous) = previous_codex_bin {
+            std::env::set_var("CODEX_BIN", previous);
+        } else {
+            std::env::remove_var("CODEX_BIN");
+        }
+        let mut notifications: Vec<Value> = Vec::new();
+        for _ in 0..20 {
+            notifications.extend(client.drain_notifications());
+            if notifications.iter().any(|notification| {
+                notification.get("method").and_then(Value::as_str) == Some("item/completed")
+            }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(notifications.iter().any(|notification| {
+            notification.get("method").and_then(Value::as_str) == Some("item/completed")
+                && notification
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    == Some("thr_async")
+        }));
     }
 
     #[test]
@@ -5068,6 +5580,180 @@ mod tests {
     }
 
     #[test]
+    fn notify_away_cli_includes_completed_threads_by_default() {
+        let cli = Cli::parse_from(["codex-hermes-bridge", "notify-away"]);
+
+        match cli.command {
+            Commands::NotifyAway { completed } => assert!(completed),
+            _ => panic!("expected notify-away command"),
+        }
+    }
+
+    #[test]
+    fn hermes_hook_notifies_on_thread_completed_event() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/hermes-codex-hook.py");
+        let mut child = Command::new("python3")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn hermes hook");
+
+        let payload = json!({
+            "type": "thread_completed",
+            "threadId": "thr_done",
+            "thread": {
+                "name": "Launch checklist",
+                "lastPreview": "Finished the launch checklist."
+            }
+        });
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(serde_json::to_string(&payload).unwrap().as_bytes())
+            .expect("write payload");
+        drop(child.stdin.take());
+
+        let output = child.wait_with_output().expect("hook output");
+        assert!(output.status.success());
+        let notification: Value =
+            serde_json::from_slice(&output.stdout).expect("hook should emit JSON");
+
+        assert_eq!(notification["notify"], true);
+        assert_eq!(notification["threadId"], "thr_done");
+        assert_eq!(notification["eventType"], "thread_completed");
+        assert_eq!(notification["message"], "Finished the launch checklist.");
+    }
+
+    #[test]
+    fn notify_away_does_not_drop_completed_threads_behind_active_inbox_limit() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        for idx in 0..100 {
+            let active = snapshot_fixture(
+                &format!("thr_active_{idx}"),
+                "/tmp/project-active",
+                3000 + idx,
+                "active",
+                vec![],
+                Some("in_progress"),
+            );
+            upsert_thread_snapshot(&conn, &active, 4000).expect("upsert active");
+        }
+        let completed = snapshot_fixture(
+            "thr_done",
+            "/tmp/project-done",
+            2000,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+        upsert_thread_snapshot(&conn, &completed, 4000).expect("upsert completed");
+
+        let notify = build_notify_away_from_db(&conn, 5000, true).expect("notify");
+        let notifications = notify["notifications"].as_array().unwrap();
+
+        assert!(notifications.iter().any(|notification| {
+            notification["type"] == "thread_completed" && notification["threadId"] == "thr_done"
+        }));
+    }
+
+    #[test]
+    fn notify_away_redelivers_completed_thread_when_summary_changes_without_timestamp_change() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let mut completed = snapshot_fixture(
+            "thr_done",
+            "/tmp/project-done",
+            2000,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+        completed.last_preview = Some("First summary".to_string());
+        upsert_thread_snapshot(&conn, &completed, 3000).expect("upsert first");
+
+        let first = build_notify_away_from_db(&conn, 4000, true).expect("first notify");
+        assert_eq!(first["notifications"].as_array().unwrap().len(), 1);
+
+        completed.last_preview = Some("Second summary".to_string());
+        upsert_thread_snapshot(&conn, &completed, 5000).expect("upsert second");
+
+        let second = build_notify_away_from_db(&conn, 6000, true).expect("second notify");
+        let notifications = second["notifications"].as_array().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Second summary"));
+    }
+
+    #[test]
+    fn notify_away_preserves_completed_summary_body_beyond_inbox_preview_length() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let mut completed = snapshot_fixture(
+            "thr_done",
+            "/tmp/project-done",
+            2000,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+        completed.last_preview = Some(format!(
+            "{}\n\n{}",
+            "A".repeat(260),
+            "The important final line survives."
+        ));
+        upsert_thread_snapshot(&conn, &completed, 3000).expect("upsert completed");
+
+        let notify = build_notify_away_from_db(&conn, 4000, true).expect("notify");
+        let text = notify["notifications"][0]["text"].as_str().unwrap();
+
+        assert!(text.contains("The important final line survives."));
+    }
+
+    #[test]
+    fn notify_away_completed_survives_older_sync_timestamp() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1_776_047_824_152).expect("away on");
+        let cached = snapshot_fixture(
+            "thr_seconds",
+            "/tmp/project-seconds",
+            1_776_047_900_000,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+        upsert_thread_snapshot(&conn, &cached, 1_776_048_898_482).expect("upsert cached");
+        let older_sync = snapshot_fixture(
+            "thr_seconds",
+            "/tmp/project-seconds",
+            1_776_047_790,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+
+        reconcile_thread_snapshots(&conn, 500, vec![older_sync], true).expect("reconcile");
+        let updated_at: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM threads_cache WHERE thread_id = ?1",
+                params!["thr_seconds"],
+                |row| row.get(0),
+            )
+            .expect("updated_at");
+        assert_eq!(updated_at, 1_776_047_900_000);
+
+        let notify = build_notify_away_from_db(&conn, 600, true).expect("notify");
+        let notifications = notify["notifications"].as_array().unwrap();
+        assert!(notifications.iter().any(|notification| {
+            notification["type"] == "thread_completed" && notification["threadId"] == "thr_seconds"
+        }));
+    }
+
+    #[test]
     fn new_and_fork_dry_run_shapes_are_stable() {
         let new_result = start_new_thread_dry_run(Some("/tmp/project"), Some("hello"));
         assert_eq!(new_result["action"], "new");
@@ -5380,6 +6066,13 @@ mod tests {
         .expect("filtered targets");
         assert_eq!(filtered.targets, vec!["thr_a"]);
         assert!(filtered.using_filter_selection);
+
+        let implicit_bulk = resolve_archive_targets(&conn, &[], None, None, None, 10, 1500)
+            .expect("implicit bulk targets");
+        assert!(implicit_bulk.using_filter_selection);
+        let bulk_without_yes =
+            archive_from_db(&conn, None, None, false, false, 1500).expect_err("bulk refusal");
+        assert!(format!("{bulk_without_yes:#}").contains("Refusing bulk archive"));
     }
 
     #[test]
