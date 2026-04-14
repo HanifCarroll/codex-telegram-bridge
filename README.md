@@ -8,9 +8,10 @@ This repo is currently focused on a small stable surface:
 - inspect threads and waiting work (`threads`, `show`, `waiting`, `inbox`, `sync`)
 - take action on a thread (`reply`, `approve`)
 - stream thread updates (`follow`, `watch`)
+- configure direct Telegram delivery and reply routing (`telegram setup/status/disable`)
+- run the proactive notification daemon (`daemon run/install/start/stop/status/logs`)
 - expose a local MCP control plane for Hermes (`mcp`, `hermes install`)
-- run a proactive Hermes notification daemon (`daemon run/install/start/stop/status/logs`)
-- push signed local webhook events into Hermes (`hermes post-webhook`, used by the daemon)
+- optionally push signed local webhook events into Hermes (`hermes post-webhook`)
 
 The CLI still includes lower-level maintenance commands such as `archive`, `unarchive`, `away`, and `notify-away`, but they are not part of the default Hermes MCP surface for the OSS release path.
 
@@ -67,23 +68,22 @@ Run a one-shot watch pass and return normalized events:
 codex-hermes-bridge watch --once
 ```
 
-Register the bridge with Hermes. This installs the MCP control lane. Add `--webhook-deliver` to also install the proactive notification lane:
+Configure direct Telegram delivery. The bridge owns the Telegram bot transport, stores message routes locally, and sends Telegram replies back to the originating Codex thread:
 
 ```bash
-codex-hermes-bridge hermes install --dry-run
-codex-hermes-bridge hermes install
-codex-hermes-bridge hermes install \
-  --webhook-deliver telegram \
-  --webhook-deliver-chat-id <chat-id>
+codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
 ```
 
-If you use a profile wrapper, pass it explicitly:
+For non-interactive setup:
 
 ```bash
-codex-hermes-bridge hermes install --hermes-command hermes-se
+codex-hermes-bridge telegram setup \
+  --bot-token <telegram-bot-token> \
+  --chat-id <telegram-chat-id> \
+  --allowed-user-id <telegram-user-id>
 ```
 
-Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools. If you installed the notification lane, install and start the local daemon:
+Install and start the local daemon:
 
 ```bash
 codex-hermes-bridge daemon install --dry-run
@@ -92,7 +92,22 @@ codex-hermes-bridge daemon start
 codex-hermes-bridge daemon status
 ```
 
-The daemon is what makes Codex changes notify Hermes without Hermes asking first. `hermes install --webhook-deliver ...` writes the local webhook URL and secret to `~/.codex-hermes-bridge/config.json` with user-only permissions, then `daemon run` reads that config.
+The daemon is what makes Codex changes notify you without another agent asking first. It writes outbound events and Telegram route state to local SQLite. Reply directly to a bridge-sent Telegram message to send that text back to the Codex thread.
+
+To let Hermes inspect and control Codex when you ask Hermes directly, install the MCP control lane:
+
+```bash
+codex-hermes-bridge hermes install --dry-run
+codex-hermes-bridge hermes install
+```
+
+If you use a profile wrapper, pass it explicitly:
+
+```bash
+codex-hermes-bridge hermes install --hermes-command hermes-se
+```
+
+Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools.
 
 ## Commands
 
@@ -164,9 +179,28 @@ Useful flags:
 - `--events <csv>`: filter emitted events
 - `--exec <command>`: pipe each emitted event to a hook command on stdin
 
-### Proactive Hermes daemon
+### Direct Telegram transport
 
-The daemon watches Codex state, writes outbound notification events to SQLite, and retries delivery to Hermes until Hermes accepts the signed webhook request.
+```bash
+codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
+codex-hermes-bridge telegram setup \
+  --bot-token <telegram-bot-token> \
+  --chat-id <telegram-chat-id> \
+  --allowed-user-id <telegram-user-id>
+codex-hermes-bridge telegram status
+codex-hermes-bridge telegram disable --dry-run
+codex-hermes-bridge telegram disable
+```
+
+`telegram setup` writes `~/.codex-hermes-bridge/config.json` with user-only permissions. It clears any existing Telegram webhook for that bot token because the daemon uses local long polling to receive replies and button callbacks.
+
+Use a dedicated Telegram bot token for this bridge. Telegram update delivery should have one owner.
+
+See [docs/telegram.md](docs/telegram.md).
+
+### Proactive daemon
+
+The daemon watches Codex state, writes outbound notification events to SQLite, sends configured delivery transports, and processes Telegram replies/buttons.
 
 ```bash
 codex-hermes-bridge daemon run --once
@@ -186,7 +220,7 @@ codex-hermes-bridge daemon logs
 
 ### Manual webhook posting
 
-`hermes post-webhook` reads one watch event from stdin, wraps it for Hermes, signs it with `X-Hub-Signature-256`, and posts it to a local Hermes webhook route.
+`hermes post-webhook` is the lower-level Hermes webhook lane. It reads one watch event from stdin, wraps it for Hermes, signs it with `X-Hub-Signature-256`, and posts it to a local Hermes webhook route.
 
 ```bash
 codex-hermes-bridge hermes post-webhook \
@@ -234,7 +268,7 @@ The default MCP server exposes structured tools for `doctor`, `threads`, `inbox`
 
 `watch`, `new`, `fork`, `archive`, `unarchive`, `away`, and `notify-away` are intentionally not exposed as default MCP tools. The MCP lane should stay bounded and action-focused; proactive notification belongs in the daemon lane.
 
-See [docs/hermes.md](docs/hermes.md) for the Hermes-first setup guide.
+See [docs/hermes.md](docs/hermes.md) for the Hermes MCP setup guide.
 
 ## Hook examples
 
@@ -246,7 +280,7 @@ See [docs/hermes.md](docs/hermes.md) for the Hermes-first setup guide.
 codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
 ```
 
-### Send Telegram notifications
+### Custom Telegram notifications
 
 ```bash
 export TELEGRAM_BOT_TOKEN=...
@@ -254,7 +288,7 @@ export TELEGRAM_CHAT_ID=...
 codex-hermes-bridge watch --exec "python3 examples/notify-telegram.py"
 ```
 
-The Telegram example expects:
+This example is a low-level hook for custom scripts. The product path is `telegram setup` plus `daemon run`, which handles reply routing. The example expects:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 

@@ -91,6 +91,11 @@ enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    #[command(about = "Configure direct Telegram delivery and reply routing")]
+    Telegram {
+        #[command(subcommand)]
+        command: TelegramCommands,
+    },
     #[command(about = "Emit away-mode notification summaries")]
     NotifyAway {
         #[arg(long = "no-completed", default_value_t = true, action = clap::ArgAction::SetFalse)]
@@ -300,6 +305,34 @@ enum DaemonCommands {
     Logs {
         #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
         label: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TelegramCommands {
+    #[command(about = "Configure the bridge-owned Telegram bot transport")]
+    Setup {
+        #[arg(long)]
+        bot_token: Option<String>,
+        #[arg(long)]
+        chat_id: Option<String>,
+        #[arg(long)]
+        allowed_user_id: Option<String>,
+        #[arg(long, default_value = DEFAULT_HERMES_WEBHOOK_EVENTS)]
+        events: String,
+        #[arg(long, default_value = "codex-hermes-bridge")]
+        bridge_command: String,
+        #[arg(long, default_value_t = 60_000)]
+        pair_timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    #[command(about = "Show direct Telegram transport configuration")]
+    Status,
+    #[command(about = "Remove direct Telegram transport configuration")]
+    Disable {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -724,6 +757,36 @@ fn run() -> Result<()> {
             }
             DaemonCommands::Logs { label } => {
                 let result = daemon_service_logs(&label)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+        },
+        Commands::Telegram { command } => match command {
+            TelegramCommands::Setup {
+                bot_token,
+                chat_id,
+                allowed_user_id,
+                events,
+                bridge_command,
+                pair_timeout_ms,
+                dry_run,
+            } => {
+                let result = telegram_setup_result(TelegramSetupOptions {
+                    bot_token: bot_token.as_deref(),
+                    chat_id: chat_id.as_deref(),
+                    allowed_user_id: allowed_user_id.as_deref(),
+                    events: &events,
+                    bridge_command: &bridge_command,
+                    dry_run,
+                    pair_timeout_ms,
+                })?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            TelegramCommands::Status => {
+                let result = telegram_status_result()?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            TelegramCommands::Disable { dry_run } => {
+                let result = telegram_disable_result(dry_run)?;
                 println!("{}", serde_json::to_string(&result)?);
             }
         },
@@ -1194,7 +1257,9 @@ fn run() -> Result<()> {
                     .context("failed to parse watch event JSON from stdin")?;
                 let secret = match secret {
                     Some(secret) => secret,
-                    None => load_daemon_config()?.webhook_secret,
+                    None => load_daemon_config()?
+                        .webhook_secret
+                        .context("daemon config does not contain a Hermes webhook secret")?,
                 };
                 let result =
                     post_hermes_webhook(&url, &secret, &event, Duration::from_millis(timeout_ms))?;
@@ -1749,6 +1814,30 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           last_error TEXT,
           created_at INTEGER NOT NULL,
           delivered_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS telegram_message_routes (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          thread_id TEXT NOT NULL,
+          event_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id, message_id)
+        );
+        CREATE TABLE IF NOT EXISTS telegram_callback_routes (
+          callback_id TEXT PRIMARY KEY,
+          chat_id TEXT NOT NULL,
+          message_id INTEGER,
+          thread_id TEXT NOT NULL,
+          action TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          used_at INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS transport_delivery_log (
+          event_id TEXT NOT NULL,
+          transport TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          delivered_at INTEGER NOT NULL,
+          PRIMARY KEY(event_id, transport)
         );
         CREATE TABLE IF NOT EXISTS actions_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3886,11 +3975,90 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
 struct DaemonConfig {
     version: u32,
     bridge_command: String,
-    webhook_url: String,
-    webhook_secret: String,
+    #[serde(default)]
+    webhook_url: Option<String>,
+    #[serde(default)]
+    webhook_secret: Option<String>,
     events: String,
+    #[serde(default)]
     deliver: Option<String>,
+    #[serde(default)]
     deliver_chat_id: Option<String>,
+    #[serde(default)]
+    telegram: Option<TelegramConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct TelegramConfig {
+    bot_token: String,
+    chat_id: String,
+    #[serde(default)]
+    allowed_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TelegramSetupOptions<'a> {
+    bot_token: Option<&'a str>,
+    chat_id: Option<&'a str>,
+    allowed_user_id: Option<&'a str>,
+    events: &'a str,
+    bridge_command: &'a str,
+    dry_run: bool,
+    pair_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedTelegramDelivery {
+    payload: Value,
+    thread_id: Option<String>,
+    event_id: String,
+    callback_routes: Vec<TelegramCallbackRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramCallbackRoute {
+    callback_id: String,
+    chat_id: String,
+    message_id: Option<i64>,
+    thread_id: String,
+    action: TelegramCallbackAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramCallbackAction {
+    Approve,
+    Deny,
+}
+
+impl TelegramCallbackAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "approve" => Some(Self::Approve),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedTelegramReply {
+    thread_id: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedTelegramCallback {
+    callback_query_id: String,
+    thread_id: String,
+    action: TelegramCallbackAction,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3925,14 +4093,42 @@ fn load_daemon_config() -> Result<DaemonConfig> {
         .with_context(|| format!("daemon config not found at {}", path.display()))?;
     let config: DaemonConfig = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse daemon config at {}", path.display()))?;
-    if config.webhook_url.trim().is_empty() {
-        bail!("daemon config webhookUrl cannot be empty");
-    }
-    if config.webhook_secret.trim().is_empty() {
-        bail!("daemon config webhookSecret cannot be empty");
-    }
     if config.events.trim().is_empty() {
         bail!("daemon config events cannot be empty");
+    }
+    let has_hermes = match (&config.webhook_url, &config.webhook_secret) {
+        (Some(url), Some(secret)) => {
+            if url.trim().is_empty() {
+                bail!(
+                    "daemon config webhookUrl cannot be empty when Hermes delivery is configured"
+                );
+            }
+            if secret.trim().is_empty() {
+                bail!(
+                    "daemon config webhookSecret cannot be empty when Hermes delivery is configured"
+                );
+            }
+            true
+        }
+        (None, None) => false,
+        _ => bail!(
+            "daemon config must include both webhookUrl and webhookSecret for Hermes delivery"
+        ),
+    };
+    let has_telegram = match config.telegram.as_ref() {
+        Some(telegram) => {
+            if telegram.bot_token.trim().is_empty() {
+                bail!("daemon config telegram.botToken cannot be empty");
+            }
+            if telegram.chat_id.trim().is_empty() {
+                bail!("daemon config telegram.chatId cannot be empty");
+            }
+            true
+        }
+        None => false,
+    };
+    if !has_hermes && !has_telegram {
+        bail!("daemon config needs at least one delivery target: telegram or Hermes webhook");
     }
     Ok(config)
 }
@@ -3942,10 +4138,15 @@ fn redacted_daemon_config(config: &DaemonConfig) -> Value {
         "version": config.version,
         "bridgeCommand": config.bridge_command,
         "webhookUrl": config.webhook_url,
-        "webhookSecret": "<redacted>",
+        "webhookSecret": config.webhook_secret.as_ref().map(|_| "<redacted>"),
         "events": config.events,
         "deliver": config.deliver,
-        "deliverChatId": config.deliver_chat_id
+        "deliverChatId": config.deliver_chat_id,
+        "telegram": config.telegram.as_ref().map(|telegram| json!({
+            "botToken": "<redacted>",
+            "chatId": telegram.chat_id,
+            "allowedUserId": telegram.allowed_user_id
+        }))
     })
 }
 
@@ -3955,6 +4156,757 @@ fn daemon_run_command(bridge_command: &str) -> String {
 
 fn daemon_run_once_command(bridge_command: &str) -> String {
     format!("{} daemon run --once", shell_quote(bridge_command))
+}
+
+fn read_daemon_config_raw() -> Result<Option<DaemonConfig>> {
+    let path = daemon_config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read daemon config at {}", path.display()))?;
+    let config: DaemonConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse daemon config at {}", path.display()))?;
+    Ok(Some(config))
+}
+
+fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<String> {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            env::var("TELEGRAM_BOT_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .context(
+            "Telegram bot token is required. Pass --bot-token or set TELEGRAM_BOT_TOKEN after creating a bot with @BotFather.",
+        )
+}
+
+fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
+    let bot_token = resolve_telegram_bot_token(options.bot_token)?;
+    let events = options.events.trim();
+    let bridge_command = options.bridge_command.trim();
+    if events.is_empty() {
+        bail!("telegram setup events cannot be empty");
+    }
+    if bridge_command.is_empty() {
+        bail!("telegram setup bridge command cannot be empty");
+    }
+    if !options.dry_run {
+        telegram_delete_webhook(&bot_token, Duration::from_secs(10))
+            .context("failed to clear existing Telegram webhook before enabling long polling")?;
+    }
+
+    let pair_hint = json!({
+        "message": "Send /start to the Telegram bot to pair this chat automatically.",
+        "timeoutMs": options.pair_timeout_ms
+    });
+    let paired = if let Some(chat_id) = options.chat_id.map(str::trim).filter(|v| !v.is_empty()) {
+        TelegramConfig {
+            bot_token: bot_token.clone(),
+            chat_id: chat_id.to_string(),
+            allowed_user_id: options
+                .allowed_user_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }
+    } else if options.dry_run {
+        TelegramConfig {
+            bot_token: bot_token.clone(),
+            chat_id: "<paired by /start>".to_string(),
+            allowed_user_id: options
+                .allowed_user_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        }
+    } else {
+        discover_telegram_pairing(&bot_token, options.pair_timeout_ms)?
+    };
+
+    let config = DaemonConfig {
+        version: 2,
+        bridge_command: bridge_command.to_string(),
+        events: events.to_string(),
+        telegram: Some(paired.clone()),
+        ..read_daemon_config_raw()?.unwrap_or_else(|| DaemonConfig {
+            version: 2,
+            bridge_command: bridge_command.to_string(),
+            webhook_url: None,
+            webhook_secret: None,
+            events: events.to_string(),
+            deliver: None,
+            deliver_chat_id: None,
+            telegram: None,
+        })
+    };
+
+    let config_path = if options.dry_run {
+        daemon_config_path()?
+    } else {
+        write_daemon_config(&config)?
+    };
+
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_setup",
+        "dryRun": options.dry_run,
+        "configPath": config_path.display().to_string(),
+        "telegram": {
+            "configured": true,
+            "botToken": "<redacted>",
+            "chatId": paired.chat_id,
+            "allowedUserId": paired.allowed_user_id,
+            "pairing": if options.chat_id.is_some() { Value::Null } else { pair_hint }
+        },
+        "config": redacted_daemon_config(&config),
+        "daemonCommand": daemon_run_command(bridge_command),
+        "daemonInstallCommand": format!("{} daemon install --bridge-command {}", shell_quote(bridge_command), shell_quote(bridge_command)),
+        "nextStep": "Install and start the daemon. Codex updates will go directly to Telegram, and Telegram replies to those messages will route back to the originating Codex thread."
+    }))
+}
+
+fn telegram_status_result() -> Result<Value> {
+    let config = read_daemon_config_raw()?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_status",
+        "configPath": daemon_config_path()?.display().to_string(),
+        "configured": config.as_ref().and_then(|config| config.telegram.as_ref()).is_some(),
+        "config": config.as_ref().map(redacted_daemon_config)
+    }))
+}
+
+fn telegram_disable_result(dry_run: bool) -> Result<Value> {
+    let path = daemon_config_path()?;
+    let mut config = read_daemon_config_raw()?;
+    let had_telegram = config
+        .as_ref()
+        .and_then(|config| config.telegram.as_ref())
+        .is_some();
+    let removes_config = config
+        .as_ref()
+        .map(|config| config.webhook_url.is_none() && config.webhook_secret.is_none())
+        .unwrap_or(false);
+    if !dry_run {
+        if let Some(mut current) = config.take() {
+            current.telegram = None;
+            if removes_config {
+                if path.exists() {
+                    fs::remove_file(&path)?;
+                }
+            } else {
+                write_daemon_config(&current)?;
+            }
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_disable",
+        "dryRun": dry_run,
+        "hadTelegram": had_telegram,
+        "configPath": path.display().to_string(),
+        "removedConfig": removes_config
+    }))
+}
+
+fn discover_telegram_pairing(bot_token: &str, timeout_ms: u64) -> Result<TelegramConfig> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let mut offset = None;
+    while std::time::Instant::now() < deadline {
+        let updates = telegram_get_updates(bot_token, offset, 10, Duration::from_secs(15))?;
+        for update in telegram_updates_array(&updates)? {
+            if let Some(update_id) = update.get("update_id").and_then(Value::as_i64) {
+                offset = Some(update_id.saturating_add(1));
+            }
+            if let Some(message) = update.get("message") {
+                let text = message.get("text").and_then(Value::as_str).unwrap_or("");
+                if text.trim() != "/start" {
+                    continue;
+                }
+                let chat_id = telegram_chat_id(message)
+                    .context("Telegram /start update did not include chat.id")?;
+                let allowed_user_id = telegram_from_user_id(message);
+                return Ok(TelegramConfig {
+                    bot_token: bot_token.to_string(),
+                    chat_id,
+                    allowed_user_id,
+                });
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    bail!("Timed out waiting for Telegram /start. Send /start to the bot and rerun telegram setup.")
+}
+
+fn telegram_api_post(
+    bot_token: &str,
+    method: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let url = format!(
+        "https://api.telegram.org/bot{}/{}",
+        bot_token.trim(),
+        method.trim()
+    );
+    let response = agent.post(&url).send_json(body.clone()).map_err(|error| {
+        anyhow!(
+            "Telegram API {method} request failed: {}",
+            redact_secret_text(&error.to_string(), bot_token)
+        )
+    })?;
+    let value: Value = response
+        .into_json()
+        .with_context(|| format!("Telegram API {method} returned invalid JSON"))?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        bail!("Telegram API {method} returned error: {value}");
+    }
+    Ok(value)
+}
+
+fn telegram_delete_webhook(bot_token: &str, timeout: Duration) -> Result<Value> {
+    telegram_api_post(
+        bot_token,
+        "deleteWebhook",
+        &json!({ "drop_pending_updates": false }),
+        timeout,
+    )
+}
+
+fn telegram_get_updates(
+    bot_token: &str,
+    offset: Option<i64>,
+    timeout_seconds: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut body = serde_json::Map::new();
+    if let Some(offset) = offset {
+        body.insert("offset".to_string(), json!(offset));
+    }
+    body.insert("timeout".to_string(), json!(timeout_seconds));
+    body.insert(
+        "allowed_updates".to_string(),
+        json!(["message", "callback_query"]),
+    );
+    telegram_api_post(bot_token, "getUpdates", &Value::Object(body), timeout)
+}
+
+fn telegram_send_message(
+    telegram: &TelegramConfig,
+    payload: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_api_post(&telegram.bot_token, "sendMessage", payload, timeout)
+}
+
+fn telegram_answer_callback_query(
+    telegram: &TelegramConfig,
+    callback_query_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_api_post(
+        &telegram.bot_token,
+        "answerCallbackQuery",
+        &json!({
+            "callback_query_id": callback_query_id,
+            "text": text,
+            "show_alert": false
+        }),
+        timeout,
+    )
+}
+
+fn telegram_updates_array(updates: &Value) -> Result<&[Value]> {
+    updates
+        .get("result")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .context("Telegram getUpdates response did not contain result array")
+}
+
+fn telegram_chat_id(message: &Value) -> Option<String> {
+    message.pointer("/chat/id").and_then(|value| {
+        value
+            .as_i64()
+            .map(|id| id.to_string())
+            .or_else(|| value.as_str().map(str::to_string))
+    })
+}
+
+fn telegram_from_user_id(message: &Value) -> Option<String> {
+    message.pointer("/from/id").and_then(|value| {
+        value
+            .as_i64()
+            .map(|id| id.to_string())
+            .or_else(|| value.as_str().map(str::to_string))
+    })
+}
+
+fn telegram_message_id(message: &Value) -> Option<i64> {
+    message.get("message_id").and_then(Value::as_i64)
+}
+
+fn telegram_authorized(
+    telegram: &TelegramConfig,
+    chat_id: Option<&str>,
+    user_id: Option<&str>,
+) -> bool {
+    if chat_id != Some(telegram.chat_id.as_str()) {
+        return false;
+    }
+    match telegram.allowed_user_id.as_deref() {
+        Some(allowed) => user_id == Some(allowed),
+        None => true,
+    }
+}
+
+fn telegram_event_title(event_type: &str) -> &'static str {
+    match event_type {
+        "thread_waiting" => "Codex needs you",
+        "thread_completed" => "Codex finished",
+        "thread_status_changed" => "Codex changed",
+        _ => "Codex update",
+    }
+}
+
+fn telegram_event_display_name(event: &Value) -> String {
+    event
+        .pointer("/thread/displayName")
+        .and_then(Value::as_str)
+        .or_else(|| event.pointer("/thread/name").and_then(Value::as_str))
+        .or_else(|| event.get("threadId").and_then(Value::as_str))
+        .unwrap_or("Codex thread")
+        .to_string()
+}
+
+fn telegram_event_detail(event: &Value) -> Option<String> {
+    event
+        .pointer("/thread/pendingPrompt/question")
+        .and_then(Value::as_str)
+        .or_else(|| event.pointer("/thread/lastPreview").and_then(Value::as_str))
+        .or_else(|| event.get("lastPreview").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let truncated = value.chars().take(900).collect::<String>();
+            if truncated.len() < value.len() {
+                format!("{truncated}...")
+            } else {
+                value.to_string()
+            }
+        })
+}
+
+fn telegram_event_is_approval(event: &Value) -> bool {
+    event
+        .pointer("/thread/pendingPrompt/promptKind")
+        .and_then(Value::as_str)
+        == Some("approval")
+        || event
+            .pointer("/thread/pendingPrompt/kind")
+            .and_then(Value::as_str)
+            == Some("approval")
+}
+
+fn telegram_callback_id(event_id: &str, action: TelegramCallbackAction) -> String {
+    let digest = sha256_hex(format!("{event_id}:{}", action.as_str()).as_bytes());
+    format!("cb_{}", &digest[..24])
+}
+
+fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTelegramDelivery> {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("codex_event");
+    let event_id = hermes_webhook_delivery_id(event);
+    let thread_id = event_thread_id(event);
+    let mut lines = vec![format!(
+        "{}: {}",
+        telegram_event_title(event_type),
+        telegram_event_display_name(event)
+    )];
+    if let Some(project) = event.pointer("/thread/project").and_then(Value::as_str) {
+        lines.push(format!("Project: {project}"));
+    }
+    if let Some(detail) = telegram_event_detail(event) {
+        lines.push(String::new());
+        lines.push(detail);
+    }
+    if thread_id.is_some() {
+        lines.push(String::new());
+        lines.push(
+            "Reply to this Telegram message to send text back to the Codex thread.".to_string(),
+        );
+    }
+
+    let mut payload = json!({
+        "chat_id": chat_id,
+        "text": lines.join("\n"),
+        "disable_web_page_preview": true
+    });
+
+    let mut callback_routes = Vec::new();
+    if telegram_event_is_approval(event) {
+        if let Some(thread_id) = thread_id.as_ref() {
+            let approve_id = telegram_callback_id(&event_id, TelegramCallbackAction::Approve);
+            let deny_id = telegram_callback_id(&event_id, TelegramCallbackAction::Deny);
+            payload["reply_markup"] = json!({
+                "inline_keyboard": [[
+                    { "text": "Approve", "callback_data": format!("codex:{approve_id}") },
+                    { "text": "Deny", "callback_data": format!("codex:{deny_id}") }
+                ]]
+            });
+            callback_routes.push(TelegramCallbackRoute {
+                callback_id: approve_id,
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.clone(),
+                action: TelegramCallbackAction::Approve,
+            });
+            callback_routes.push(TelegramCallbackRoute {
+                callback_id: deny_id,
+                chat_id: chat_id.to_string(),
+                message_id: None,
+                thread_id: thread_id.clone(),
+                action: TelegramCallbackAction::Deny,
+            });
+        }
+    }
+
+    Ok(PreparedTelegramDelivery {
+        payload,
+        thread_id,
+        event_id,
+        callback_routes,
+    })
+}
+
+fn insert_telegram_message_route(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+    thread_id: &str,
+    event_id: &str,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO telegram_message_routes(chat_id, message_id, thread_id, event_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![chat_id, message_id, thread_id, event_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
+}
+
+fn insert_telegram_callback_route(
+    conn: &Connection,
+    route: &TelegramCallbackRoute,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO telegram_callback_routes(callback_id, chat_id, message_id, thread_id, action, created_at, used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+        params![
+            route.callback_id,
+            route.chat_id,
+            route.message_id,
+            route.thread_id,
+            route.action.as_str(),
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_telegram_callback_message_id(
+    conn: &Connection,
+    callback_id: &str,
+    message_id: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE telegram_callback_routes SET message_id = ?2 WHERE callback_id = ?1",
+        params![callback_id, message_id],
+    )?;
+    Ok(())
+}
+
+fn lookup_telegram_message_route(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT thread_id FROM telegram_message_routes WHERE chat_id = ?1 AND message_id = ?2",
+        params![chat_id, message_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn extract_telegram_reply_route(
+    conn: &Connection,
+    message: &Value,
+    telegram: &TelegramConfig,
+) -> Result<Option<RoutedTelegramReply>> {
+    let chat_id = telegram_chat_id(message);
+    let user_id = telegram_from_user_id(message);
+    if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
+        return Ok(None);
+    }
+    let reply_message_id = message
+        .get("reply_to_message")
+        .and_then(telegram_message_id);
+    let Some(reply_message_id) = reply_message_id else {
+        return Ok(None);
+    };
+    let text = message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let Some(chat_id) = chat_id else {
+        return Ok(None);
+    };
+    let thread_id = lookup_telegram_message_route(conn, &chat_id, reply_message_id)?;
+    Ok(thread_id.map(|thread_id| RoutedTelegramReply {
+        thread_id,
+        message: text.to_string(),
+    }))
+}
+
+fn extract_telegram_callback_route(
+    conn: &Connection,
+    callback_query: &Value,
+    telegram: &TelegramConfig,
+) -> Result<Option<RoutedTelegramCallback>> {
+    let message = callback_query.get("message");
+    let chat_id = message.and_then(telegram_chat_id);
+    let user_id = callback_query
+        .get("from")
+        .and_then(|from| from.get("id"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .map(|id| id.to_string())
+                .or_else(|| value.as_str().map(str::to_string))
+        });
+    if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
+        return Ok(None);
+    }
+    let callback_query_id = callback_query
+        .get("id")
+        .and_then(Value::as_str)
+        .context("callback query missing id")?;
+    let Some(callback_id) = callback_query
+        .get("data")
+        .and_then(Value::as_str)
+        .and_then(|data| data.strip_prefix("codex:"))
+    else {
+        return Ok(None);
+    };
+    let route = conn
+        .query_row(
+            "SELECT thread_id, action FROM telegram_callback_routes WHERE callback_id = ?1",
+            params![callback_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(route.and_then(|(thread_id, action)| {
+        TelegramCallbackAction::from_str(&action).map(|action| RoutedTelegramCallback {
+            callback_query_id: callback_query_id.to_string(),
+            thread_id,
+            action,
+        })
+    }))
+}
+
+fn deliver_telegram_event(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    event: &Value,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut prepared = prepare_telegram_delivery(&telegram.chat_id, event)?;
+    for route in &prepared.callback_routes {
+        insert_telegram_callback_route(conn, route, now)?;
+    }
+    let response = telegram_send_message(telegram, &prepared.payload, timeout)?;
+    let message_id = response
+        .pointer("/result/message_id")
+        .and_then(Value::as_i64)
+        .context("Telegram sendMessage response missing result.message_id")?;
+    if let Some(thread_id) = prepared.thread_id.as_deref() {
+        insert_telegram_message_route(
+            conn,
+            &telegram.chat_id,
+            message_id,
+            thread_id,
+            &prepared.event_id,
+            now,
+        )?;
+    }
+    for route in &mut prepared.callback_routes {
+        route.message_id = Some(message_id);
+        update_telegram_callback_message_id(conn, &route.callback_id, message_id)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "transport": "telegram",
+        "messageId": message_id,
+        "threadId": prepared.thread_id,
+        "callbacks": prepared.callback_routes.len()
+    }))
+}
+
+fn send_codex_reply_to_thread(
+    conn: &Connection,
+    thread_id: &str,
+    message: &str,
+    now: u64,
+) -> Result<Value> {
+    let mut client = CodexAppServerClient::connect()?;
+    let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
+    let started = client.request(
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": [text_input_value(message)]
+        }),
+    )?;
+    record_action(
+        conn,
+        thread_id,
+        "telegram_reply",
+        json!({
+            "message": message,
+            "resumed": resumed,
+            "started": started,
+            "sentAt": now
+        }),
+        now,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_reply",
+        "threadId": thread_id,
+        "message": message,
+        "sentAt": now
+    }))
+}
+
+fn send_codex_approval_to_thread(
+    conn: &Connection,
+    thread_id: &str,
+    action: TelegramCallbackAction,
+    now: u64,
+) -> Result<Value> {
+    let sent_text = match action {
+        TelegramCallbackAction::Approve => "YES",
+        TelegramCallbackAction::Deny => "NO",
+    };
+    let mut client = CodexAppServerClient::connect()?;
+    let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
+    let started = client.request(
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": [text_input_value(sent_text)]
+        }),
+    )?;
+    record_action(
+        conn,
+        thread_id,
+        "telegram_approval",
+        json!({
+            "decision": action.as_str(),
+            "sentText": sent_text,
+            "resumed": resumed,
+            "started": started,
+            "sentAt": now
+        }),
+        now,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_approval",
+        "threadId": thread_id,
+        "decision": action.as_str(),
+        "sentText": sent_text,
+        "sentAt": now
+    }))
+}
+
+fn process_telegram_updates(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let key = format!(
+        "telegram_offset:{}",
+        sha256_hex(telegram.bot_token.as_bytes())
+    );
+    let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
+    let updates = telegram_get_updates(&telegram.bot_token, offset, 0, timeout)?;
+    let updates = telegram_updates_array(&updates)?;
+    let mut seen = 0usize;
+    let mut replies = 0usize;
+    let mut callbacks = 0usize;
+    let mut ignored = 0usize;
+    let mut max_update_id = None;
+    for update in updates {
+        seen += 1;
+        if let Some(update_id) = update.get("update_id").and_then(Value::as_i64) {
+            max_update_id =
+                Some(max_update_id.map_or(update_id, |current: i64| current.max(update_id)));
+        }
+        if let Some(message) = update.get("message") {
+            match extract_telegram_reply_route(conn, message, telegram)? {
+                Some(route) => {
+                    send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
+                    replies += 1;
+                }
+                None => ignored += 1,
+            }
+        } else if let Some(callback_query) = update.get("callback_query") {
+            match extract_telegram_callback_route(conn, callback_query, telegram)? {
+                Some(route) => {
+                    send_codex_approval_to_thread(conn, &route.thread_id, route.action, now)?;
+                    telegram_answer_callback_query(
+                        telegram,
+                        &route.callback_query_id,
+                        "Sent to Codex",
+                        timeout,
+                    )?;
+                    callbacks += 1;
+                }
+                None => ignored += 1,
+            }
+        }
+    }
+    if let Some(update_id) = max_update_id {
+        set_setting(conn, &key, update_id as u64)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "transport": "telegram",
+        "seen": seen,
+        "replies": replies,
+        "callbacks": callbacks,
+        "ignored": ignored
+    }))
 }
 
 fn enqueue_outbound_event(conn: &Connection, event: &Value, now: u64) -> Result<bool> {
@@ -3985,6 +4937,37 @@ fn pending_outbound_count(conn: &Connection) -> Result<u64> {
         |row| row.get(0),
     )?;
     from_sql_i64(count)
+}
+
+fn transport_delivery_exists(conn: &Connection, event_id: &str, transport: &str) -> Result<bool> {
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT event_id FROM transport_delivery_log WHERE event_id = ?1 AND transport = ?2",
+            params![event_id, transport],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn record_transport_delivery(
+    conn: &Connection,
+    event_id: &str,
+    transport: &str,
+    result: &Value,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO transport_delivery_log(event_id, transport, result_json, delivered_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            event_id,
+            transport,
+            serde_json::to_string(result)?,
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(())
 }
 
 fn retry_delay_ms(attempts: u64) -> u64 {
@@ -4068,7 +5051,35 @@ fn deliver_outbound_events(
     timeout: Duration,
 ) -> Result<OutboxDeliverySummary> {
     deliver_due_outbound_events(conn, now, 100, |event| {
-        post_hermes_webhook(&config.webhook_url, &config.webhook_secret, event, timeout)
+        let event_id = hermes_webhook_delivery_id(event);
+        let mut delivered = serde_json::Map::new();
+        if let (Some(webhook_url), Some(webhook_secret)) = (
+            config.webhook_url.as_deref(),
+            config.webhook_secret.as_deref(),
+        ) {
+            let result = if transport_delivery_exists(conn, &event_id, "hermes")? {
+                json!({ "ok": true, "transport": "hermes", "skipped": "already_delivered" })
+            } else {
+                let result = post_hermes_webhook(webhook_url, webhook_secret, event, timeout)?;
+                record_transport_delivery(conn, &event_id, "hermes", &result, now)?;
+                result
+            };
+            delivered.insert("hermes".to_string(), result);
+        }
+        if let Some(telegram) = config.telegram.as_ref() {
+            let result = if transport_delivery_exists(conn, &event_id, "telegram")? {
+                json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
+            } else {
+                let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
+                record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
+                result
+            };
+            delivered.insert("telegram".to_string(), result);
+        }
+        if delivered.is_empty() {
+            bail!("no daemon delivery target is configured");
+        }
+        Ok(Value::Object(delivered))
     })
 }
 
@@ -4097,12 +5108,24 @@ fn daemon_cycle(
         }
     }
     let delivery = deliver_outbound_events(conn, config, now, timeout)?;
+    let telegram_updates = match config.telegram.as_ref() {
+        Some(telegram) => match process_telegram_updates(conn, telegram, now, timeout) {
+            Ok(result) => result,
+            Err(error) => json!({
+                "ok": false,
+                "transport": "telegram",
+                "error": format!("{error:#}")
+            }),
+        },
+        None => Value::Null,
+    };
     Ok(json!({
         "ok": true,
         "action": "daemon_cycle",
         "observed": events.len(),
         "enqueued": enqueued,
         "delivery": delivery,
+        "telegramUpdates": telegram_updates,
         "pending": pending_outbound_count(conn)?
     }))
 }
@@ -4515,11 +5538,12 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
     let planned_daemon_config = DaemonConfig {
         version: 1,
         bridge_command: bridge_command.to_string(),
-        webhook_url: planned_webhook_url.clone(),
-        webhook_secret: "<secret printed by hermes webhook subscribe>".to_string(),
+        webhook_url: Some(planned_webhook_url.clone()),
+        webhook_secret: Some("<secret printed by hermes webhook subscribe>".to_string()),
         events: webhook_events.to_string(),
         deliver: None,
         deliver_chat_id: None,
+        telegram: None,
     };
     let webhook_deliver = options
         .webhook_deliver
@@ -4619,11 +5643,12 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
         let daemon_config = DaemonConfig {
             version: 1,
             bridge_command: bridge_command.to_string(),
-            webhook_url: webhook_url.clone(),
-            webhook_secret: resolved_secret.clone(),
+            webhook_url: Some(webhook_url.clone()),
+            webhook_secret: Some(resolved_secret.clone()),
             events: webhook_events.to_string(),
             deliver: webhook_deliver.map(str::to_string),
             deliver_chat_id: webhook_deliver_chat_id.map(str::to_string),
+            telegram: read_daemon_config_raw()?.and_then(|config| config.telegram),
         };
         let config_path = write_daemon_config(&daemon_config)?;
         Some(json!({
@@ -6483,6 +7508,171 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_telegram_setup_and_status_commands() {
+        for args in [
+            vec![
+                "codex-hermes-bridge",
+                "telegram",
+                "setup",
+                "--bot-token",
+                "123:abc",
+                "--chat-id",
+                "456",
+                "--dry-run",
+            ],
+            vec!["codex-hermes-bridge", "telegram", "status"],
+            vec!["codex-hermes-bridge", "telegram", "disable", "--dry-run"],
+        ] {
+            let parsed = Cli::try_parse_from(args.clone());
+            assert!(
+                parsed.is_ok(),
+                "telegram command should parse: {args:?}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
+        let result = telegram_setup_result(TelegramSetupOptions {
+            bot_token: Some("123:secret"),
+            chat_id: Some("456"),
+            allowed_user_id: Some("789"),
+            events: DEFAULT_HERMES_WEBHOOK_EVENTS,
+            bridge_command: "codex-hermes-bridge",
+            dry_run: true,
+            pair_timeout_ms: 1000,
+        })
+        .expect("telegram setup dry run");
+
+        assert_eq!(result["action"], "telegram_setup");
+        assert_eq!(result["dryRun"], true);
+        assert_eq!(result["telegram"]["configured"], true);
+        assert_eq!(result["telegram"]["botToken"], "<redacted>");
+        assert_eq!(result["config"]["telegram"]["botToken"], "<redacted>");
+        assert_eq!(result["config"]["telegram"]["chatId"], "456");
+        assert_eq!(result["config"]["telegram"]["allowedUserId"], "789");
+        assert_eq!(result["daemonCommand"], "codex-hermes-bridge daemon run");
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("123:secret"),
+            "setup output must not leak Telegram bot token"
+        );
+    }
+
+    #[test]
+    fn telegram_message_payload_contains_reply_buttons_for_approval_events() {
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_approval",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Approve deploy",
+                "project": "infra",
+                "pendingPrompt": {
+                    "promptKind": "approval",
+                    "question": "Deploy to production?"
+                },
+                "lastPreview": "Need approval"
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
+
+        assert_eq!(prepared.thread_id.as_deref(), Some("thr_approval"));
+        assert!(prepared.payload["text"]
+            .as_str()
+            .expect("text")
+            .contains("Approve deploy"));
+        assert_eq!(prepared.payload["chat_id"], "999");
+        assert_eq!(
+            prepared.payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Approve"
+        );
+        assert_eq!(
+            prepared.callback_routes[0].action,
+            TelegramCallbackAction::Approve
+        );
+        assert!(
+            prepared.payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                .as_str()
+                .expect("callback")
+                .len()
+                <= 64,
+            "Telegram callback_data must fit the Bot API limit"
+        );
+    }
+
+    #[test]
+    fn telegram_routes_map_message_replies_to_codex_threads() {
+        let conn = create_state_db_in_memory().expect("db");
+        insert_telegram_message_route(&conn, "456", 111, "thr_1", "event_1", 1000)
+            .expect("insert route");
+
+        let routed = extract_telegram_reply_route(
+            &conn,
+            &json!({
+                "message_id": 222,
+                "from": { "id": 789 },
+                "chat": { "id": 456 },
+                "text": "continue with the safer patch",
+                "reply_to_message": { "message_id": 111 }
+            }),
+            &TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            },
+        )
+        .expect("route")
+        .expect("reply should route");
+
+        assert_eq!(routed.thread_id, "thr_1");
+        assert_eq!(routed.message, "continue with the safer patch");
+    }
+
+    #[test]
+    fn telegram_callback_routes_map_buttons_to_approvals() {
+        let conn = create_state_db_in_memory().expect("db");
+        insert_telegram_callback_route(
+            &conn,
+            &TelegramCallbackRoute {
+                callback_id: "cb_1".to_string(),
+                chat_id: "456".to_string(),
+                message_id: None,
+                thread_id: "thr_approval".to_string(),
+                action: TelegramCallbackAction::Deny,
+            },
+            1000,
+        )
+        .expect("insert callback");
+
+        let routed = extract_telegram_callback_route(
+            &conn,
+            &json!({
+                "id": "callback-query-id",
+                "from": { "id": 789 },
+                "message": {
+                    "message_id": 111,
+                    "chat": { "id": 456 }
+                },
+                "data": "codex:cb_1"
+            }),
+            &TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            },
+        )
+        .expect("route")
+        .expect("callback should route");
+
+        assert_eq!(routed.thread_id, "thr_approval");
+        assert_eq!(routed.action, TelegramCallbackAction::Deny);
+        assert_eq!(routed.callback_query_id, "callback-query-id");
+    }
+
+    #[test]
     fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
         let result = install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/codex-hermes-bridge", true)
             .expect("daemon install dry run");
@@ -6760,6 +7950,33 @@ mod tests {
             }
         );
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
+    }
+
+    #[test]
+    fn transport_delivery_log_tracks_each_transport_once() {
+        let conn = create_state_db_in_memory().expect("db");
+
+        assert!(
+            !transport_delivery_exists(&conn, "event_1", "telegram").expect("lookup"),
+            "transport should not start delivered"
+        );
+        record_transport_delivery(
+            &conn,
+            "event_1",
+            "telegram",
+            &json!({ "messageId": 111 }),
+            1000,
+        )
+        .expect("record delivery");
+
+        assert!(
+            transport_delivery_exists(&conn, "event_1", "telegram").expect("lookup"),
+            "recorded transport should be treated as delivered"
+        );
+        assert!(
+            !transport_delivery_exists(&conn, "event_1", "hermes").expect("lookup"),
+            "other transports for the same event must remain pending"
+        );
     }
 
     #[test]
