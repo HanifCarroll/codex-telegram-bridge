@@ -8,14 +8,11 @@ import urllib.request
 
 def main() -> int:
     payload = json.load(sys.stdin)
-    if payload.get("type") != "thread_waiting":
+    event_type = payload.get("type")
+    if event_type not in {"thread_waiting", "thread_completed", "item_completed"}:
         return 0
 
     thread = payload.get("thread") or {}
-    prompt = thread.get("pendingPrompt") or {}
-    if prompt.get("promptKind") not in {"reply", "approval"}:
-        return 0
-
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -23,15 +20,25 @@ def main() -> int:
         return 1
 
     name = thread.get("name") or payload.get("threadId") or "unknown-thread"
-    question = prompt.get("question") or thread.get("lastPreview") or "Codex needs attention"
-    prompt_kind = prompt.get("promptKind") or "attention"
+    prompt = thread.get("pendingPrompt") or {}
+    if event_type == "thread_waiting":
+        if prompt.get("promptKind") not in {"reply", "approval"}:
+            return 0
+        prompt_kind = prompt.get("promptKind") or "attention"
+        body_text = prompt.get("question") or thread.get("lastPreview") or "Codex needs attention"
+        title = f"Codex needs {prompt_kind}"
+        detail_label = "Question"
+    else:
+        body_text = thread.get("lastPreview") or "Codex finished work"
+        title = "Codex thread completed"
+        detail_label = "Summary"
 
-    message = (
-        f"Codex needs {prompt_kind}\n"
-        f"Thread: {name}\n"
-        f"Question: {question}\n"
-        f"Thread ID: {payload.get('threadId')}"
-    )
+    message = "\n".join([
+        title,
+        f"Thread: {name}",
+        f"{detail_label}: {body_text}",
+        f"Thread ID: {payload.get('threadId')}",
+    ])
 
     body = urllib.parse.urlencode({
         "chat_id": chat_id,

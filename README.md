@@ -8,7 +8,8 @@ Stable product path:
 - thread inspection and actions (`threads`, `show`, `reply`, `approve`, `waiting`, `sync`)
 - event streaming via `follow` and `watch`
 - hook integration via `watch --exec`
-- away-mode notification summaries via `notify-away`
+- safe archive/unarchive flows with dry-run support
+- away-mode notification summaries via `notify-away`, including completed threads by default
 
 Experimental path:
 - `follow --experimental-realtime`
@@ -37,6 +38,10 @@ bin/codex-hermes-bridge --help
 ```
 
 The wrapper builds `target/debug/codex-hermes-bridge` on first use and then execs it.
+
+Codex binary resolution checks each candidate with `codex --version`.
+If `CODEX_BIN` points at a missing or broken executable, the bridge skips it and falls back to workspace-local, platform-known Codex.app installs, then PATH.
+Prefer the bundled Codex.app binary for desktop automation; stale global CLI installs can be incompatible with the app's state database.
 
 ## Commands
 
@@ -85,7 +90,7 @@ Stream JSON events from sync reconciliation plus normalized live notifications.
 ```bash
 codex-hermes-bridge watch
 codex-hermes-bridge watch --once
-codex-hermes-bridge watch --events thread_waiting,item_completed
+codex-hermes-bridge watch --events thread_waiting,thread_completed,item_completed
 codex-hermes-bridge watch --exec "python3 examples/hermes-codex-hook.py"
 ```
 
@@ -93,6 +98,21 @@ Useful flags:
 - `--once`: run one sync pass and return JSON
 - `--events <csv>`: filter emitted events
 - `--exec <command>`: pipe each emitted event to a hook command on stdin
+
+The app-server reader runs continuously while the client is alive, so live notifications that arrive between request/response cycles are still available to `follow`, `watch`, and hooks.
+
+### Archive threads
+
+Archive explicit threads or selected inbox rows.
+
+```bash
+codex-hermes-bridge archive --thread-id thr_123 --dry-run
+codex-hermes-bridge archive --project my-app --status idle --dry-run
+codex-hermes-bridge archive --project my-app --status idle --yes
+```
+
+Archive commands that select from the inbox are treated as bulk operations.
+They require `--dry-run` or `--yes`; explicit thread IDs do not require the bulk confirmation.
 
 ### Away mode
 
@@ -104,7 +124,9 @@ codex-hermes-bridge notify-away
 codex-hermes-bridge away off
 ```
 
-`notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply or approval prompts.
+`notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply, approval, and completed-thread prompts.
+Completion notifications are included by default so an away-mode relay can report finished Codex work without requiring an extra flag.
+Completed-thread summaries keep the final answer body for relay delivery and dedupe on content changes, not only timestamps.
 
 ## Event schema
 
@@ -181,7 +203,7 @@ Experimental realtime events:
 Use CSV event names.
 
 ```bash
---events thread_waiting,item_completed
+--events thread_waiting,thread_completed,item_completed
 --events follow_snapshot,follow_realtime_error
 ```
 
