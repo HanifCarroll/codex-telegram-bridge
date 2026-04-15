@@ -11,6 +11,8 @@ The product rule is simple:
 
 Hermes is optional. It uses the local MCP server when you ask an agent to inspect, reply to, or approve Codex work. Hermes and MCP do not own Telegram notification delivery.
 
+You do not need Hermes for the default product flow. A normal install is Codex plus Telegram plus the local daemon. Add Hermes only if you also want a Hermes agent to call the bridge tools directly.
+
 ## Core Product Surface
 
 - Product setup: `setup`
@@ -69,6 +71,8 @@ Configure Telegram and the daemon in one command:
 ```bash
 codex-telegram-bridge setup --bot-token <telegram-bot-token>
 ```
+
+No Hermes setup is required for Telegram notifications or Telegram replies.
 
 For non-interactive setup:
 

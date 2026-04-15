@@ -1429,17 +1429,39 @@ fn latest_question(thread: &Value) -> Option<String> {
     last_user_message.contains('?').then_some(last_user_message)
 }
 
+fn status_flags_waiting_for_approval(status_flags: &[String]) -> bool {
+    status_flags.iter().any(|flag| flag == "waitingOnApproval")
+}
+
+fn status_flags_waiting_for_input(status_flags: &[String]) -> bool {
+    status_flags
+        .iter()
+        .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")
+}
+
+fn active_flag_is_waiting(flag: &Value) -> bool {
+    matches!(
+        flag.as_str(),
+        Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
+    )
+}
+
+fn active_flags_are_waiting(value: &Value) -> bool {
+    value
+        .pointer("/status/activeFlags")
+        .and_then(Value::as_array)
+        .map(|active_flags| active_flags.iter().any(active_flag_is_waiting))
+        .unwrap_or(false)
+}
+
 fn show_pending_prompt(status_flags: &[String]) -> Option<Value> {
-    if status_flags.iter().any(|flag| flag == "waitingOnApproval") {
+    if status_flags_waiting_for_approval(status_flags) {
         return Some(json!({
             "kind": "approval",
             "promptStatus": "Needs approval"
         }));
     }
-    if status_flags
-        .iter()
-        .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")
-    {
+    if status_flags_waiting_for_input(status_flags) {
         return Some(json!({
             "kind": "reply",
             "promptStatus": "Needs input"
@@ -1508,7 +1530,7 @@ fn derive_pending_prompt(
     status_flags: &[String],
     last_preview: Option<String>,
 ) -> Option<PendingPrompt> {
-    if status_flags.iter().any(|flag| flag == "waitingOnApproval") {
+    if status_flags_waiting_for_approval(status_flags) {
         return Some(PendingPrompt {
             prompt_id: format!("approval:{thread_id}"),
             kind: "approval".to_string(),
@@ -1516,10 +1538,7 @@ fn derive_pending_prompt(
             question: last_preview.or_else(|| Some("Approval required".to_string())),
         });
     }
-    if status_flags
-        .iter()
-        .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")
-    {
+    if status_flags_waiting_for_input(status_flags) {
         return Some(PendingPrompt {
             prompt_id: format!("reply:{thread_id}"),
             kind: "reply".to_string(),
@@ -3345,18 +3364,7 @@ fn thread_snapshot_is_terminal(thread: &Value) -> bool {
         return true;
     }
 
-    thread
-        .pointer("/status/activeFlags")
-        .and_then(Value::as_array)
-        .map(|active_flags| {
-            active_flags.iter().any(|flag| {
-                matches!(
-                    flag.as_str(),
-                    Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
-                )
-            })
-        })
-        .unwrap_or(false)
+    active_flags_are_waiting(thread)
 }
 
 fn event_turn_id(event: &Value) -> Option<&str> {
@@ -3397,20 +3405,7 @@ fn event_is_terminal_for_started_turn(event: &Value, expected_turn_id: Option<&s
         Some("turn_completed") | Some("task_complete") | Some("turn.completed") => {
             turn_id_matches(event_turn_id(event), expected_turn_id)
         }
-        Some("thread_status_changed") => event
-            .pointer("/status/activeFlags")
-            .and_then(Value::as_array)
-            .map(|active_flags| {
-                active_flags.iter().any(|flag| {
-                    matches!(
-                        flag.as_str(),
-                        Some("waitingOnUserInput")
-                            | Some("waitingOnInput")
-                            | Some("waitingOnApproval")
-                    )
-                })
-            })
-            .unwrap_or(false),
+        Some("thread_status_changed") => active_flags_are_waiting(event),
         Some("approval_request") | Some("turn.waiting") => true,
         _ => false,
     }
@@ -3438,18 +3433,7 @@ fn thread_snapshot_started_turn_is_terminal(
     matches!(
         thread_snapshot_started_turn_status(thread, expected_turn_id),
         Some("completed") | Some("failed") | Some("interrupted")
-    ) || thread
-        .pointer("/status/activeFlags")
-        .and_then(Value::as_array)
-        .map(|active_flags| {
-            active_flags.iter().any(|flag| {
-                matches!(
-                    flag.as_str(),
-                    Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
-                )
-            })
-        })
-        .unwrap_or(false)
+    ) || active_flags_are_waiting(thread)
 }
 
 fn settle_composed_follow_events(
@@ -3842,7 +3826,7 @@ struct SetupOptions<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedTelegramDelivery {
-    payload: Value,
+    payloads: Vec<Value>,
     thread_id: Option<String>,
     event_id: String,
     callback_routes: Vec<TelegramCallbackRoute>,
@@ -4388,12 +4372,16 @@ fn telegram_authorized(
     }
 }
 
+const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+const TELEGRAM_REPLY_HINT: &str =
+    "💬 Reply to this Telegram message to send text back to the Codex thread.";
+
 fn telegram_event_title(event_type: &str) -> &'static str {
     match event_type {
-        "thread_waiting" => "Codex needs you",
-        "thread_completed" => "Codex finished",
-        "thread_status_changed" => "Codex changed",
-        _ => "Codex update",
+        "thread_waiting" => "🟡 Codex needs you",
+        "thread_completed" => "✅ Codex finished",
+        "thread_status_changed" => "🔄 Codex changed",
+        _ => "🧵 Codex update",
     }
 }
 
@@ -4413,16 +4401,8 @@ fn telegram_event_detail(event: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| event.pointer("/thread/lastPreview").and_then(Value::as_str))
         .or_else(|| event.get("lastPreview").and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let truncated = value.chars().take(900).collect::<String>();
-            if truncated.len() < value.len() {
-                format!("{truncated}...")
-            } else {
-                value.to_string()
-            }
-        })
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn telegram_event_is_approval(event: &Value) -> bool {
@@ -4441,6 +4421,36 @@ fn telegram_callback_id(event_id: &str, action: TelegramCallbackAction) -> Strin
     format!("cb_{}", &digest[..24])
 }
 
+fn split_telegram_text(text: &str, max_chars: usize) -> Vec<String> {
+    assert!(
+        max_chars > 0,
+        "Telegram message chunk size must be non-zero"
+    );
+
+    let mut chunks = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_chars = 0;
+
+    for ch in text.chars() {
+        if chunk_chars == max_chars {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk_chars = 0;
+        }
+        chunk.push(ch);
+        chunk_chars += 1;
+    }
+
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+
+    chunks
+}
+
 fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTelegramDelivery> {
     let event_type = event
         .get("type")
@@ -4448,40 +4458,46 @@ fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTel
         .unwrap_or("codex_event");
     let event_id = notification_event_id(event);
     let thread_id = event_thread_id(event);
-    let mut lines = vec![format!(
-        "{}: {}",
-        telegram_event_title(event_type),
-        telegram_event_display_name(event)
-    )];
+    let mut lines = vec![
+        telegram_event_title(event_type).to_string(),
+        format!("🧵 {}", telegram_event_display_name(event)),
+    ];
     if let Some(project) = event.pointer("/thread/project").and_then(Value::as_str) {
-        lines.push(format!("Project: {project}"));
+        lines.push(format!("📁 {project}"));
+    }
+    if let Some(thread_id) = thread_id.as_deref() {
+        lines.push(format!("🆔 {thread_id}"));
     }
     if let Some(detail) = telegram_event_detail(event) {
         lines.push(String::new());
+        lines.push("📝 Codex".to_string());
         lines.push(detail);
     }
     if thread_id.is_some() {
         lines.push(String::new());
-        lines.push(
-            "Reply to this Telegram message to send text back to the Codex thread.".to_string(),
-        );
+        lines.push(TELEGRAM_REPLY_HINT.to_string());
     }
 
-    let mut payload = json!({
-        "chat_id": chat_id,
-        "text": lines.join("\n"),
-        "disable_web_page_preview": true
-    });
+    let mut payloads = split_telegram_text(&lines.join("\n"), TELEGRAM_MESSAGE_CHAR_LIMIT)
+        .into_iter()
+        .map(|text| {
+            json!({
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": true
+            })
+        })
+        .collect::<Vec<_>>();
 
     let mut callback_routes = Vec::new();
     if telegram_event_is_approval(event) {
         if let Some(thread_id) = thread_id.as_ref() {
             let approve_id = telegram_callback_id(&event_id, TelegramCallbackAction::Approve);
             let deny_id = telegram_callback_id(&event_id, TelegramCallbackAction::Deny);
-            payload["reply_markup"] = json!({
+            payloads[0]["reply_markup"] = json!({
                 "inline_keyboard": [[
-                    { "text": "Approve", "callback_data": format!("codex:{approve_id}") },
-                    { "text": "Deny", "callback_data": format!("codex:{deny_id}") }
+                    { "text": "✅ Approve", "callback_data": format!("codex:{approve_id}") },
+                    { "text": "🛑 Deny", "callback_data": format!("codex:{deny_id}") }
                 ]]
             });
             callback_routes.push(TelegramCallbackRoute {
@@ -4502,7 +4518,7 @@ fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTel
     }
 
     Ok(PreparedTelegramDelivery {
-        payload,
+        payloads,
         thread_id,
         event_id,
         callback_routes,
@@ -4662,29 +4678,38 @@ fn deliver_telegram_event(
     for route in &prepared.callback_routes {
         insert_telegram_callback_route(conn, route, now)?;
     }
-    let response = telegram_send_message(telegram, &prepared.payload, timeout)?;
-    let message_id = response
-        .pointer("/result/message_id")
-        .and_then(Value::as_i64)
-        .context("Telegram sendMessage response missing result.message_id")?;
-    if let Some(thread_id) = prepared.thread_id.as_deref() {
-        insert_telegram_message_route(
-            conn,
-            &telegram.chat_id,
-            message_id,
-            thread_id,
-            &prepared.event_id,
-            now,
-        )?;
+    let mut message_ids = Vec::with_capacity(prepared.payloads.len());
+    for payload in &prepared.payloads {
+        let response = telegram_send_message(telegram, payload, timeout)?;
+        let message_id = response
+            .pointer("/result/message_id")
+            .and_then(Value::as_i64)
+            .context("Telegram sendMessage response missing result.message_id")?;
+        if let Some(thread_id) = prepared.thread_id.as_deref() {
+            insert_telegram_message_route(
+                conn,
+                &telegram.chat_id,
+                message_id,
+                thread_id,
+                &prepared.event_id,
+                now,
+            )?;
+        }
+        message_ids.push(message_id);
     }
+    let first_message_id = *message_ids
+        .first()
+        .context("Telegram delivery did not send any messages")?;
     for route in &mut prepared.callback_routes {
-        route.message_id = Some(message_id);
-        update_telegram_callback_message_id(conn, &route.callback_id, message_id)?;
+        route.message_id = Some(first_message_id);
+        update_telegram_callback_message_id(conn, &route.callback_id, first_message_id)?;
     }
     Ok(json!({
         "ok": true,
         "transport": "telegram",
-        "messageId": message_id,
+        "messageId": first_message_id,
+        "messageIds": message_ids,
+        "chunks": prepared.payloads.len(),
         "threadId": prepared.thread_id,
         "callbacks": prepared.callback_routes.len()
     }))
@@ -7054,27 +7079,82 @@ mod tests {
         let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
 
         assert_eq!(prepared.thread_id.as_deref(), Some("thr_approval"));
-        assert!(prepared.payload["text"]
+        assert_eq!(prepared.payloads.len(), 1);
+        let payload = &prepared.payloads[0];
+        assert!(payload["text"]
             .as_str()
             .expect("text")
             .contains("Approve deploy"));
-        assert_eq!(prepared.payload["chat_id"], "999");
+        assert_eq!(payload["chat_id"], "999");
         assert_eq!(
-            prepared.payload["reply_markup"]["inline_keyboard"][0][0]["text"],
-            "Approve"
+            payload["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "✅ Approve"
         );
         assert_eq!(
             prepared.callback_routes[0].action,
             TelegramCallbackAction::Approve
         );
         assert!(
-            prepared.payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+            payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
                 .as_str()
                 .expect("callback")
                 .len()
                 <= 64,
             "Telegram callback_data must fit the Bot API limit"
         );
+    }
+
+    #[test]
+    fn telegram_message_payload_preserves_full_multiline_codex_body() {
+        let full_message =
+            "\nFirst line from Codex.\n\nSecond line with details.\n- keep bullets\n- keep spacing\n";
+        let event = json!({
+            "type": "thread_completed",
+            "threadId": "thr_done",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Finish release notes",
+                "project": "codex-telegram-bridge",
+                "lastPreview": full_message
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+
+        assert!(text.contains("✅ Codex finished"));
+        assert!(text.contains("🧵 Finish release notes"));
+        assert!(text.contains("📁 codex-telegram-bridge"));
+        assert!(text.contains(full_message));
+    }
+
+    #[test]
+    fn telegram_message_payload_splits_without_truncating_codex_body() {
+        let full_message = "Codex line\n".repeat(500);
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_long",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Long update",
+                "project": "codex-telegram-bridge",
+                "lastPreview": full_message.clone()
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
+
+        assert!(prepared.payloads.len() > 1);
+        for payload in &prepared.payloads {
+            let text = payload["text"].as_str().expect("text");
+            assert!(text.chars().count() <= TELEGRAM_MESSAGE_CHAR_LIMIT);
+        }
+        let joined = prepared
+            .payloads
+            .iter()
+            .filter_map(|payload| payload["text"].as_str())
+            .collect::<String>();
+        assert!(joined.contains(&full_message));
     }
 
     #[test]
