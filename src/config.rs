@@ -66,7 +66,7 @@ pub(crate) struct SetupOptions<'a> {
     pub(crate) pair_timeout_ms: u64,
 }
 
-fn daemon_config_path() -> Result<PathBuf> {
+pub(crate) fn daemon_config_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("config.json"))
 }
 

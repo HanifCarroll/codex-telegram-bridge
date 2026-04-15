@@ -28,9 +28,9 @@ use crate::projects::{
 };
 use clap::Parser;
 pub(crate) use config::{
-    load_daemon_config, merged_daemon_config, read_daemon_config_raw, redacted_daemon_config,
-    resolve_telegram_bot_token, write_daemon_config, DaemonConfig, RegisteredProject, SetupOptions,
-    TelegramConfig, TelegramSetupOptions,
+    daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
+    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, DaemonConfig,
+    RegisteredProject, SetupOptions, TelegramConfig, TelegramSetupOptions,
 };
 
 #[derive(Serialize)]
@@ -3696,7 +3696,7 @@ fn daemon_run_command(bridge_command: &str) -> String {
 }
 
 fn doctor_bridge() -> Result<DoctorBridge> {
-    let config_path = state_dir_path()?.join("config.json");
+    let config_path = daemon_config_path()?;
     let config = read_daemon_config_raw()?;
     let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-telegram-bridge")?;
     Ok(DoctorBridge {
@@ -3827,7 +3827,7 @@ fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
     };
 
     let config_path = if options.dry_run {
-        state_dir_path()?.join("config.json")
+        daemon_config_path()?
     } else {
         write_daemon_config(&config)?
     };
@@ -3857,7 +3857,7 @@ fn telegram_status_result() -> Result<Value> {
     Ok(json!({
         "ok": true,
         "action": "telegram_status",
-        "configPath": state_dir_path()?.join("config.json").display().to_string(),
+        "configPath": daemon_config_path()?.display().to_string(),
         "configured": config.as_ref().and_then(|config| config.telegram.as_ref()).is_some(),
         "config": config.as_ref().map(redacted_daemon_config)
     }))
@@ -3894,7 +3894,7 @@ fn telegram_test_result(message: &str, timeout: Duration, dry_run: bool) -> Resu
 }
 
 fn telegram_disable_result(dry_run: bool) -> Result<Value> {
-    let path = state_dir_path()?.join("config.json");
+    let path = daemon_config_path()?;
     let config = read_daemon_config_raw()?;
     let had_telegram = config
         .as_ref()
@@ -5987,7 +5987,7 @@ fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
         serde_json::to_string(&json!({
             "ok": true,
             "action": "daemon_started",
-            "configPath": state_dir_path()?.join("config.json").display().to_string(),
+            "configPath": daemon_config_path()?.display().to_string(),
             "events": config.events,
             "telegramCommands": telegram_commands
         }))?
@@ -6260,7 +6260,7 @@ fn stop_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
 
 fn daemon_service_status(label: &str) -> Result<Value> {
     let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
-    let config_path = state_dir_path()?.join("config.json");
+    let config_path = daemon_config_path()?;
     Ok(json!({
         "ok": true,
         "action": "daemon_status",
