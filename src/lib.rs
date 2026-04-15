@@ -18,11 +18,21 @@ mod config;
 mod projects;
 mod state;
 
-use crate::codex::*;
-
 use crate::cli::{
     AwayCommands, Cli, Commands, DaemonCommands, HermesCommands, ProjectCommands, TelegramCommands,
 };
+use crate::codex::{
+    attach_follow_result, build_show_thread_result, classify_app_server_error_message,
+    collect_follow_events, filter_watch_events, follow_result_summary, fork_thread_dry_run,
+    fork_thread_live_result, get_away_mode, normalized_message, parse_event_filter,
+    resolve_codex_binary, run_exec_hook, set_away_mode, start_codex_watch_receiver,
+    start_new_thread_dry_run, start_thread_in_cwd, sync_state_from_live, text_input_value,
+    thread_cwd_from_response, thread_id_from_response, turn_start_params, wait_for_started_turn,
+    watch_events_from_sync_result, watch_thread_error_event, CodexAppServerClient, FollowRun,
+    TELEGRAM_TURN_SETTLE_POLL_MS, TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
+};
+#[cfg(test)]
+use crate::codex::{derive_pending_prompt, normalize_thread_snapshot};
 use crate::projects::{
     build_registered_project, derive_project_label, ensure_unique_project_id,
     resolve_new_thread_request, resolve_project_query, slugify_project_token,
@@ -494,18 +504,7 @@ fn run() -> Result<()> {
                 );
             } else {
                 let mut client = CodexAppServerClient::connect()?;
-                let created =
-                    client.request("thread/start", thread_start_params(cwd.as_deref()))?;
-                let thread_id = thread_id_from_response(&created);
-                let started = match (thread_id.as_deref(), message.as_deref()) {
-                    (Some(thread_id), Some(message)) => Some(client.request(
-                        "turn/start",
-                        turn_start_params(thread_id, cwd.as_deref(), message),
-                    )?),
-                    _ => None,
-                };
-                let result =
-                    new_thread_live_result(cwd.as_deref(), message.as_deref(), created, started);
+                let result = start_thread_in_cwd(&mut client, cwd.as_deref(), message.as_deref())?;
                 let result = if follow {
                     let db_path = state_db_path()?;
                     let conn = create_state_db(&db_path)?;
@@ -2300,14 +2299,11 @@ fn start_new_thread_from_telegram(
     now: u64,
 ) -> Result<Value> {
     let mut client = CodexAppServerClient::connect()?;
-    let created = client.request("thread/start", thread_start_params(Some(&project.cwd)))?;
-    let thread_id = thread_id_from_response(&created)
+    let result = start_thread_in_cwd(&mut client, Some(&project.cwd), Some(message))?;
+    let thread_id = result
+        .get("threadId")
+        .and_then(Value::as_str)
         .context("Codex app-server thread/start response missing thread.id")?;
-    let started = client.request(
-        "turn/start",
-        turn_start_params(&thread_id, Some(&project.cwd), message),
-    )?;
-    let result = new_thread_live_result(Some(&project.cwd), Some(message), created, Some(started));
     record_action(
         conn,
         &thread_id,

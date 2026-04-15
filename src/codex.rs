@@ -26,7 +26,7 @@ pub(crate) struct ResolvedBinary {
     pub(crate) source: &'static str,
 }
 
-pub(crate) fn last_preview_from_thread(thread: &Value) -> Option<String> {
+fn last_preview_from_thread(thread: &Value) -> Option<String> {
     let turns = thread.get("turns")?.as_array()?;
     let mut fallback: Option<String> = None;
     for turn in turns.iter().rev() {
@@ -54,7 +54,7 @@ pub(crate) fn last_preview_from_thread(thread: &Value) -> Option<String> {
     fallback
 }
 
-pub(crate) fn extract_item_text(item: &Value) -> Option<String> {
+fn extract_item_text(item: &Value) -> Option<String> {
     if let Some(text) = item.get("text").and_then(Value::as_str).map(str::trim) {
         if !text.is_empty() {
             return Some(text.to_string());
@@ -76,7 +76,7 @@ pub(crate) fn extract_item_text(item: &Value) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-pub(crate) fn find_last_message_by_type(thread: &Value, item_type: &str) -> Option<String> {
+fn find_last_message_by_type(thread: &Value, item_type: &str) -> Option<String> {
     let turns = thread.get("turns").and_then(Value::as_array)?;
     for turn in turns.iter().rev() {
         let Some(items) = turn.get("items").and_then(Value::as_array) else {
@@ -93,29 +93,29 @@ pub(crate) fn find_last_message_by_type(thread: &Value, item_type: &str) -> Opti
     None
 }
 
-pub(crate) fn latest_question(thread: &Value) -> Option<String> {
+fn latest_question(thread: &Value) -> Option<String> {
     let last_user_message = find_last_message_by_type(thread, "userMessage")?;
     last_user_message.contains('?').then_some(last_user_message)
 }
 
-pub(crate) fn status_flags_waiting_for_approval(status_flags: &[String]) -> bool {
+fn status_flags_waiting_for_approval(status_flags: &[String]) -> bool {
     status_flags.iter().any(|flag| flag == "waitingOnApproval")
 }
 
-pub(crate) fn status_flags_waiting_for_input(status_flags: &[String]) -> bool {
+fn status_flags_waiting_for_input(status_flags: &[String]) -> bool {
     status_flags
         .iter()
         .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")
 }
 
-pub(crate) fn active_flag_is_waiting(flag: &Value) -> bool {
+fn active_flag_is_waiting(flag: &Value) -> bool {
     matches!(
         flag.as_str(),
         Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
     )
 }
 
-pub(crate) fn active_flags_are_waiting(value: &Value) -> bool {
+fn active_flags_are_waiting(value: &Value) -> bool {
     value
         .pointer("/status/activeFlags")
         .and_then(Value::as_array)
@@ -123,7 +123,7 @@ pub(crate) fn active_flags_are_waiting(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn show_pending_prompt(status_flags: &[String]) -> Option<Value> {
+fn show_pending_prompt(status_flags: &[String]) -> Option<Value> {
     if status_flags_waiting_for_approval(status_flags) {
         return Some(json!({
             "kind": "approval",
@@ -139,7 +139,7 @@ pub(crate) fn show_pending_prompt(status_flags: &[String]) -> Option<Value> {
     None
 }
 
-pub(crate) fn build_delta_summary(
+fn build_delta_summary(
     pending_prompt: Option<&Value>,
     last_turn_status: Option<&str>,
     last_agent_message: Option<&str>,
@@ -164,7 +164,7 @@ pub(crate) fn build_delta_summary(
     last_agent_message.map(str::to_string)
 }
 
-pub(crate) fn build_unresolved_summary(
+fn build_unresolved_summary(
     pending_prompt: Option<&Value>,
     latest_question: Option<&str>,
     last_user_message: Option<&str>,
@@ -334,7 +334,29 @@ pub(crate) fn turn_start_params(thread_id: &str, cwd: Option<&str>, message: &st
     Value::Object(params)
 }
 
-pub(crate) fn thread_field_string(response: &Value, field: &str) -> Option<String> {
+pub(crate) fn start_thread_in_cwd(
+    client: &mut CodexAppServerClient,
+    cwd: Option<&str>,
+    message: Option<&str>,
+) -> Result<Value> {
+    let created = client.request("thread/start", thread_start_params(cwd))?;
+    let normalized_message = normalized_message(message);
+    let thread_id = thread_id_from_response(&created);
+    let started = match (thread_id.as_deref(), normalized_message.as_deref()) {
+        (Some(thread_id), Some(message)) => {
+            Some(client.request("turn/start", turn_start_params(thread_id, cwd, message))?)
+        }
+        _ => None,
+    };
+    Ok(new_thread_live_result(
+        cwd,
+        normalized_message.as_deref(),
+        created,
+        started,
+    ))
+}
+
+fn thread_field_string(response: &Value, field: &str) -> Option<String> {
     response
         .get("thread")
         .and_then(|thread| thread.get(field))
@@ -350,7 +372,7 @@ pub(crate) fn thread_cwd_from_response(response: &Value, fallback: Option<&str>)
     thread_field_string(response, "cwd").or_else(|| fallback.map(str::to_string))
 }
 
-pub(crate) fn new_thread_live_result(
+fn new_thread_live_result(
     cwd: Option<&str>,
     message: Option<&str>,
     created: Value,
@@ -487,7 +509,7 @@ pub(crate) fn resolve_codex_binary() -> Result<ResolvedBinary> {
     )
 }
 
-pub(crate) fn codex_candidate_is_usable(path: &Path) -> bool {
+fn codex_candidate_is_usable(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
@@ -504,7 +526,7 @@ pub(crate) fn codex_candidate_is_usable(path: &Path) -> bool {
     codex_candidate_is_usable_with_timeout(path, Duration::from_secs(3))
 }
 
-pub(crate) fn codex_candidate_is_usable_with_timeout(path: &Path, timeout: Duration) -> bool {
+fn codex_candidate_is_usable_with_timeout(path: &Path, timeout: Duration) -> bool {
     let Ok(mut child) = Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
@@ -534,7 +556,7 @@ pub(crate) fn codex_candidate_is_usable_with_timeout(path: &Path, timeout: Durat
     }
 }
 
-pub(crate) fn push_candidate(
+fn push_candidate(
     candidates: &mut Vec<ResolvedBinary>,
     seen: &mut BTreeSet<String>,
     path: PathBuf,
@@ -546,7 +568,7 @@ pub(crate) fn push_candidate(
     }
 }
 
-pub(crate) fn workspace_roots(start: &Path) -> Vec<PathBuf> {
+fn workspace_roots(start: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut current = start.to_path_buf();
     loop {
@@ -785,7 +807,7 @@ pub(crate) fn parse_event_filter(input: Option<&str>) -> Option<BTreeSet<String>
         .filter(|set| !set.is_empty())
 }
 
-pub(crate) fn should_emit_event(filter: Option<&BTreeSet<String>>, event: &Value) -> bool {
+fn should_emit_event(filter: Option<&BTreeSet<String>>, event: &Value) -> bool {
     match filter {
         None => true,
         Some(filter) => event
@@ -796,7 +818,7 @@ pub(crate) fn should_emit_event(filter: Option<&BTreeSet<String>>, event: &Value
     }
 }
 
-pub(crate) fn normalize_notification_event(notification: &Value) -> Value {
+fn normalize_notification_event(notification: &Value) -> Value {
     match notification.get("method").and_then(Value::as_str) {
         Some("thread/status/changed") => json!({
             "type": "thread_status_changed",
@@ -837,7 +859,7 @@ pub(crate) fn normalize_notification_event(notification: &Value) -> Value {
     }
 }
 
-pub(crate) fn push_follow_event(
+fn push_follow_event(
     events: &mut Vec<Value>,
     event_filter: Option<&BTreeSet<String>>,
     event: Value,
@@ -847,7 +869,7 @@ pub(crate) fn push_follow_event(
     }
 }
 
-pub(crate) fn read_thread_with_turns_fallback(
+fn read_thread_with_turns_fallback(
     client: &mut CodexAppServerClient,
     thread_id: &str,
 ) -> Result<Value> {
@@ -958,7 +980,7 @@ pub(crate) fn collect_follow_events(
     Ok(events)
 }
 
-pub(crate) fn persist_follow_events(
+fn persist_follow_events(
     conn: &Connection,
     thread_id: &str,
     events: &[Value],
@@ -1016,7 +1038,7 @@ pub(crate) fn follow_result_summary(
     summary
 }
 
-pub(crate) fn attach_follow_payload(mut result: Value, follow: Value, stream: bool) -> Value {
+fn attach_follow_payload(mut result: Value, follow: Value, stream: bool) -> Value {
     result["follow"] = follow;
     if stream {
         json!({
@@ -1028,7 +1050,7 @@ pub(crate) fn attach_follow_payload(mut result: Value, follow: Value, stream: bo
     }
 }
 
-pub(crate) fn composed_settle_duration_ms(duration_ms: u64) -> u64 {
+fn composed_settle_duration_ms(duration_ms: u64) -> u64 {
     if duration_ms <= 100 {
         0
     } else {
@@ -1036,7 +1058,7 @@ pub(crate) fn composed_settle_duration_ms(duration_ms: u64) -> u64 {
     }
 }
 
-pub(crate) fn event_is_terminal(event: &Value) -> bool {
+fn event_is_terminal(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
         Some("item_completed")
@@ -1047,7 +1069,7 @@ pub(crate) fn event_is_terminal(event: &Value) -> bool {
     )
 }
 
-pub(crate) fn thread_snapshot_is_terminal(thread: &Value) -> bool {
+fn thread_snapshot_is_terminal(thread: &Value) -> bool {
     let last_turn_status = thread
         .get("turns")
         .and_then(Value::as_array)
@@ -1061,7 +1083,7 @@ pub(crate) fn thread_snapshot_is_terminal(thread: &Value) -> bool {
     active_flags_are_waiting(thread)
 }
 
-pub(crate) fn event_turn_id(event: &Value) -> Option<&str> {
+fn event_turn_id(event: &Value) -> Option<&str> {
     event
         .get("turnId")
         .and_then(Value::as_str)
@@ -1070,17 +1092,14 @@ pub(crate) fn event_turn_id(event: &Value) -> Option<&str> {
         .or_else(|| event.pointer("/raw/params/turn/id").and_then(Value::as_str))
 }
 
-pub(crate) fn turn_id_matches(event_turn_id: Option<&str>, expected_turn_id: Option<&str>) -> bool {
+fn turn_id_matches(event_turn_id: Option<&str>, expected_turn_id: Option<&str>) -> bool {
     match expected_turn_id {
         Some(expected) => event_turn_id == Some(expected),
         None => true,
     }
 }
 
-pub(crate) fn event_is_agent_item_completed_for_turn(
-    event: &Value,
-    expected_turn_id: Option<&str>,
-) -> bool {
+fn event_is_agent_item_completed_for_turn(event: &Value, expected_turn_id: Option<&str>) -> bool {
     if event.get("type").and_then(Value::as_str) != Some("item_completed") {
         return false;
     }
@@ -1093,10 +1112,7 @@ pub(crate) fn event_is_agent_item_completed_for_turn(
     )
 }
 
-pub(crate) fn event_is_terminal_for_started_turn(
-    event: &Value,
-    expected_turn_id: Option<&str>,
-) -> bool {
+fn event_is_terminal_for_started_turn(event: &Value, expected_turn_id: Option<&str>) -> bool {
     if event_is_agent_item_completed_for_turn(event, expected_turn_id) {
         return true;
     }
@@ -1111,7 +1127,7 @@ pub(crate) fn event_is_terminal_for_started_turn(
     }
 }
 
-pub(crate) fn thread_snapshot_started_turn_status<'a>(
+fn thread_snapshot_started_turn_status<'a>(
     thread: &'a Value,
     expected_turn_id: Option<&str>,
 ) -> Option<&'a str> {
@@ -1126,7 +1142,7 @@ pub(crate) fn thread_snapshot_started_turn_status<'a>(
     turn.get("status").and_then(Value::as_str)
 }
 
-pub(crate) fn thread_snapshot_started_turn_is_terminal(
+fn thread_snapshot_started_turn_is_terminal(
     thread: &Value,
     expected_turn_id: Option<&str>,
 ) -> bool {
@@ -1136,7 +1152,7 @@ pub(crate) fn thread_snapshot_started_turn_is_terminal(
     ) || active_flags_are_waiting(thread)
 }
 
-pub(crate) fn settle_composed_follow_events(
+fn settle_composed_follow_events(
     client: &mut CodexAppServerClient,
     thread_id: &str,
     events: &mut Vec<Value>,
@@ -1269,7 +1285,7 @@ pub(crate) fn wait_for_started_turn(
 }
 
 #[cfg(test)]
-pub(crate) struct FollowEventsFixture<'a> {
+struct FollowEventsFixture<'a> {
     pub(crate) thread_id: &'a str,
     pub(crate) duration_ms: u64,
     pub(crate) poll_interval_ms: u64,
@@ -1280,7 +1296,7 @@ pub(crate) struct FollowEventsFixture<'a> {
 }
 
 #[cfg(test)]
-pub(crate) fn build_follow_events(fixture: FollowEventsFixture<'_>) -> Result<Vec<Value>> {
+fn build_follow_events(fixture: FollowEventsFixture<'_>) -> Result<Vec<Value>> {
     let mut events = vec![json!({
         "type": "follow_started",
         "threadId": fixture.thread_id,
@@ -1339,7 +1355,7 @@ pub(crate) fn watch_thread_error_event(error: &anyhow::Error) -> Value {
     })
 }
 
-pub(crate) fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
+fn enrich_event_with_thread(event: Value, threads: &[Value]) -> Value {
     let Some(thread_id) = event.get("threadId").and_then(Value::as_str) else {
         return event;
     };
@@ -1613,7 +1629,7 @@ fn spawn_app_server_reader(
     (rx, reader)
 }
 
-pub(crate) fn initialize_params() -> Value {
+fn initialize_params() -> Value {
     json!({
         "protocolVersion": 1,
         "capabilities": {},
@@ -1624,7 +1640,7 @@ pub(crate) fn initialize_params() -> Value {
     })
 }
 
-pub(crate) fn handle_app_server_message(
+fn handle_app_server_message(
     parsed: &Value,
     expected_id: u64,
     notifications: &mut Vec<Value>,
