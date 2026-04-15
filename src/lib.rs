@@ -28,19 +28,23 @@ use crate::projects::{
 };
 #[cfg(test)]
 use crate::state::{
-    archive_from_db, create_state_db_in_memory, get_thread_history, watch_once_from_db,
+    archive_from_db, classify_inbox_item, create_state_db_in_memory, get_thread_history,
+    watch_once_from_db,
 };
 use crate::state::{
     archive_result, clear_pending_outbound_events, create_state_db, deliver_due_outbound_events,
-    enqueue_outbound_event, get_setting_number, get_setting_text, get_telegram_current_project_id,
-    insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
-    list_inbox_from_db, list_waiting_from_db, lookup_telegram_command_route,
-    lookup_telegram_message_route, mark_telegram_command_route_used, observed_workspaces_from_db,
-    pending_outbound_count, recent_actions_json, reconcile_thread_snapshots, record_action,
-    record_telegram_inbound_processed, record_transport_delivery, resolve_archive_targets,
-    set_setting, set_setting_text, set_telegram_current_project_id, should_emit_for_away_window,
-    state_db_path, telegram_inbound_processed, transport_delivery_exists, unarchive_thread_result,
-    update_telegram_callback_message_id, upsert_thread_snapshot,
+    derive_thread_display_name, enqueue_outbound_event, get_setting_number, get_setting_text,
+    get_telegram_current_project_id, insert_telegram_callback_route, insert_telegram_command_route,
+    insert_telegram_message_route, list_inbox_from_db, list_waiting_from_db,
+    lookup_telegram_command_route, lookup_telegram_message_route, mark_telegram_command_route_used,
+    observed_workspaces_from_db, pending_outbound_count, recent_actions_json,
+    reconcile_thread_snapshots, record_action, record_telegram_inbound_processed,
+    record_transport_delivery, resolve_archive_targets, set_setting, set_setting_text,
+    set_telegram_current_project_id, should_emit_for_away_window, state_db_path,
+    telegram_inbound_processed, transport_delivery_exists, unarchive_thread_result,
+    update_telegram_callback_message_id, upsert_thread_snapshot, BridgeThreadSnapshot,
+    ObservedWorkspace, OutboxDeliverySummary, PendingPrompt, TelegramCallbackAction,
+    TelegramCallbackRoute, TelegramCommandRouteKind,
 };
 use clap::Parser;
 pub(crate) use config::{
@@ -111,120 +115,6 @@ struct ApproveResult<'a> {
 struct ResolvedBinary {
     path: PathBuf,
     source: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct PendingPrompt {
-    prompt_id: String,
-    kind: String,
-    status: String,
-    question: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct BridgeThreadSnapshot {
-    thread_id: String,
-    name: Option<String>,
-    cwd: Option<String>,
-    updated_at: Option<u64>,
-    status_type: String,
-    status_flags: Vec<String>,
-    last_turn_status: Option<String>,
-    last_preview: Option<String>,
-    pending_prompt: Option<PendingPrompt>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WaitingThread {
-    #[serde(rename = "threadId")]
-    thread_id: String,
-    name: Option<String>,
-    #[serde(rename = "displayName")]
-    display_name: String,
-    project: Option<String>,
-    cwd: Option<String>,
-    #[serde(rename = "updatedAt")]
-    updated_at: Option<u64>,
-    #[serde(rename = "statusType")]
-    status_type: String,
-    #[serde(rename = "statusFlags")]
-    status_flags: Vec<String>,
-    prompt: PendingPrompt,
-    #[serde(rename = "lastPreview")]
-    last_preview: Option<String>,
-    label: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WaitingSummary {
-    count: usize,
-    #[serde(rename = "threadIds")]
-    thread_ids: Vec<String>,
-    labels: Vec<String>,
-    #[serde(rename = "appliedFilters")]
-    applied_filters: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WaitingResult {
-    summary: WaitingSummary,
-    threads: Vec<WaitingThread>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct InboxItem {
-    #[serde(rename = "threadId")]
-    thread_id: String,
-    name: Option<String>,
-    #[serde(rename = "displayName")]
-    display_name: String,
-    project: Option<String>,
-    cwd: Option<String>,
-    #[serde(rename = "updatedAt")]
-    updated_at: Option<u64>,
-    #[serde(rename = "lastSeenAt")]
-    last_seen_at: Option<u64>,
-    #[serde(rename = "ageSeconds")]
-    age_seconds: Option<u64>,
-    #[serde(rename = "statusType")]
-    status_type: String,
-    #[serde(rename = "statusFlags")]
-    status_flags: Vec<String>,
-    #[serde(rename = "lastPreview")]
-    last_preview: Option<String>,
-    #[serde(rename = "promptKind")]
-    prompt_kind: Option<String>,
-    #[serde(rename = "promptStatus")]
-    prompt_status: Option<String>,
-    question: Option<String>,
-    basis: String,
-    #[serde(rename = "attentionReason")]
-    attention_reason: String,
-    #[serde(rename = "waitingOn")]
-    waiting_on: String,
-    #[serde(rename = "suggestedAction")]
-    suggested_action: String,
-    priority: String,
-    #[serde(rename = "recentAction")]
-    recent_action: Option<Value>,
-    label: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct InboxSummary {
-    total: usize,
-    #[serde(rename = "needsAttention")]
-    needs_attention: usize,
-    #[serde(rename = "countsByReason")]
-    counts_by_reason: Value,
-    #[serde(rename = "appliedFilters")]
-    applied_filters: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct InboxResult {
-    summary: InboxSummary,
-    items: Vec<InboxItem>,
 }
 
 pub fn main_entry() -> anyhow::Result<()> {
@@ -1029,34 +919,6 @@ fn now_millis() -> Result<u64> {
         .as_millis() as u64)
 }
 
-const UNIX_TIMESTAMP_MILLIS_THRESHOLD: u64 = 100_000_000_000;
-
-fn timestamp_to_millis(value: u64) -> u64 {
-    if value < UNIX_TIMESTAMP_MILLIS_THRESHOLD {
-        value.saturating_mul(1000)
-    } else {
-        value
-    }
-}
-
-fn timestamp_age_seconds(now: u64, then: u64) -> u64 {
-    timestamp_to_millis(now).saturating_sub(timestamp_to_millis(then)) / 1000
-}
-
-fn compact_text_preview(input: Option<String>, limit: usize) -> Option<String> {
-    let text = input?.trim().replace(char::is_whitespace, " ");
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    let count = normalized.chars().count();
-    if count <= limit {
-        return Some(normalized);
-    }
-    let truncated = normalized.chars().take(limit).collect::<String>();
-    Some(format!("{}…", truncated.trim_end()))
-}
-
 fn importable_projects_from_observed(
     observed: &[ObservedWorkspace],
     existing_projects: &[RegisteredProject],
@@ -1090,26 +952,6 @@ fn importable_projects_from_observed(
         });
     }
     projects
-}
-
-fn derive_thread_display_name(
-    name: Option<&str>,
-    project: Option<&str>,
-    question: Option<&str>,
-    thread_id: &str,
-) -> String {
-    if let Some(value) = name.map(str::trim).filter(|value| !value.is_empty()) {
-        return value.to_string();
-    }
-    if let Some(value) = question.map(str::trim).filter(|value| !value.is_empty()) {
-        return compact_text_preview(Some(value.to_string()), 80)
-            .unwrap_or_else(|| value.to_string());
-    }
-    if let Some(project) = project.filter(|value| !value.is_empty()) {
-        return format!("Untitled {project} thread");
-    }
-    let short_id = thread_id.chars().take(8).collect::<String>();
-    format!("Untitled thread {short_id}")
 }
 
 fn last_preview_from_thread(thread: &Value) -> Option<String> {
@@ -1376,124 +1218,6 @@ fn normalize_thread_snapshot(summary: &Value, thread: &Value) -> Result<BridgeTh
         last_preview,
         pending_prompt,
     })
-}
-
-fn classify_attention(snapshot: &BridgeThreadSnapshot) -> (&'static str, &'static str) {
-    match snapshot
-        .pending_prompt
-        .as_ref()
-        .map(|prompt| prompt.kind.as_str())
-    {
-        Some("approval") => ("pending_approval", "prompt_kind"),
-        Some("reply") => ("needs_reply", "prompt_kind"),
-        _ if snapshot.last_turn_status.as_deref() == Some("completed") => {
-            ("completed", "last_turn_completed")
-        }
-        _ if snapshot.last_turn_status.as_deref() == Some("interrupted")
-            && snapshot
-                .last_preview
-                .as_deref()
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false) =>
-        {
-            ("updated", "last_turn_interrupted")
-        }
-        _ => ("active", "fallback_active"),
-    }
-}
-
-fn classify_waiting_on(reason: &str) -> &'static str {
-    match reason {
-        "pending_approval" | "needs_reply" => "me",
-        "active" => "codex",
-        "updated" => "none",
-        _ => "none",
-    }
-}
-
-fn classify_suggested_action(reason: &str) -> &'static str {
-    match reason {
-        "pending_approval" => "approve",
-        "needs_reply" => "reply",
-        "completed" => "archive",
-        "updated" => "inspect",
-        _ => "inspect",
-    }
-}
-
-fn classify_priority(reason: &str) -> &'static str {
-    match reason {
-        "pending_approval" => "high",
-        "needs_reply" | "active" | "updated" => "medium",
-        _ => "low",
-    }
-}
-
-fn score_inbox_item(item: &InboxItem) -> u128 {
-    let priority_score = match item.priority.as_str() {
-        "high" => 300_u128,
-        "medium" => 200_u128,
-        _ => 100_u128,
-    };
-    priority_score * 1_000_000_000_000 + item.updated_at.unwrap_or(0) as u128
-}
-
-fn classify_inbox_item(snapshot: &BridgeThreadSnapshot, now: u64) -> InboxItem {
-    let (attention_reason, basis) = classify_attention(snapshot);
-    let project = derive_project_label(snapshot.cwd.as_deref());
-    let display_name = derive_thread_display_name(
-        snapshot.name.as_deref(),
-        project.as_deref(),
-        snapshot
-            .pending_prompt
-            .as_ref()
-            .and_then(|prompt| prompt.question.as_deref()),
-        &snapshot.thread_id,
-    );
-    InboxItem {
-        thread_id: snapshot.thread_id.clone(),
-        name: snapshot.name.clone(),
-        display_name: display_name.clone(),
-        project: project.clone(),
-        cwd: snapshot.cwd.clone(),
-        updated_at: snapshot.updated_at,
-        last_seen_at: None,
-        age_seconds: snapshot
-            .updated_at
-            .map(|updated| timestamp_age_seconds(now, updated)),
-        status_type: snapshot.status_type.clone(),
-        status_flags: snapshot.status_flags.clone(),
-        last_preview: compact_text_preview(snapshot.last_preview.clone(), 220),
-        prompt_kind: snapshot
-            .pending_prompt
-            .as_ref()
-            .map(|prompt| prompt.kind.clone()),
-        prompt_status: snapshot
-            .pending_prompt
-            .as_ref()
-            .map(|prompt| prompt.status.clone()),
-        question: compact_text_preview(
-            snapshot
-                .pending_prompt
-                .as_ref()
-                .and_then(|prompt| prompt.question.clone()),
-            160,
-        ),
-        basis: basis.to_string(),
-        attention_reason: attention_reason.to_string(),
-        waiting_on: classify_waiting_on(attention_reason).to_string(),
-        suggested_action: classify_suggested_action(attention_reason).to_string(),
-        priority: classify_priority(attention_reason).to_string(),
-        recent_action: None,
-        label: format!(
-            "{} · {}",
-            display_name,
-            project
-                .clone()
-                .or_else(|| snapshot.cwd.clone())
-                .unwrap_or_else(|| "unknown cwd".to_string())
-        ),
-    }
 }
 
 fn start_new_thread_dry_run(cwd: Option<&str>, message: Option<&str>) -> Value {
@@ -2643,13 +2367,6 @@ fn start_codex_watch_receiver() -> Result<CodexWatchReceiver> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ObservedWorkspace {
-    cwd: String,
-    label: String,
-    last_seen_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedTelegramDelivery {
     payloads: Vec<Value>,
     thread_id: Option<String>,
@@ -2674,63 +2391,11 @@ enum TelegramInboundCommand {
     Unknown(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TelegramCommandRouteKind {
-    NewThread,
-}
-
-impl TelegramCommandRouteKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::NewThread => "new_thread",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "new_thread" => Some(Self::NewThread),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoutedTelegramCommandPromptReply {
     kind: TelegramCommandRouteKind,
     message: String,
     project_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TelegramCallbackRoute {
-    callback_id: String,
-    chat_id: String,
-    message_id: Option<i64>,
-    thread_id: String,
-    action: TelegramCallbackAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TelegramCallbackAction {
-    Approve,
-    Deny,
-}
-
-impl TelegramCallbackAction {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Approve => "approve",
-            Self::Deny => "deny",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "approve" => Some(Self::Approve),
-            "deny" => Some(Self::Deny),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2744,14 +2409,6 @@ struct RoutedTelegramCallback {
     callback_query_id: String,
     thread_id: String,
     action: TelegramCallbackAction,
-}
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct OutboxDeliverySummary {
-    attempted: usize,
-    delivered: usize,
-    failed: usize,
 }
 
 fn daemon_run_command(bridge_command: &str) -> String {

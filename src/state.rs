@@ -2,18 +2,194 @@
 use anyhow::bail;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::projects::{canonicalize_project_cwd, derive_project_label};
-use crate::{
-    classify_inbox_item, derive_thread_display_name, score_inbox_item, timestamp_to_millis,
-    BridgeThreadSnapshot, InboxResult, InboxSummary, ObservedWorkspace, OutboxDeliverySummary,
-    PendingPrompt, TelegramCallbackRoute, TelegramCommandRouteKind, WaitingResult, WaitingSummary,
-    WaitingThread,
-};
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PendingPrompt {
+    pub(crate) prompt_id: String,
+    pub(crate) kind: String,
+    pub(crate) status: String,
+    pub(crate) question: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BridgeThreadSnapshot {
+    pub(crate) thread_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) updated_at: Option<u64>,
+    pub(crate) status_type: String,
+    pub(crate) status_flags: Vec<String>,
+    pub(crate) last_turn_status: Option<String>,
+    pub(crate) last_preview: Option<String>,
+    pub(crate) pending_prompt: Option<PendingPrompt>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WaitingThread {
+    #[serde(rename = "threadId")]
+    pub(crate) thread_id: String,
+    pub(crate) name: Option<String>,
+    #[serde(rename = "displayName")]
+    pub(crate) display_name: String,
+    pub(crate) project: Option<String>,
+    pub(crate) cwd: Option<String>,
+    #[serde(rename = "updatedAt")]
+    pub(crate) updated_at: Option<u64>,
+    #[serde(rename = "statusType")]
+    pub(crate) status_type: String,
+    #[serde(rename = "statusFlags")]
+    pub(crate) status_flags: Vec<String>,
+    pub(crate) prompt: PendingPrompt,
+    #[serde(rename = "lastPreview")]
+    pub(crate) last_preview: Option<String>,
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WaitingSummary {
+    pub(crate) count: usize,
+    #[serde(rename = "threadIds")]
+    pub(crate) thread_ids: Vec<String>,
+    pub(crate) labels: Vec<String>,
+    #[serde(rename = "appliedFilters")]
+    pub(crate) applied_filters: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WaitingResult {
+    pub(crate) summary: WaitingSummary,
+    pub(crate) threads: Vec<WaitingThread>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InboxItem {
+    #[serde(rename = "threadId")]
+    pub(crate) thread_id: String,
+    pub(crate) name: Option<String>,
+    #[serde(rename = "displayName")]
+    pub(crate) display_name: String,
+    pub(crate) project: Option<String>,
+    pub(crate) cwd: Option<String>,
+    #[serde(rename = "updatedAt")]
+    pub(crate) updated_at: Option<u64>,
+    #[serde(rename = "lastSeenAt")]
+    pub(crate) last_seen_at: Option<u64>,
+    #[serde(rename = "ageSeconds")]
+    pub(crate) age_seconds: Option<u64>,
+    #[serde(rename = "statusType")]
+    pub(crate) status_type: String,
+    #[serde(rename = "statusFlags")]
+    pub(crate) status_flags: Vec<String>,
+    #[serde(rename = "lastPreview")]
+    pub(crate) last_preview: Option<String>,
+    #[serde(rename = "promptKind")]
+    pub(crate) prompt_kind: Option<String>,
+    #[serde(rename = "promptStatus")]
+    pub(crate) prompt_status: Option<String>,
+    pub(crate) question: Option<String>,
+    pub(crate) basis: String,
+    #[serde(rename = "attentionReason")]
+    pub(crate) attention_reason: String,
+    #[serde(rename = "waitingOn")]
+    pub(crate) waiting_on: String,
+    #[serde(rename = "suggestedAction")]
+    pub(crate) suggested_action: String,
+    pub(crate) priority: String,
+    #[serde(rename = "recentAction")]
+    pub(crate) recent_action: Option<Value>,
+    pub(crate) label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InboxSummary {
+    pub(crate) total: usize,
+    #[serde(rename = "needsAttention")]
+    pub(crate) needs_attention: usize,
+    #[serde(rename = "countsByReason")]
+    pub(crate) counts_by_reason: Value,
+    #[serde(rename = "appliedFilters")]
+    pub(crate) applied_filters: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InboxResult {
+    pub(crate) summary: InboxSummary,
+    pub(crate) items: Vec<InboxItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedWorkspace {
+    pub(crate) cwd: String,
+    pub(crate) label: String,
+    pub(crate) last_seen_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TelegramCommandRouteKind {
+    NewThread,
+}
+
+impl TelegramCommandRouteKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NewThread => "new_thread",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "new_thread" => Some(Self::NewThread),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TelegramCallbackRoute {
+    pub(crate) callback_id: String,
+    pub(crate) chat_id: String,
+    pub(crate) message_id: Option<i64>,
+    pub(crate) thread_id: String,
+    pub(crate) action: TelegramCallbackAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TelegramCallbackAction {
+    Approve,
+    Deny,
+}
+
+impl TelegramCallbackAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "approve" => Some(Self::Approve),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OutboxDeliverySummary {
+    pub(crate) attempted: usize,
+    pub(crate) delivered: usize,
+    pub(crate) failed: usize,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryAction {
@@ -26,6 +202,171 @@ pub(crate) struct HistoryAction {
 pub(crate) struct ArchiveSelection {
     pub(crate) targets: Vec<String>,
     pub(crate) using_filter_selection: bool,
+}
+
+fn timestamp_to_millis(value: u64) -> u64 {
+    const UNIX_TIMESTAMP_MILLIS_THRESHOLD: u64 = 100_000_000_000;
+    if value < UNIX_TIMESTAMP_MILLIS_THRESHOLD {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
+}
+
+fn timestamp_age_seconds(now: u64, then: u64) -> u64 {
+    timestamp_to_millis(now).saturating_sub(timestamp_to_millis(then)) / 1000
+}
+
+fn compact_text_preview(input: Option<String>, limit: usize) -> Option<String> {
+    let text = input?.trim().replace(char::is_whitespace, " ");
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let count = normalized.chars().count();
+    if count <= limit {
+        return Some(normalized);
+    }
+    let truncated = normalized.chars().take(limit).collect::<String>();
+    Some(format!("{}…", truncated.trim_end()))
+}
+
+pub(crate) fn derive_thread_display_name(
+    name: Option<&str>,
+    project: Option<&str>,
+    question: Option<&str>,
+    thread_id: &str,
+) -> String {
+    if let Some(value) = name.map(str::trim).filter(|value| !value.is_empty()) {
+        return value.to_string();
+    }
+    if let Some(value) = question.map(str::trim).filter(|value| !value.is_empty()) {
+        return compact_text_preview(Some(value.to_string()), 80)
+            .unwrap_or_else(|| value.to_string());
+    }
+    if let Some(project) = project.filter(|value| !value.is_empty()) {
+        return format!("Untitled {project} thread");
+    }
+    let short_id = thread_id.chars().take(8).collect::<String>();
+    format!("Untitled thread {short_id}")
+}
+
+fn classify_attention(snapshot: &BridgeThreadSnapshot) -> (&'static str, &'static str) {
+    match snapshot
+        .pending_prompt
+        .as_ref()
+        .map(|prompt| prompt.kind.as_str())
+    {
+        Some("approval") => ("pending_approval", "prompt_kind"),
+        Some("reply") => ("needs_reply", "prompt_kind"),
+        _ if snapshot.last_turn_status.as_deref() == Some("completed") => {
+            ("completed", "last_turn_completed")
+        }
+        _ if snapshot.last_turn_status.as_deref() == Some("interrupted")
+            && snapshot
+                .last_preview
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false) =>
+        {
+            ("updated", "last_turn_interrupted")
+        }
+        _ => ("active", "fallback_active"),
+    }
+}
+
+fn classify_waiting_on(reason: &str) -> &'static str {
+    match reason {
+        "pending_approval" | "needs_reply" => "me",
+        "active" => "codex",
+        "updated" => "none",
+        _ => "none",
+    }
+}
+
+fn classify_suggested_action(reason: &str) -> &'static str {
+    match reason {
+        "pending_approval" => "approve",
+        "needs_reply" => "reply",
+        "completed" => "archive",
+        "updated" => "inspect",
+        _ => "inspect",
+    }
+}
+
+fn classify_priority(reason: &str) -> &'static str {
+    match reason {
+        "pending_approval" => "high",
+        "needs_reply" | "active" | "updated" => "medium",
+        _ => "low",
+    }
+}
+
+pub(crate) fn score_inbox_item(item: &InboxItem) -> u128 {
+    let priority_score = match item.priority.as_str() {
+        "high" => 300_u128,
+        "medium" => 200_u128,
+        _ => 100_u128,
+    };
+    priority_score * 1_000_000_000_000 + item.updated_at.unwrap_or(0) as u128
+}
+
+pub(crate) fn classify_inbox_item(snapshot: &BridgeThreadSnapshot, now: u64) -> InboxItem {
+    let (attention_reason, basis) = classify_attention(snapshot);
+    let project = derive_project_label(snapshot.cwd.as_deref());
+    let display_name = derive_thread_display_name(
+        snapshot.name.as_deref(),
+        project.as_deref(),
+        snapshot
+            .pending_prompt
+            .as_ref()
+            .and_then(|prompt| prompt.question.as_deref()),
+        &snapshot.thread_id,
+    );
+    InboxItem {
+        thread_id: snapshot.thread_id.clone(),
+        name: snapshot.name.clone(),
+        display_name: display_name.clone(),
+        project: project.clone(),
+        cwd: snapshot.cwd.clone(),
+        updated_at: snapshot.updated_at,
+        last_seen_at: None,
+        age_seconds: snapshot
+            .updated_at
+            .map(|updated| timestamp_age_seconds(now, updated)),
+        status_type: snapshot.status_type.clone(),
+        status_flags: snapshot.status_flags.clone(),
+        last_preview: compact_text_preview(snapshot.last_preview.clone(), 220),
+        prompt_kind: snapshot
+            .pending_prompt
+            .as_ref()
+            .map(|prompt| prompt.kind.clone()),
+        prompt_status: snapshot
+            .pending_prompt
+            .as_ref()
+            .map(|prompt| prompt.status.clone()),
+        question: compact_text_preview(
+            snapshot
+                .pending_prompt
+                .as_ref()
+                .and_then(|prompt| prompt.question.clone()),
+            160,
+        ),
+        basis: basis.to_string(),
+        attention_reason: attention_reason.to_string(),
+        waiting_on: classify_waiting_on(attention_reason).to_string(),
+        suggested_action: classify_suggested_action(attention_reason).to_string(),
+        priority: classify_priority(attention_reason).to_string(),
+        recent_action: None,
+        label: format!(
+            "{} · {}",
+            display_name,
+            project
+                .clone()
+                .or_else(|| snapshot.cwd.clone())
+                .unwrap_or_else(|| "unknown cwd".to_string())
+        ),
+    }
 }
 
 pub(crate) fn observed_workspaces_from_db(
@@ -56,15 +397,15 @@ pub(crate) fn observed_workspaces_from_db(
         .collect()
 }
 
-pub(crate) fn to_sql_i64(value: u64) -> Result<i64> {
+fn to_sql_i64(value: u64) -> Result<i64> {
     i64::try_from(value).context("timestamp out of range for sqlite i64")
 }
 
-pub(crate) fn from_sql_i64(value: i64) -> Result<u64> {
+fn from_sql_i64(value: i64) -> Result<u64> {
     u64::try_from(value).context("negative sqlite integer cannot be converted to u64")
 }
 
-pub(crate) fn optional_from_sql_i64(value: Option<i64>) -> Result<Option<u64>> {
+fn optional_from_sql_i64(value: Option<i64>) -> Result<Option<u64>> {
     value.map(from_sql_i64).transpose()
 }
 
@@ -195,7 +536,7 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -203,12 +544,7 @@ pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String
     Ok(columns)
 }
 
-pub(crate) fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let columns = table_columns(conn, table)?;
     if !columns.iter().any(|current| current == column) {
         conn.execute_batch(&format!(
@@ -1295,10 +1631,9 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        derive_pending_prompt, extract_telegram_callback_route,
-        extract_telegram_command_prompt_reply, extract_telegram_reply_route,
-        importable_projects_from_observed, set_away_mode, telegram_bot_id, TelegramCallbackAction,
-        TelegramConfig,
+        extract_telegram_callback_route, extract_telegram_command_prompt_reply,
+        extract_telegram_reply_route, importable_projects_from_observed, set_away_mode,
+        telegram_bot_id, TelegramConfig,
     };
 
     fn snapshot_fixture(
@@ -1313,6 +1648,29 @@ mod tests {
             .into_iter()
             .map(|value| value.to_string())
             .collect::<Vec<_>>();
+        let pending_prompt = if status_flags_vec
+            .iter()
+            .any(|flag| flag == "waitingOnApproval")
+        {
+            Some(PendingPrompt {
+                prompt_id: format!("approval:{thread_id}"),
+                kind: "approval".to_string(),
+                status: "Needs approval".to_string(),
+                question: Some(format!("preview for {thread_id}")),
+            })
+        } else if status_flags_vec
+            .iter()
+            .any(|flag| flag == "waitingOnUserInput" || flag == "waitingOnInput")
+        {
+            Some(PendingPrompt {
+                prompt_id: format!("reply:{thread_id}"),
+                kind: "reply".to_string(),
+                status: "Needs input".to_string(),
+                question: Some(format!("preview for {thread_id}")),
+            })
+        } else {
+            None
+        };
         BridgeThreadSnapshot {
             thread_id: thread_id.to_string(),
             name: None,
@@ -1322,11 +1680,7 @@ mod tests {
             status_flags: status_flags_vec.clone(),
             last_turn_status: last_turn_status.map(|value| value.to_string()),
             last_preview: Some(format!("preview for {thread_id}")),
-            pending_prompt: derive_pending_prompt(
-                thread_id,
-                &status_flags_vec,
-                Some(format!("preview for {thread_id}")),
-            ),
+            pending_prompt,
         }
     }
 
