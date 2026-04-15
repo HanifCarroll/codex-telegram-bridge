@@ -1630,11 +1630,11 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::json;
 
-    use crate::{
+    use crate::telegram::{
         extract_telegram_callback_route, extract_telegram_command_prompt_reply,
-        extract_telegram_reply_route, importable_projects_from_observed, set_away_mode,
-        telegram_bot_id, TelegramConfig,
+        extract_telegram_reply_route, telegram_bot_id,
     };
+    use crate::{importable_projects_from_observed, set_away_mode, TelegramConfig};
 
     fn snapshot_fixture(
         thread_id: &str,
