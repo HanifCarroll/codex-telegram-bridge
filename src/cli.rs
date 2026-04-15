@@ -397,6 +397,16 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_mcp_server_command() {
+        let parsed = Cli::try_parse_from(["codex-telegram-bridge", "mcp"]);
+        assert!(parsed.is_ok(), "mcp command should parse: {parsed:?}");
+
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Run a stdio MCP server for Hermes"));
+    }
+
+    #[test]
     fn cli_accepts_daemon_lifecycle_commands() {
         for args in [
             vec!["codex-telegram-bridge", "daemon", "run", "--once"],
@@ -419,6 +429,71 @@ mod tests {
                 "daemon command should parse: {args:?}: {parsed:?}"
             );
         }
+    }
+
+    #[test]
+    fn cli_accepts_ts_composed_follow_flags() {
+        let new_cli = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "new",
+            "--message",
+            "hello",
+            "--follow",
+            "--stream",
+            "--duration",
+            "500",
+            "--poll-interval",
+            "100",
+            "--events",
+            "follow_snapshot,item_completed",
+        ]);
+        assert!(
+            new_cli.is_ok(),
+            "new should accept TS follow flags: {new_cli:?}"
+        );
+
+        let reply_cli = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "reply",
+            "thr_1",
+            "--message",
+            "ok",
+            "--follow",
+            "--duration",
+            "500",
+            "--events",
+            "item_completed",
+        ]);
+        assert!(
+            reply_cli.is_ok(),
+            "reply should accept TS follow flags: {reply_cli:?}"
+        );
+
+        let approve_cli = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "approve",
+            "thr_1",
+            "approve",
+            "--follow",
+            "--stream",
+        ]);
+        assert!(
+            approve_cli.is_ok(),
+            "approve should accept positional decision and follow flags: {approve_cli:?}"
+        );
+
+        let fork_cli = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "fork",
+            "thr_1",
+            "--message",
+            "try again",
+            "--follow",
+        ]);
+        assert!(
+            fork_cli.is_ok(),
+            "fork should accept TS follow flags: {fork_cli:?}"
+        );
     }
 
     #[test]
@@ -454,6 +529,45 @@ mod tests {
     }
 
     #[test]
+    fn cli_rejects_legacy_hermes_notification_flags() {
+        let parsed = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "hermes",
+            "install",
+            "--hermes-command",
+            "hermes-se",
+            "--webhook-deliver",
+            "telegram",
+            "--webhook-deliver-chat-id",
+            "12345",
+            "--webhook-secret",
+            "test-secret",
+            "--dry-run",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "Hermes install should stay MCP-only; Telegram setup owns notifications"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_legacy_hermes_post_webhook_command() {
+        let parsed = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "hermes",
+            "post-webhook",
+            "--url",
+            "http://localhost:8644/webhooks/codex-watch",
+            "--secret",
+            "test-secret",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "hermes post-webhook should not be part of the product surface"
+        );
+    }
+
+    #[test]
     fn cli_accepts_product_setup_command() {
         let parsed = Cli::try_parse_from([
             "codex-telegram-bridge",
@@ -469,6 +583,43 @@ mod tests {
             "--dry-run",
         ]);
         assert!(parsed.is_ok(), "setup command should parse: {parsed:?}");
+    }
+
+    #[test]
+    fn cli_rejects_experimental_realtime_flag_for_stable_surface() {
+        let parsed = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "follow",
+            "thr_1",
+            "--experimental-realtime",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "experimental realtime should not be part of the stable v0.1 CLI"
+        );
+    }
+
+    #[test]
+    fn cli_accepts_ts_archive_filter_flags() {
+        let cli = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "archive",
+            "--thread-id",
+            "thr_1,thr_2",
+            "--project",
+            "bridge",
+            "--status",
+            "active",
+            "--attention",
+            "completed",
+            "--limit",
+            "5",
+            "--dry-run",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "archive should accept TS filter flags: {cli:?}"
+        );
     }
 
     #[test]
