@@ -1842,6 +1842,14 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           created_at INTEGER NOT NULL,
           used_at INTEGER
         );
+        CREATE TABLE IF NOT EXISTS telegram_command_routes (
+          chat_id TEXT NOT NULL,
+          message_id INTEGER NOT NULL,
+          command TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          used_at INTEGER,
+          PRIMARY KEY(chat_id, message_id)
+        );
         CREATE TABLE IF NOT EXISTS transport_delivery_log (
           event_id TEXT NOT NULL,
           transport TEXT NOT NULL,
@@ -3833,6 +3841,47 @@ struct PreparedTelegramDelivery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramInboundCommand {
+    Start,
+    Help,
+    AwayOn,
+    AwayOff,
+    Status,
+    NewThread(Option<String>),
+    Inbox,
+    Waiting,
+    Recent,
+    Settings,
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramCommandRouteKind {
+    NewThread,
+}
+
+impl TelegramCommandRouteKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NewThread => "new_thread",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "new_thread" => Some(Self::NewThread),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedTelegramCommandPromptReply {
+    kind: TelegramCommandRouteKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TelegramCallbackRoute {
     callback_id: String,
     chat_id: String,
@@ -4094,6 +4143,17 @@ fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
         events: events.to_string(),
         telegram: Some(paired.clone()),
     };
+    let commands = telegram_bot_commands();
+    let commands_registration = if options.dry_run {
+        json!({ "registered": false, "dryRun": true, "commands": commands })
+    } else {
+        json!({
+            "registered": true,
+            "commands": commands,
+            "response": telegram_set_my_commands(&paired, Duration::from_secs(10))
+                .context("failed to register Telegram slash commands")?
+        })
+    };
 
     let config_path = if options.dry_run {
         daemon_config_path()?
@@ -4111,12 +4171,13 @@ fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
             "botToken": "<redacted>",
             "chatId": paired.chat_id,
             "allowedUserId": paired.allowed_user_id,
-            "pairing": if options.chat_id.is_some() { Value::Null } else { pair_hint }
+            "pairing": if options.chat_id.is_some() { Value::Null } else { pair_hint },
+            "commands": commands_registration
         },
         "config": redacted_daemon_config(&config),
         "daemonCommand": daemon_run_command(bridge_command),
         "daemonInstallCommand": format!("{} daemon install --bridge-command {}", shell_quote(bridge_command), shell_quote(bridge_command)),
-        "nextStep": "Install and start the daemon. Codex updates will go directly to Telegram, and Telegram replies to those messages will route back to the originating Codex thread."
+        "nextStep": "Install and start the daemon. Codex updates will go directly to Telegram, Telegram replies route back to the originating thread, and slash commands control away mode or start new threads."
     }))
 }
 
@@ -4273,6 +4334,53 @@ fn telegram_send_message(
     telegram_api_post(&telegram.bot_token, "sendMessage", payload, timeout)
 }
 
+fn telegram_send_text(telegram: &TelegramConfig, text: &str, timeout: Duration) -> Result<Value> {
+    telegram_send_message(
+        telegram,
+        &json!({
+            "chat_id": telegram.chat_id.as_str(),
+            "text": text,
+            "disable_web_page_preview": true
+        }),
+        timeout,
+    )
+}
+
+fn telegram_send_text_message_id(
+    telegram: &TelegramConfig,
+    text: &str,
+    timeout: Duration,
+) -> Result<i64> {
+    telegram_send_text(telegram, text, timeout)?
+        .pointer("/result/message_id")
+        .and_then(Value::as_i64)
+        .context("Telegram sendMessage response missing result.message_id")
+}
+
+fn telegram_bot_commands() -> Vec<Value> {
+    vec![
+        json!({ "command": "start", "description": "Pair and show remote control help" }),
+        json!({ "command": "help", "description": "Show Telegram remote control commands" }),
+        json!({ "command": "away_on", "description": "Enable away mode notifications" }),
+        json!({ "command": "away_off", "description": "Disable away mode notifications" }),
+        json!({ "command": "status", "description": "Show away mode and pending delivery status" }),
+        json!({ "command": "new_thread", "description": "Start a new Codex thread from Telegram" }),
+        json!({ "command": "inbox", "description": "Show actionable Codex inbox rows" }),
+        json!({ "command": "waiting", "description": "Show threads waiting for you" }),
+        json!({ "command": "recent", "description": "Show recent Codex threads" }),
+        json!({ "command": "settings", "description": "Show current Telegram bridge settings" }),
+    ]
+}
+
+fn telegram_set_my_commands(telegram: &TelegramConfig, timeout: Duration) -> Result<Value> {
+    telegram_api_post(
+        &telegram.bot_token,
+        "setMyCommands",
+        &json!({ "commands": telegram_bot_commands() }),
+        timeout,
+    )
+}
+
 fn telegram_answer_callback_query(
     telegram: &TelegramConfig,
     callback_query_id: &str,
@@ -4372,16 +4480,83 @@ fn telegram_authorized(
     }
 }
 
-const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
-const TELEGRAM_REPLY_HINT: &str =
-    "💬 Reply to this Telegram message to send text back to the Codex thread.";
+fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let raw_command = parts.next().unwrap_or_default();
+    let rest = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let command = raw_command
+        .split_once('@')
+        .map(|(name, _)| name)
+        .unwrap_or(raw_command)
+        .to_ascii_lowercase();
+    match command.as_str() {
+        "/start" => Some(TelegramInboundCommand::Start),
+        "/help" => Some(TelegramInboundCommand::Help),
+        "/away_on" => Some(TelegramInboundCommand::AwayOn),
+        "/away_off" => Some(TelegramInboundCommand::AwayOff),
+        "/status" => Some(TelegramInboundCommand::Status),
+        "/new_thread" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
+        "/inbox" => Some(TelegramInboundCommand::Inbox),
+        "/waiting" => Some(TelegramInboundCommand::Waiting),
+        "/recent" => Some(TelegramInboundCommand::Recent),
+        "/settings" => Some(TelegramInboundCommand::Settings),
+        _ => Some(TelegramInboundCommand::Unknown(raw_command.to_string())),
+    }
+}
 
-fn telegram_event_title(event_type: &str) -> &'static str {
+fn extract_telegram_command(
+    message: &Value,
+    telegram: &TelegramConfig,
+) -> Result<Option<TelegramInboundCommand>> {
+    let chat_id = telegram_chat_id(message);
+    let user_id = telegram_from_user_id(message);
+    if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
+        return Ok(None);
+    }
+    if message.get("reply_to_message").is_some() {
+        return Ok(None);
+    }
+    Ok(message
+        .get("text")
+        .and_then(Value::as_str)
+        .and_then(parse_telegram_command_text))
+}
+
+const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+const TELEGRAM_CONTINUE_THREAD_HINT: &str =
+    "💬 To continue this thread, use Telegram's Reply action on this message.";
+const TELEGRAM_ANSWER_THREAD_HINT: &str =
+    "💬 To answer Codex, use Telegram's Reply action on this message.";
+const TELEGRAM_APPROVAL_HINT: &str =
+    "Use the buttons below, or use Telegram's Reply action on this message.";
+
+fn telegram_event_title(event_type: &str, event: &Value) -> &'static str {
+    if telegram_event_is_approval(event) {
+        return "🔐 Codex needs approval";
+    }
     match event_type {
         "thread_waiting" => "🟡 Codex needs you",
         "thread_completed" => "✅ Codex finished",
         "thread_status_changed" => "🔄 Codex changed",
         _ => "🧵 Codex update",
+    }
+}
+
+fn telegram_event_reply_hint(event_type: &str, event: &Value) -> &'static str {
+    if telegram_event_is_approval(event) {
+        TELEGRAM_APPROVAL_HINT
+    } else {
+        match event_type {
+            "thread_waiting" => TELEGRAM_ANSWER_THREAD_HINT,
+            _ => TELEGRAM_CONTINUE_THREAD_HINT,
+        }
     }
 }
 
@@ -4459,23 +4634,19 @@ fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTel
     let event_id = notification_event_id(event);
     let thread_id = event_thread_id(event);
     let mut lines = vec![
-        telegram_event_title(event_type).to_string(),
+        telegram_event_title(event_type, event).to_string(),
         format!("🧵 {}", telegram_event_display_name(event)),
     ];
     if let Some(project) = event.pointer("/thread/project").and_then(Value::as_str) {
         lines.push(format!("📁 {project}"));
     }
-    if let Some(thread_id) = thread_id.as_deref() {
-        lines.push(format!("🆔 {thread_id}"));
-    }
     if let Some(detail) = telegram_event_detail(event) {
         lines.push(String::new());
-        lines.push("📝 Codex".to_string());
         lines.push(detail);
     }
     if thread_id.is_some() {
         lines.push(String::new());
-        lines.push(TELEGRAM_REPLY_HINT.to_string());
+        lines.push(telegram_event_reply_hint(event_type, event).to_string());
     }
 
     let mut payloads = split_telegram_text(&lines.join("\n"), TELEGRAM_MESSAGE_CHAR_LIMIT)
@@ -4561,6 +4732,26 @@ fn insert_telegram_callback_route(
     Ok(())
 }
 
+fn insert_telegram_command_route(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+    kind: TelegramCommandRouteKind,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO telegram_command_routes(chat_id, message_id, command, created_at, used_at)
+         VALUES (?1, ?2, ?3, ?4, NULL)",
+        params![
+            chat_id,
+            message_id,
+            kind.as_str(),
+            to_sql_i64(now)?
+        ],
+    )?;
+    Ok(())
+}
+
 fn update_telegram_callback_message_id(
     conn: &Connection,
     callback_id: &str,
@@ -4585,6 +4776,37 @@ fn lookup_telegram_message_route(
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn lookup_telegram_command_route(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+) -> Result<Option<TelegramCommandRouteKind>> {
+    let command = conn
+        .query_row(
+            "SELECT command FROM telegram_command_routes
+             WHERE chat_id = ?1 AND message_id = ?2 AND used_at IS NULL",
+            params![chat_id, message_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(command
+        .as_deref()
+        .and_then(TelegramCommandRouteKind::from_str))
+}
+
+fn mark_telegram_command_route_used(
+    conn: &Connection,
+    chat_id: &str,
+    message_id: i64,
+    now: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE telegram_command_routes SET used_at = ?3 WHERE chat_id = ?1 AND message_id = ?2",
+        params![chat_id, message_id, to_sql_i64(now)?],
+    )?;
+    Ok(())
 }
 
 fn extract_telegram_reply_route(
@@ -4618,6 +4840,42 @@ fn extract_telegram_reply_route(
     Ok(thread_id.map(|thread_id| RoutedTelegramReply {
         thread_id,
         message: text.to_string(),
+    }))
+}
+
+fn extract_telegram_command_prompt_reply(
+    conn: &Connection,
+    message: &Value,
+    telegram: &TelegramConfig,
+) -> Result<Option<RoutedTelegramCommandPromptReply>> {
+    let chat_id = telegram_chat_id(message);
+    let user_id = telegram_from_user_id(message);
+    if !telegram_authorized(telegram, chat_id.as_deref(), user_id.as_deref()) {
+        return Ok(None);
+    }
+    let Some(chat_id) = chat_id else {
+        return Ok(None);
+    };
+    let Some(reply_message_id) = message
+        .get("reply_to_message")
+        .and_then(telegram_message_id)
+    else {
+        return Ok(None);
+    };
+    let Some(message_text) = message
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(kind) = lookup_telegram_command_route(conn, &chat_id, reply_message_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(RoutedTelegramCommandPromptReply {
+        kind,
+        message: message_text.to_string(),
     }))
 }
 
@@ -4821,6 +5079,339 @@ fn send_codex_approval_to_thread(
     }))
 }
 
+fn telegram_help_text() -> String {
+    [
+        "Codex remote is ready.",
+        "",
+        "Use Telegram's Reply action on a Codex notification to continue that exact thread.",
+        "",
+        "/away_on - turn on away notifications",
+        "/away_off - turn off away notifications",
+        "/status - show bridge status",
+        "/new_thread <prompt> - start a new Codex thread",
+        "/new_thread - ask for a prompt in a reply",
+        "/inbox - show actionable threads",
+        "/waiting - show threads waiting for you",
+        "/recent - show recent threads",
+        "/settings - show Telegram bridge settings",
+    ]
+    .join("\n")
+}
+
+fn telegram_format_item_line(index: usize, title: &str, detail: Option<&str>) -> String {
+    match detail.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(detail) => format!(
+            "{}. {} - {}",
+            index + 1,
+            title,
+            trim_for_telegram_line(detail, 120)
+        ),
+        None => format!("{}. {}", index + 1, title),
+    }
+}
+
+fn trim_for_telegram_line(value: &str, max_chars: usize) -> String {
+    let mut trimmed = value.trim().replace('\n', " ");
+    if trimmed.chars().count() <= max_chars {
+        return trimmed;
+    }
+    trimmed = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    trimmed.push_str("...");
+    trimmed
+}
+
+fn telegram_status_text(conn: &Connection) -> Result<String> {
+    let away = get_away_mode(conn)?;
+    let pending = pending_outbound_count(conn)?;
+    let waiting = list_waiting_from_db(conn, None, 5)?;
+    let away_label = if away["away"].as_bool() == Some(true) {
+        "on"
+    } else {
+        "off"
+    };
+    Ok(format!(
+        "Codex remote status\n\nAway mode: {away_label}\nPending Telegram notifications: {pending}\nThreads waiting for you: {}\n\nUse /away_on or /away_off to change away mode.",
+        waiting.summary.count
+    ))
+}
+
+fn telegram_settings_text(telegram: &TelegramConfig, conn: &Connection) -> Result<String> {
+    let away = get_away_mode(conn)?;
+    let allowed_user = telegram
+        .allowed_user_id
+        .as_deref()
+        .unwrap_or("any user in this chat");
+    let away_label = if away["away"].as_bool() == Some(true) {
+        "on"
+    } else {
+        "off"
+    };
+    Ok(format!(
+        "Telegram bridge settings\n\nChat: connected\nAllowed user: {allowed_user}\nAway mode: {away_label}\n\nNotifications keep Codex's final answer verbatim. To continue a thread, use Telegram's Reply action on that specific notification."
+    ))
+}
+
+fn telegram_waiting_text(conn: &Connection) -> Result<String> {
+    let waiting = list_waiting_from_db(conn, None, 5)?;
+    if waiting.threads.is_empty() {
+        return Ok("No Codex threads are waiting for you.".to_string());
+    }
+    let mut lines = vec!["Threads waiting for you:".to_string(), String::new()];
+    for (index, thread) in waiting.threads.iter().enumerate() {
+        lines.push(telegram_format_item_line(
+            index,
+            &thread.display_name,
+            thread
+                .prompt
+                .question
+                .as_deref()
+                .or(thread.last_preview.as_deref()),
+        ));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Use Telegram's Reply action on the matching Codex notification to answer that thread."
+            .to_string(),
+    );
+    Ok(lines.join("\n"))
+}
+
+fn telegram_inbox_text(conn: &Connection, now: u64) -> Result<String> {
+    let inbox = list_inbox_from_db(conn, now, None, None, None, None, 5)?;
+    if inbox.items.is_empty() {
+        return Ok("Your Codex inbox is empty.".to_string());
+    }
+    let mut lines = vec![
+        format!(
+            "Codex inbox: {} item{} need attention.",
+            inbox.summary.needs_attention,
+            if inbox.summary.needs_attention == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+        String::new(),
+    ];
+    for (index, item) in inbox.items.iter().enumerate() {
+        let detail = format!("{} - {}", item.waiting_on, item.suggested_action);
+        lines.push(telegram_format_item_line(
+            index,
+            &item.display_name,
+            Some(&detail),
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Use /waiting for reply-only items, or reply to a Codex notification to continue that thread.".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn telegram_recent_text(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT thread_id, name, cwd, updated_at, last_preview
+         FROM threads_cache
+         ORDER BY COALESCE(updated_at, 0) DESC
+         LIMIT 5",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok("No recent Codex threads are cached yet.".to_string());
+    }
+    let mut lines = vec!["Recent Codex threads:".to_string(), String::new()];
+    for (index, (thread_id, name, cwd, _, last_preview)) in rows.iter().enumerate() {
+        let project = derive_project_label(cwd.as_deref());
+        let display_name = derive_thread_display_name(
+            name.as_deref(),
+            project.as_deref(),
+            last_preview.as_deref(),
+            thread_id,
+        );
+        lines.push(telegram_format_item_line(
+            index,
+            &display_name,
+            last_preview.as_deref(),
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn start_new_thread_from_telegram(conn: &Connection, message: &str, now: u64) -> Result<Value> {
+    let mut client = CodexAppServerClient::connect()?;
+    let created = client.request("thread/start", thread_start_params(None))?;
+    let thread_id = thread_id_from_response(&created)
+        .context("Codex app-server thread/start response missing thread.id")?;
+    let started = client.request("turn/start", turn_start_params(&thread_id, None, message))?;
+    let result = new_thread_live_result(None, Some(message), created, Some(started));
+    record_action(
+        conn,
+        &thread_id,
+        "telegram_new_thread",
+        json!({
+            "message": message,
+            "result": result.clone(),
+            "sentAt": now
+        }),
+        now,
+    )?;
+    Ok(result)
+}
+
+fn send_new_thread_confirmation(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    result: &Value,
+    timeout: Duration,
+    now: u64,
+) -> Result<Value> {
+    let thread_id = result
+        .get("threadId")
+        .and_then(Value::as_str)
+        .context("new thread result missing threadId")?;
+    let text = "Started a new Codex thread.\n\nUse Telegram's Reply action on this message to continue it.";
+    let message_id = telegram_send_text_message_id(telegram, text, timeout)?;
+    insert_telegram_message_route(
+        conn,
+        &telegram.chat_id,
+        message_id,
+        thread_id,
+        &format!("telegram_new_thread:{thread_id}"),
+        now,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_new_thread_confirmation",
+        "threadId": thread_id,
+        "messageId": message_id
+    }))
+}
+
+fn execute_telegram_command(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    command: TelegramInboundCommand,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    match command {
+        TelegramInboundCommand::Start | TelegramInboundCommand::Help => {
+            let sent = telegram_send_text(telegram, &telegram_help_text(), timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_help", "sent": sent }))
+        }
+        TelegramInboundCommand::AwayOn => {
+            let state = set_away_mode(conn, true, now)?;
+            let sent = telegram_send_text(
+                telegram,
+                "Away mode is on. Codex final answers will be forwarded here.",
+                timeout,
+            )?;
+            Ok(json!({ "ok": true, "action": "telegram_away_on", "state": state, "sent": sent }))
+        }
+        TelegramInboundCommand::AwayOff => {
+            let state = set_away_mode(conn, false, now)?;
+            let cleared = state
+                .get("clearedPendingNotifications")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let sent = telegram_send_text(
+                telegram,
+                &format!("Away mode is off. Cleared {cleared} pending notification(s)."),
+                timeout,
+            )?;
+            Ok(json!({ "ok": true, "action": "telegram_away_off", "state": state, "sent": sent }))
+        }
+        TelegramInboundCommand::Status => {
+            let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
+        }
+        TelegramInboundCommand::NewThread(Some(prompt)) => {
+            let result = start_new_thread_from_telegram(conn, &prompt, now)?;
+            let confirmation = send_new_thread_confirmation(conn, telegram, &result, timeout, now)?;
+            Ok(
+                json!({ "ok": true, "action": "telegram_new_thread", "result": result, "confirmation": confirmation }),
+            )
+        }
+        TelegramInboundCommand::NewThread(None) => {
+            let text = "What should Codex work on?\n\nUse Telegram's Reply action on this message with the prompt for the new thread.";
+            let message_id = telegram_send_text_message_id(telegram, text, timeout)?;
+            insert_telegram_command_route(
+                conn,
+                &telegram.chat_id,
+                message_id,
+                TelegramCommandRouteKind::NewThread,
+                now,
+            )?;
+            Ok(
+                json!({ "ok": true, "action": "telegram_new_thread_prompt", "messageId": message_id }),
+            )
+        }
+        TelegramInboundCommand::Inbox => {
+            let sent = telegram_send_text(telegram, &telegram_inbox_text(conn, now)?, timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_inbox", "sent": sent }))
+        }
+        TelegramInboundCommand::Waiting => {
+            let sent = telegram_send_text(telegram, &telegram_waiting_text(conn)?, timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_waiting", "sent": sent }))
+        }
+        TelegramInboundCommand::Recent => {
+            let sent = telegram_send_text(telegram, &telegram_recent_text(conn)?, timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_recent", "sent": sent }))
+        }
+        TelegramInboundCommand::Settings => {
+            let sent =
+                telegram_send_text(telegram, &telegram_settings_text(telegram, conn)?, timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_settings", "sent": sent }))
+        }
+        TelegramInboundCommand::Unknown(command) => {
+            let sent = telegram_send_text(
+                telegram,
+                &format!("I don't know {command} yet.\n\n{}", telegram_help_text()),
+                timeout,
+            )?;
+            Ok(
+                json!({ "ok": true, "action": "telegram_unknown_command", "command": command, "sent": sent }),
+            )
+        }
+    }
+}
+
+fn execute_telegram_command_prompt_reply(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    message: &Value,
+    route: RoutedTelegramCommandPromptReply,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let chat_id =
+        telegram_chat_id(message).context("Telegram command prompt reply missing chat.id")?;
+    let reply_message_id = message
+        .get("reply_to_message")
+        .and_then(telegram_message_id)
+        .context("Telegram command prompt reply missing reply_to_message.message_id")?;
+    match route.kind {
+        TelegramCommandRouteKind::NewThread => {
+            let result = start_new_thread_from_telegram(conn, &route.message, now)?;
+            mark_telegram_command_route_used(conn, &chat_id, reply_message_id, now)?;
+            let confirmation = send_new_thread_confirmation(conn, telegram, &result, timeout, now)?;
+            Ok(json!({
+                "ok": true,
+                "action": "telegram_new_thread_prompt_reply",
+                "result": result,
+                "confirmation": confirmation
+            }))
+        }
+    }
+}
+
 fn process_telegram_updates(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -4834,6 +5425,8 @@ fn process_telegram_updates(
     let updates = telegram_updates_array(&updates)?;
     let mut seen = 0usize;
     let mut replies = 0usize;
+    let mut command_prompt_replies = 0usize;
+    let mut commands = 0usize;
     let mut callbacks = 0usize;
     let mut duplicate = 0usize;
     let mut ignored = 0usize;
@@ -4850,30 +5443,62 @@ fn process_telegram_updates(
             }
         }
         if let Some(message) = update.get("message") {
-            match extract_telegram_reply_route(conn, message, telegram)? {
-                Some(route) => {
-                    let result =
-                        send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
-                    if let Some(update_id) = update_id {
-                        record_telegram_inbound_processed(
-                            conn, &bot_id, update_id, "message", &result, now,
-                        )?;
-                    }
-                    replies += 1;
+            if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
+                let result =
+                    send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
+                if let Some(update_id) = update_id {
+                    record_telegram_inbound_processed(
+                        conn,
+                        &bot_id,
+                        update_id,
+                        "telegram_reply",
+                        &result,
+                        now,
+                    )?;
                 }
-                None => {
-                    if let Some(update_id) = update_id {
-                        record_telegram_inbound_processed(
-                            conn,
-                            &bot_id,
-                            update_id,
-                            "message_ignored",
-                            &json!({ "ignored": true }),
-                            now,
-                        )?;
-                    }
-                    ignored += 1;
+                replies += 1;
+            } else if let Some(route) =
+                extract_telegram_command_prompt_reply(conn, message, telegram)?
+            {
+                let result = execute_telegram_command_prompt_reply(
+                    conn, telegram, message, route, now, timeout,
+                )?;
+                if let Some(update_id) = update_id {
+                    record_telegram_inbound_processed(
+                        conn,
+                        &bot_id,
+                        update_id,
+                        "telegram_command_prompt_reply",
+                        &result,
+                        now,
+                    )?;
                 }
+                command_prompt_replies += 1;
+            } else if let Some(command) = extract_telegram_command(message, telegram)? {
+                let result = execute_telegram_command(conn, telegram, command, now, timeout)?;
+                if let Some(update_id) = update_id {
+                    record_telegram_inbound_processed(
+                        conn,
+                        &bot_id,
+                        update_id,
+                        "telegram_command",
+                        &result,
+                        now,
+                    )?;
+                }
+                commands += 1;
+            } else {
+                if let Some(update_id) = update_id {
+                    record_telegram_inbound_processed(
+                        conn,
+                        &bot_id,
+                        update_id,
+                        "message_ignored",
+                        &json!({ "ignored": true }),
+                        now,
+                    )?;
+                }
+                ignored += 1;
             }
         } else if let Some(callback_query) = update.get("callback_query") {
             match extract_telegram_callback_route(conn, callback_query, telegram)? {
@@ -4922,6 +5547,8 @@ fn process_telegram_updates(
         "transport": "telegram",
         "seen": seen,
         "replies": replies,
+        "commandPromptReplies": command_prompt_replies,
+        "commands": commands,
         "callbacks": callbacks,
         "duplicate": duplicate,
         "ignored": ignored
@@ -5196,13 +5823,25 @@ fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
         return Ok(());
     }
 
+    let telegram_commands = config.telegram.as_ref().map(|telegram| {
+        telegram_set_my_commands(telegram, timeout)
+            .map(|_| json!({ "registered": true }))
+            .unwrap_or_else(|error| {
+                json!({
+                    "registered": false,
+                    "error": format!("{error:#}")
+                })
+            })
+    });
+
     println!(
         "{}",
         serde_json::to_string(&json!({
             "ok": true,
             "action": "daemon_started",
             "configPath": daemon_config_path()?.display().to_string(),
-            "events": config.events
+            "events": config.events,
+            "telegramCommands": telegram_commands
         }))?
     );
     let watch_rx = start_codex_watch_receiver().ok();
@@ -7126,6 +7765,190 @@ mod tests {
         assert!(text.contains("🧵 Finish release notes"));
         assert!(text.contains("📁 codex-telegram-bridge"));
         assert!(text.contains(full_message));
+    }
+
+    #[test]
+    fn telegram_message_payload_uses_remote_codex_chrome_only() {
+        let full_message = "Done.\n\n::inbox-item{title=\"vault commands checked\" summary=\"No local Claude commands; LifeOS has four\"}";
+        let event = json!({
+            "type": "thread_completed",
+            "threadId": "019d8f82-c4f5-7c00-a3ea-b0f118d8f2d",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "LinkedIn Network",
+                "lastPreview": full_message
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+
+        assert!(text.starts_with("✅ Codex finished\n🧵 LinkedIn Network\n\n"));
+        assert!(text.contains(full_message));
+        assert!(text
+            .contains("💬 To continue this thread, use Telegram's Reply action on this message."));
+        assert!(!text.contains("🆔"));
+        assert!(!text.contains("019d8f82-c4f5-7c00-a3ea-b0f118d8f2d"));
+        assert!(!text.contains("📝 Codex"));
+    }
+
+    #[test]
+    fn telegram_approval_payload_uses_approval_title_and_button_footer() {
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_approval",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "Deploy",
+                "pendingPrompt": {
+                    "promptKind": "approval",
+                    "question": "Run `pnpm build`?"
+                }
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+
+        assert!(text.starts_with("🔐 Codex needs approval\n🧵 Deploy\n\n"));
+        assert!(text.contains("Run `pnpm build`?"));
+        assert!(
+            text.contains("Use the buttons below, or use Telegram's Reply action on this message.")
+        );
+        assert_eq!(
+            prepared.payloads[0]["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "✅ Approve"
+        );
+    }
+
+    #[test]
+    fn telegram_command_parser_supports_core_commands() {
+        assert_eq!(
+            parse_telegram_command_text("/away_on"),
+            Some(TelegramInboundCommand::AwayOn)
+        );
+        assert_eq!(
+            parse_telegram_command_text("/away_off@codex_bridge_bot"),
+            Some(TelegramInboundCommand::AwayOff)
+        );
+        assert_eq!(
+            parse_telegram_command_text("/new_thread Fix the formatter"),
+            Some(TelegramInboundCommand::NewThread(Some(
+                "Fix the formatter".to_string()
+            )))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/new_thread"),
+            Some(TelegramInboundCommand::NewThread(None))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/unknown"),
+            Some(TelegramInboundCommand::Unknown("/unknown".to_string()))
+        );
+    }
+
+    #[test]
+    fn telegram_command_extraction_requires_standalone_authorized_message() {
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+        };
+        let command = extract_telegram_command(
+            &json!({
+                "chat": { "id": 456 },
+                "from": { "id": 789 },
+                "text": "/status"
+            }),
+            &telegram,
+        )
+        .expect("extract command");
+        assert_eq!(command, Some(TelegramInboundCommand::Status));
+
+        let reply_command = extract_telegram_command(
+            &json!({
+                "chat": { "id": 456 },
+                "from": { "id": 789 },
+                "text": "/away_on",
+                "reply_to_message": { "message_id": 111 }
+            }),
+            &telegram,
+        )
+        .expect("extract reply command");
+        assert_eq!(reply_command, None);
+
+        let unauthorized = extract_telegram_command(
+            &json!({
+                "chat": { "id": 456 },
+                "from": { "id": 111 },
+                "text": "/status"
+            }),
+            &telegram,
+        )
+        .expect("extract unauthorized command");
+        assert_eq!(unauthorized, None);
+    }
+
+    #[test]
+    fn telegram_command_prompt_routes_map_reply_to_new_thread_prompt() {
+        let conn = create_state_db_in_memory().expect("db");
+        insert_telegram_command_route(&conn, "456", 222, TelegramCommandRouteKind::NewThread, 1000)
+            .expect("insert command route");
+
+        let route = extract_telegram_command_prompt_reply(
+            &conn,
+            &json!({
+                "chat": { "id": 456 },
+                "from": { "id": 789 },
+                "text": "Build the mobile proof report",
+                "reply_to_message": { "message_id": 222 }
+            }),
+            &TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            },
+        )
+        .expect("extract command prompt reply")
+        .expect("route");
+
+        assert_eq!(route.kind, TelegramCommandRouteKind::NewThread);
+        assert_eq!(route.message, "Build the mobile proof report");
+    }
+
+    #[test]
+    fn telegram_bot_commands_are_registered_for_core_remote_actions() {
+        let commands = telegram_bot_commands();
+        let names = commands
+            .iter()
+            .filter_map(|command| command.get("command").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "start",
+                "help",
+                "away_on",
+                "away_off",
+                "status",
+                "new_thread",
+                "inbox",
+                "waiting",
+                "recent",
+                "settings"
+            ]
+        );
+        for command in commands {
+            assert!(
+                command["command"].as_str().expect("command").len() <= 32,
+                "Telegram command names must fit BotCommand limits"
+            );
+            assert!(!command["description"]
+                .as_str()
+                .expect("description")
+                .is_empty());
+        }
     }
 
     #[test]

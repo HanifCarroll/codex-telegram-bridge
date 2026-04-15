@@ -9,6 +9,7 @@ The intended behavior:
 - `away off` disables outbound Telegram notifications
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - approval messages include `Approve` and `Deny` buttons
+- slash commands can toggle away mode, inspect state, and start new Codex threads from Telegram
 
 Hermes can still control Codex through MCP when you ask it to, but Hermes and MCP do not own Telegram delivery.
 
@@ -54,6 +55,8 @@ codex-telegram-bridge telegram setup \
 
 `telegram setup` clears any existing Telegram webhook for that bot token because the daemon uses local long polling for replies and button callbacks.
 
+Setup also registers the bot command menu with Telegram. The daemon re-registers the same command menu on startup as a best-effort repair path.
+
 ## Test Delivery
 
 ```bash
@@ -93,6 +96,52 @@ Inbound Telegram replies and button callbacks are processed whenever the daemon 
 When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, and calls the local Codex thread reply flow.
 
 For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
+
+## Notification Format
+
+Bridge notifications are designed to feel like Codex is speaking directly in Telegram:
+
+```text
+✅ Codex finished
+🧵 Thread name
+
+<Codex final answer verbatim>
+
+💬 To continue this thread, use Telegram's Reply action on this message.
+```
+
+Thread ids are intentionally hidden. The bridge still stores the Telegram message id to Codex thread id route locally, so replying to the specific Telegram message is enough.
+
+Approval messages use a compact approval header and a button-aware footer:
+
+```text
+🔐 Codex needs approval
+🧵 Thread name
+
+<approval prompt verbatim>
+
+Use the buttons below, or use Telegram's Reply action on this message.
+```
+
+Codex app directives such as `::inbox-item{...}` are not stripped or summarized. They are part of the Codex answer body, so Telegram receives the same final answer that appears in the Codex app.
+
+## Slash Commands
+
+The bridge accepts these standalone Telegram commands from the paired chat and allowed user:
+
+- `/start`: pair during setup, or show help after setup
+- `/help`: show command help
+- `/away_on`: enable away mode notifications
+- `/away_off`: disable away mode notifications and clear pending outbound notifications
+- `/status`: show away mode, pending delivery count, and waiting thread count
+- `/new_thread <prompt>`: create a new Codex thread and send the prompt immediately
+- `/new_thread`: ask for a prompt; use Telegram's Reply action on the prompt message to create the thread
+- `/inbox`: show actionable cached Codex inbox rows
+- `/waiting`: show cached threads waiting for user input or approval
+- `/recent`: show recent cached Codex threads
+- `/settings`: show current Telegram bridge settings
+
+Commands only run as standalone messages. If a message is a Telegram reply to a Codex notification, the text is sent back to that Codex thread verbatim, even if it starts with `/`.
 
 ## Token Ownership
 
