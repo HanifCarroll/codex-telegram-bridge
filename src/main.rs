@@ -4577,7 +4577,7 @@ fn telegram_event_detail(event: &Value) -> Option<String> {
         .or_else(|| event.pointer("/thread/lastPreview").and_then(Value::as_str))
         .or_else(|| event.get("lastPreview").and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
+        .map(sanitize_telegram_detail)
 }
 
 fn telegram_event_is_approval(event: &Value) -> bool {
@@ -4624,6 +4624,47 @@ fn split_telegram_text(text: &str, max_chars: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+fn sanitize_telegram_detail(detail: &str) -> String {
+    let mut sanitized = String::with_capacity(detail.len());
+    let mut rest = detail;
+    while let Some(start) = rest.find('[') {
+        let (before, candidate_start) = rest.split_at(start);
+        sanitized.push_str(before);
+        let Some(end_offset) = candidate_start.find(']') else {
+            sanitized.push_str(candidate_start);
+            return sanitized;
+        };
+        let candidate = &candidate_start[1..end_offset];
+        if let Some(replacement) = compact_telegram_file_reference(candidate) {
+            sanitized.push_str(&replacement);
+            rest = &candidate_start[end_offset + 1..];
+        } else {
+            sanitized.push('[');
+            rest = &candidate_start[1..];
+        }
+    }
+    sanitized.push_str(rest);
+    sanitized
+}
+
+fn compact_telegram_file_reference(candidate: &str) -> Option<String> {
+    let normalized = candidate
+        .strip_prefix("F:")
+        .or_else(|| candidate.strip_prefix("f:"))
+        .unwrap_or(candidate);
+    if !normalized.starts_with('/') {
+        return None;
+    }
+    let (path, line_ref) = normalized.split_once('†').unwrap_or((normalized, ""));
+    let file_name = Path::new(path).file_name()?.to_string_lossy();
+    let line_ref = line_ref.trim();
+    if line_ref.is_empty() {
+        Some(file_name.into_owned())
+    } else {
+        Some(format!("{file_name} {line_ref}"))
+    }
 }
 
 fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTelegramDelivery> {
@@ -5265,6 +5306,16 @@ fn start_new_thread_from_telegram(conn: &Connection, message: &str, now: u64) ->
     Ok(result)
 }
 
+fn telegram_new_thread_confirmation_text(result: &Value) -> Result<String> {
+    let cwd = result.get("cwd").and_then(Value::as_str);
+    Ok(match cwd {
+        Some(cwd) if !cwd.trim().is_empty() => format!(
+            "Started a new Codex thread in:\n{cwd}\n\nUse Telegram's Reply action on this message to continue it."
+        ),
+        _ => "Started a new Codex thread with no explicit working directory.\n\nUse Telegram's Reply action on this message to continue it.".to_string(),
+    })
+}
+
 fn send_new_thread_confirmation(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -5276,8 +5327,8 @@ fn send_new_thread_confirmation(
         .get("threadId")
         .and_then(Value::as_str)
         .context("new thread result missing threadId")?;
-    let text = "Started a new Codex thread.\n\nUse Telegram's Reply action on this message to continue it.";
-    let message_id = telegram_send_text_message_id(telegram, text, timeout)?;
+    let text = telegram_new_thread_confirmation_text(result)?;
+    let message_id = telegram_send_text_message_id(telegram, &text, timeout)?;
     insert_telegram_message_route(
         conn,
         &telegram.chat_id,
@@ -7793,6 +7844,26 @@ mod tests {
     }
 
     #[test]
+    fn telegram_message_payload_shortens_app_file_reference_tokens() {
+        let event = json!({
+            "type": "thread_completed",
+            "threadId": "thr_file_refs",
+            "updatedAt": 42,
+            "thread": {
+                "displayName": "UI Experiment",
+                "lastPreview": "Updated [F:/Users/hanifcarroll/projects/ui-experiment/README.md†L1-L24] and [F:/Users/hanifcarroll/projects/ui-experiment/src/styles.css†L70-L229]."
+            }
+        });
+
+        let prepared = prepare_telegram_delivery("999", &event).expect("prepared telegram event");
+        let text = prepared.payloads[0]["text"].as_str().expect("text");
+
+        assert!(text.contains("README.md L1-L24"));
+        assert!(text.contains("styles.css L70-L229"));
+        assert!(!text.contains("[F:/Users/hanifcarroll/projects/ui-experiment/"));
+    }
+
+    #[test]
     fn telegram_approval_payload_uses_approval_title_and_button_footer() {
         let event = json!({
             "type": "thread_waiting",
@@ -9696,5 +9767,17 @@ raise SystemExit(1)
                 Some(format!("preview for {thread_id}")),
             ),
         }
+    }
+
+    #[test]
+    fn telegram_new_thread_confirmation_reports_working_directory() {
+        let message = telegram_new_thread_confirmation_text(&json!({
+            "threadId": "thr_new",
+            "cwd": "/Users/hanifcarroll/projects/ui-experiment"
+        }))
+        .expect("message");
+
+        assert!(message.contains("/Users/hanifcarroll/projects/ui-experiment"));
+        assert!(message.contains("Use Telegram's Reply action on this message to continue it."));
     }
 }

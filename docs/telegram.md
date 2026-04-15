@@ -112,6 +112,8 @@ Bridge notifications are designed to feel like Codex is speaking directly in Tel
 
 Thread ids are intentionally hidden. The bridge still stores the Telegram message id to Codex thread id route locally, so replying to the specific Telegram message is enough.
 
+App-only file reference tokens such as `[F:/.../README.md†L1-L24]` are compacted before delivery so Telegram sees readable refs like `README.md L1-L24` instead of raw app link payloads.
+
 Approval messages use a compact approval header and a button-aware footer:
 
 ```text
@@ -142,6 +144,8 @@ The bridge accepts these standalone Telegram commands from the paired chat and a
 - `/settings`: show current Telegram bridge settings
 
 Commands only run as standalone messages. If a message is a Telegram reply to a Codex notification, the text is sent back to that Codex thread verbatim, even if it starts with `/`.
+
+When `/new_thread` succeeds, the confirmation message now includes the working directory returned by Codex, if the app server assigned one. The bridge itself currently does not set an explicit cwd for Telegram-created threads; it calls `thread/start` without a cwd and reports back what Codex returned.
 
 ## Token Ownership
 
