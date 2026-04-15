@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use notify::Watcher as _;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -15,11 +15,23 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod cli;
+mod config;
+mod projects;
 
 use crate::cli::{
     AwayCommands, Cli, Commands, DaemonCommands, HermesCommands, ProjectCommands, TelegramCommands,
 };
+use crate::projects::{
+    build_registered_project, canonicalize_project_cwd, derive_project_label,
+    ensure_unique_project_id, resolve_new_thread_request, resolve_project_query,
+    slugify_project_token,
+};
 use clap::Parser;
+pub(crate) use config::{
+    load_daemon_config, merged_daemon_config, read_daemon_config_raw, redacted_daemon_config,
+    resolve_telegram_bot_token, write_daemon_config, DaemonConfig, RegisteredProject, SetupOptions,
+    TelegramConfig, TelegramSetupOptions,
+};
 
 #[derive(Serialize)]
 struct ErrorEnvelope {
@@ -1026,155 +1038,6 @@ fn compact_text_preview(input: Option<String>, limit: usize) -> Option<String> {
     }
     let truncated = normalized.chars().take(limit).collect::<String>();
     Some(format!("{}…", truncated.trim_end()))
-}
-
-fn derive_project_label(cwd: Option<&str>) -> Option<String> {
-    let cwd = cwd?;
-    Path::new(cwd)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn slugify_project_token(value: &str) -> Option<String> {
-    let mut slug = String::new();
-    let mut last_was_sep = false;
-    for ch in value.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            last_was_sep = false;
-        } else if matches!(ch, '-' | '_' | ' ' | '.') && !last_was_sep {
-            slug.push('-');
-            last_was_sep = true;
-        }
-    }
-    let slug = slug.trim_matches('-').to_string();
-    (!slug.is_empty()).then_some(slug)
-}
-
-fn normalize_project_aliases(aliases: &[String]) -> Vec<String> {
-    let mut normalized = Vec::new();
-    let mut seen = BTreeSet::new();
-    for alias in aliases {
-        if let Some(alias) = slugify_project_token(alias) {
-            if seen.insert(alias.clone()) {
-                normalized.push(alias);
-            }
-        }
-    }
-    normalized
-}
-
-fn ensure_unique_project_id(base: &str, existing_ids: &BTreeSet<String>) -> String {
-    if !existing_ids.contains(base) {
-        return base.to_string();
-    }
-    let mut index = 2_u64;
-    loop {
-        let candidate = format!("{base}-{index}");
-        if !existing_ids.contains(&candidate) {
-            return candidate;
-        }
-        index += 1;
-    }
-}
-
-fn canonicalize_project_cwd(cwd: &str) -> Result<String> {
-    let path = PathBuf::from(cwd.trim());
-    if path.as_os_str().is_empty() {
-        bail!("project cwd cannot be empty");
-    }
-    if !path.is_absolute() {
-        bail!("project cwd must be an absolute path");
-    }
-    match fs::canonicalize(&path) {
-        Ok(resolved) => Ok(resolved.display().to_string()),
-        Err(_) => Ok(path.display().to_string()),
-    }
-}
-
-fn build_registered_project(
-    cwd: &str,
-    id: Option<&str>,
-    label: Option<&str>,
-    aliases: &[String],
-    existing_projects: &[RegisteredProject],
-) -> Result<RegisteredProject> {
-    let cwd = canonicalize_project_cwd(cwd)?;
-    let label = label
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| derive_project_label(Some(&cwd)))
-        .context("could not derive project label from cwd; pass --label")?;
-    let requested_id = id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| slugify_project_token(&label))
-        .context("could not derive project id from label; pass --id")?;
-    let normalized_id = slugify_project_token(&requested_id)
-        .context("project id must contain letters or digits")?;
-    if existing_projects
-        .iter()
-        .any(|project| project.id == normalized_id && project.cwd != cwd)
-    {
-        bail!("project id `{normalized_id}` is already in use");
-    }
-    let aliases = normalize_project_aliases(aliases)
-        .into_iter()
-        .filter(|alias| alias != &normalized_id)
-        .collect::<Vec<_>>();
-    Ok(RegisteredProject {
-        id: normalized_id,
-        label,
-        cwd,
-        aliases,
-    })
-}
-
-fn resolve_project_query<'a>(
-    projects: &'a [RegisteredProject],
-    query: &str,
-) -> Result<&'a RegisteredProject> {
-    let query = query.trim();
-    if query.is_empty() {
-        bail!("project query cannot be empty");
-    }
-    let normalized = query.to_ascii_lowercase();
-    let exact = projects
-        .iter()
-        .filter(|project| {
-            project.id.eq_ignore_ascii_case(&normalized)
-                || project
-                    .aliases
-                    .iter()
-                    .any(|alias| alias.eq_ignore_ascii_case(&normalized))
-                || project.label.eq_ignore_ascii_case(query)
-        })
-        .collect::<Vec<_>>();
-    if exact.len() == 1 {
-        return Ok(exact[0]);
-    }
-    if exact.len() > 1 {
-        bail!("project query `{query}` is ambiguous");
-    }
-    let prefix = projects
-        .iter()
-        .filter(|project| {
-            project.id.starts_with(&normalized)
-                || project
-                    .aliases
-                    .iter()
-                    .any(|alias| alias.starts_with(&normalized))
-                || project.label.to_ascii_lowercase().starts_with(&normalized)
-        })
-        .collect::<Vec<_>>();
-    match prefix.as_slice() {
-        [project] => Ok(*project),
-        [] => bail!("project `{query}` was not found"),
-        _ => bail!("project query `{query}` is ambiguous"),
-    }
 }
 
 fn observed_workspaces_from_db(conn: &Connection, limit: u64) -> Result<Vec<ObservedWorkspace>> {
@@ -3716,70 +3579,11 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
         .collect())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct DaemonConfig {
-    version: u32,
-    bridge_command: String,
-    events: String,
-    #[serde(default)]
-    telegram: Option<TelegramConfig>,
-    #[serde(default)]
-    projects: Vec<RegisteredProject>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct TelegramConfig {
-    bot_token: String,
-    chat_id: String,
-    #[serde(default)]
-    allowed_user_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct RegisteredProject {
-    id: String,
-    label: String,
-    cwd: String,
-    #[serde(default)]
-    aliases: Vec<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedWorkspace {
     cwd: String,
     label: String,
     last_seen_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TelegramSetupOptions<'a> {
-    bot_token: Option<&'a str>,
-    chat_id: Option<&'a str>,
-    allowed_user_id: Option<&'a str>,
-    events: &'a str,
-    bridge_command: &'a str,
-    dry_run: bool,
-    pair_timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SetupOptions<'a> {
-    bot_token: Option<&'a str>,
-    chat_id: Option<&'a str>,
-    allowed_user_id: Option<&'a str>,
-    events: &'a str,
-    bridge_command: &'a str,
-    daemon_label: &'a str,
-    install_daemon: bool,
-    start_daemon: bool,
-    register_hermes: bool,
-    hermes_server_name: &'a str,
-    hermes_command: &'a str,
-    dry_run: bool,
-    pair_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3887,106 +3691,12 @@ struct OutboxDeliverySummary {
     failed: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedNewThreadRequest<'a> {
-    project: &'a RegisteredProject,
-    prompt: Option<String>,
-}
-
-fn daemon_config_path() -> Result<PathBuf> {
-    Ok(state_dir_path()?.join("config.json"))
-}
-
-fn merged_daemon_config(
-    existing: Option<&DaemonConfig>,
-    bridge_command: &str,
-    events: &str,
-    telegram: TelegramConfig,
-) -> DaemonConfig {
-    DaemonConfig {
-        version: 3,
-        bridge_command: bridge_command.to_string(),
-        events: events.to_string(),
-        telegram: Some(telegram),
-        projects: existing
-            .map(|config| config.projects.clone())
-            .unwrap_or_default(),
-    }
-}
-
-fn write_daemon_config(config: &DaemonConfig) -> Result<PathBuf> {
-    let path = daemon_config_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, serde_json::to_vec_pretty(config)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(path)
-}
-
-fn load_daemon_config() -> Result<DaemonConfig> {
-    let path = daemon_config_path()?;
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("daemon config not found at {}", path.display()))?;
-    let config: DaemonConfig = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse daemon config at {}", path.display()))?;
-    if config.events.trim().is_empty() {
-        bail!("daemon config events cannot be empty");
-    }
-    match config.telegram.as_ref() {
-        Some(telegram) => {
-            if telegram.bot_token.trim().is_empty() {
-                bail!("daemon config telegram.botToken cannot be empty");
-            }
-            if telegram.chat_id.trim().is_empty() {
-                bail!("daemon config telegram.chatId cannot be empty");
-            }
-        }
-        None => bail!("daemon config must include Telegram transport. Run `codex-telegram-bridge setup` or `codex-telegram-bridge telegram setup`."),
-    }
-    for project in &config.projects {
-        if project.id.trim().is_empty() {
-            bail!("daemon config project id cannot be empty");
-        }
-        if project.label.trim().is_empty() {
-            bail!("daemon config project label cannot be empty");
-        }
-        if project.cwd.trim().is_empty() {
-            bail!("daemon config project cwd cannot be empty");
-        }
-    }
-    Ok(config)
-}
-
-fn redacted_daemon_config(config: &DaemonConfig) -> Value {
-    json!({
-        "version": config.version,
-        "bridgeCommand": config.bridge_command,
-        "events": config.events,
-        "telegram": config.telegram.as_ref().map(|telegram| json!({
-            "botToken": "<redacted>",
-            "chatId": telegram.chat_id,
-            "allowedUserId": telegram.allowed_user_id
-        })),
-        "projects": config.projects.iter().map(|project| json!({
-            "id": project.id,
-            "label": project.label,
-            "cwd": project.cwd,
-            "aliases": project.aliases
-        })).collect::<Vec<_>>()
-    })
-}
-
 fn daemon_run_command(bridge_command: &str) -> String {
     format!("{} daemon run", shell_quote(bridge_command))
 }
 
 fn doctor_bridge() -> Result<DoctorBridge> {
-    let config_path = daemon_config_path()?;
+    let config_path = state_dir_path()?.join("config.json");
     let config = read_daemon_config_raw()?;
     let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-telegram-bridge")?;
     Ok(DoctorBridge {
@@ -3999,34 +3709,6 @@ fn doctor_bridge() -> Result<DoctorBridge> {
         daemon_service_path: service.service_path.display().to_string(),
         daemon_service_exists: service.service_path.exists(),
     })
-}
-
-fn read_daemon_config_raw() -> Result<Option<DaemonConfig>> {
-    let path = daemon_config_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read daemon config at {}", path.display()))?;
-    let config: DaemonConfig = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse daemon config at {}", path.display()))?;
-    Ok(Some(config))
-}
-
-fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<String> {
-    explicit
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            env::var("TELEGRAM_BOT_TOKEN")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .context(
-            "Telegram bot token is required. Pass --bot-token or set TELEGRAM_BOT_TOKEN after creating a bot with @BotFather.",
-        )
 }
 
 fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
@@ -4145,7 +3827,7 @@ fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
     };
 
     let config_path = if options.dry_run {
-        daemon_config_path()?
+        state_dir_path()?.join("config.json")
     } else {
         write_daemon_config(&config)?
     };
@@ -4175,7 +3857,7 @@ fn telegram_status_result() -> Result<Value> {
     Ok(json!({
         "ok": true,
         "action": "telegram_status",
-        "configPath": daemon_config_path()?.display().to_string(),
+        "configPath": state_dir_path()?.join("config.json").display().to_string(),
         "configured": config.as_ref().and_then(|config| config.telegram.as_ref()).is_some(),
         "config": config.as_ref().map(redacted_daemon_config)
     }))
@@ -4212,7 +3894,7 @@ fn telegram_test_result(message: &str, timeout: Duration, dry_run: bool) -> Resu
 }
 
 fn telegram_disable_result(dry_run: bool) -> Result<Value> {
-    let path = daemon_config_path()?;
+    let path = state_dir_path()?.join("config.json");
     let config = read_daemon_config_raw()?;
     let had_telegram = config
         .as_ref()
@@ -5236,42 +4918,6 @@ fn current_project_for_identity<'a>(
         return Ok(config.projects.first());
     }
     Ok(None)
-}
-
-fn resolve_new_thread_request<'a>(
-    projects: &'a [RegisteredProject],
-    current_project: Option<&'a RegisteredProject>,
-    raw_prompt: Option<&str>,
-) -> Result<ResolvedNewThreadRequest<'a>> {
-    let prompt = raw_prompt
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let (project, prompt) = match prompt {
-        Some(prompt) => {
-            if let Some((project_query, rest)) = prompt.split_once(':') {
-                let project_query = project_query.trim();
-                let rest = rest.trim();
-                if !project_query.is_empty() {
-                    if let Ok(project) = resolve_project_query(projects, project_query) {
-                        return Ok(ResolvedNewThreadRequest {
-                            project,
-                            prompt: (!rest.is_empty()).then_some(rest.to_string()),
-                        });
-                    }
-                }
-            }
-            match current_project.or_else(|| (projects.len() == 1).then_some(&projects[0])) {
-                Some(project) => (project, Some(prompt)),
-                None => bail!("No current project selected. Use /project <id> first."),
-            }
-        }
-        None => match current_project.or_else(|| (projects.len() == 1).then_some(&projects[0])) {
-            Some(project) => (project, None),
-            None => bail!("No current project selected. Use /project <id> first."),
-        },
-    };
-    Ok(ResolvedNewThreadRequest { project, prompt })
 }
 
 fn telegram_projects_text(
@@ -6341,7 +5987,7 @@ fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
         serde_json::to_string(&json!({
             "ok": true,
             "action": "daemon_started",
-            "configPath": daemon_config_path()?.display().to_string(),
+            "configPath": state_dir_path()?.join("config.json").display().to_string(),
             "events": config.events,
             "telegramCommands": telegram_commands
         }))?
@@ -6614,7 +6260,7 @@ fn stop_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
 
 fn daemon_service_status(label: &str) -> Result<Value> {
     let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
-    let config_path = daemon_config_path()?;
+    let config_path = state_dir_path()?.join("config.json");
     Ok(json!({
         "ok": true,
         "action": "daemon_status",
@@ -9999,104 +9645,6 @@ raise SystemExit(1)
 
         assert!(message.contains("/Users/hanifcarroll/projects/ui-experiment"));
         assert!(message.contains("Use Telegram's Reply action on this message to continue it."));
-    }
-
-    #[test]
-    fn merged_daemon_config_preserves_existing_projects() {
-        let merged = merged_daemon_config(
-            Some(&DaemonConfig {
-                version: 2,
-                bridge_command: "old-bridge".to_string(),
-                events: "thread_waiting".to_string(),
-                telegram: Some(TelegramConfig {
-                    bot_token: "old".to_string(),
-                    chat_id: "old-chat".to_string(),
-                    allowed_user_id: None,
-                }),
-                projects: vec![RegisteredProject {
-                    id: "bridge".to_string(),
-                    label: "Codex Telegram Bridge".to_string(),
-                    cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
-                    aliases: vec!["codex".to_string()],
-                }],
-            }),
-            "codex-telegram-bridge",
-            DEFAULT_NOTIFICATION_EVENTS,
-            TelegramConfig {
-                bot_token: "123:secret".to_string(),
-                chat_id: "456".to_string(),
-                allowed_user_id: Some("789".to_string()),
-            },
-        );
-
-        assert_eq!(merged.version, 3);
-        assert_eq!(merged.projects.len(), 1);
-        assert_eq!(merged.projects[0].id, "bridge");
-        assert_eq!(merged.telegram.as_ref().unwrap().chat_id, "456");
-    }
-
-    #[test]
-    fn project_query_matches_id_alias_and_label() {
-        let projects = vec![
-            RegisteredProject {
-                id: "bridge".to_string(),
-                label: "Codex Telegram Bridge".to_string(),
-                cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
-                aliases: vec!["codex".to_string(), "telegram-bridge".to_string()],
-            },
-            RegisteredProject {
-                id: "ui-exp".to_string(),
-                label: "UI Experiment".to_string(),
-                cwd: "/Users/hanifcarroll/projects/ui-experiment".to_string(),
-                aliases: vec!["ui".to_string()],
-            },
-        ];
-
-        assert_eq!(
-            resolve_project_query(&projects, "bridge").expect("id").id,
-            "bridge"
-        );
-        assert_eq!(
-            resolve_project_query(&projects, "codex").expect("alias").id,
-            "bridge"
-        );
-        assert_eq!(
-            resolve_project_query(&projects, "UI Experiment")
-                .expect("label")
-                .id,
-            "ui-exp"
-        );
-    }
-
-    #[test]
-    fn new_thread_request_uses_current_project_and_override() {
-        let projects = vec![
-            RegisteredProject {
-                id: "bridge".to_string(),
-                label: "Codex Telegram Bridge".to_string(),
-                cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
-                aliases: vec!["codex".to_string()],
-            },
-            RegisteredProject {
-                id: "ui-exp".to_string(),
-                label: "UI Experiment".to_string(),
-                cwd: "/Users/hanifcarroll/projects/ui-experiment".to_string(),
-                aliases: vec!["ui".to_string()],
-            },
-        ];
-
-        let current = resolve_project_query(&projects, "bridge").expect("current");
-        let defaulted =
-            resolve_new_thread_request(&projects, Some(current), Some("Fix Telegram UX"))
-                .expect("default request");
-        assert_eq!(defaulted.project.id, "bridge");
-        assert_eq!(defaulted.prompt.as_deref(), Some("Fix Telegram UX"));
-
-        let overridden =
-            resolve_new_thread_request(&projects, Some(current), Some("ui: tighten hero spacing"))
-                .expect("override request");
-        assert_eq!(overridden.project.id, "ui-exp");
-        assert_eq!(overridden.prompt.as_deref(), Some("tighten hero spacing"));
     }
 
     #[test]
