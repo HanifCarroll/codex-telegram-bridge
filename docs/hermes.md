@@ -1,8 +1,10 @@
-# Hermes MCP Setup
+# Optional Hermes MCP Adapter
 
-Hermes is the optional agent control plane for `codex-hermes-bridge`.
+Hermes is an optional local agent adapter for `codex-hermes-bridge`.
 
-Use Hermes when you want to ask an agent to inspect Codex work, reply to a thread, or approve a waiting prompt. Use the bridge daemon plus Telegram for proactive notifications and remote reply routing.
+Use Hermes when you want to ask an agent to inspect Codex work, reply to a thread, or approve a waiting prompt. Use `codex-hermes-bridge setup`, the bridge daemon, and Telegram for proactive notifications and remote reply routing.
+
+MCP is not required for the core product loop. It does not send Telegram messages, install or run the daemon, process Telegram replies, or expose the event stream.
 
 For Telegram setup, see [telegram.md](telegram.md).
 
@@ -93,7 +95,7 @@ Hermes tool names are usually prefixed by the MCP server name. With server name 
 - `mcp_codex_codex_reply`
 - `mcp_codex_codex_approve`
 
-## Tool Surface
+## Bounded Tool Surface
 
 The MCP server exposes these bridge tools:
 
@@ -105,7 +107,7 @@ The MCP server exposes these bridge tools:
 - `codex_reply`: resume and reply to a thread.
 - `codex_approve`: send `YES` or `NO` for an approval prompt.
 
-`watch`, `new`, `fork`, `archive`, `unarchive`, and `away` are not exposed as default MCP tools. The MCP lane stays bounded and action-focused; proactive notification belongs in the daemon and Telegram transport.
+`setup`, `daemon`, `telegram`, `watch`, `follow`, `sync`, `new`, `fork`, `archive`, `unarchive`, and `away` are not exposed as MCP tools. The MCP lane stays bounded and action-focused; proactive notification belongs in the daemon and Telegram transport.
 
 ## Resources
 
@@ -140,6 +142,6 @@ When the user asks about Codex work, use the Codex MCP tools first. Check codex_
 
 - This is a local trust boundary. Do not expose `codex-hermes-bridge mcp` on a remote transport.
 - MCP tools can read thread content and perform local Codex actions.
-- Telegram notifications and reply routing are configured with `codex-hermes-bridge setup`, not through Hermes.
+- Telegram notifications and reply routing are configured with `codex-hermes-bridge setup`, not through Hermes or MCP.
 - Keep `sampling.enabled: false` unless you have a specific reason to let this server request model sampling from the client.
 - Use `dryRun: true` for reply and approve checks when you want Hermes to show the action shape before mutating Codex.

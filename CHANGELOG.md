@@ -19,4 +19,5 @@ Initial OSS release candidate.
 - Add a `hermes install` helper that registers the bridge through `hermes mcp add`.
 - Prune legacy away-summary and hidden MCP control paths so the daemon and documented MCP tools are the only notification/control lanes.
 - Hide advanced local sync, event-stream, and maintenance commands from default CLI help while keeping them available for automation.
+- Reframe MCP as an optional local agent adapter while keeping Telegram away-mode as the primary product flow.
 - Keep hook examples generic and leave Telegram delivery to the bridge daemon.

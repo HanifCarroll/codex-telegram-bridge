@@ -10,7 +10,7 @@ The intended behavior:
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - approval messages include `Approve` and `Deny` buttons
 
-Hermes can still control Codex through MCP, but Hermes does not need to own Telegram delivery.
+Hermes can still control Codex through MCP when you ask it to, but Hermes and MCP do not own Telegram delivery.
 
 ## Install
 

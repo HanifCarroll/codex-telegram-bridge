@@ -9,9 +9,9 @@ The product rule is simple:
 - replying directly to a bridge-sent Telegram message sends that reply back to the originating Codex thread
 - `away off` stops outbound Telegram notifications again
 
-Hermes is optional. It uses the local MCP server when you ask Hermes to inspect, reply to, or approve Codex work. Hermes does not own Telegram notification delivery.
+Hermes is optional. It uses the local MCP server when you ask an agent to inspect, reply to, or approve Codex work. Hermes and MCP do not own Telegram notification delivery.
 
-## Stable Public Surface
+## Core Product Surface
 
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
@@ -19,9 +19,14 @@ Hermes is optional. It uses the local MCP server when you ask Hermes to inspect,
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
 - Thread inspection: `threads`, `show`, `waiting`, `inbox`
 - Thread actions: `reply`, `approve`
-- Local Hermes MCP: `mcp`, `hermes install`
 
 Advanced commands such as `sync`, `follow`, `watch`, `new`, `fork`, `archive`, `unarchive`, and `watch --exec` remain available for local automation and maintenance, but they are hidden from default help and are not the recommended OSS onboarding path.
+
+## Optional Agent Adapter
+
+MCP is an optional local adapter for Hermes and other trusted agent clients. It exposes only `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve` through `codex-hermes-bridge mcp`.
+
+MCP does not send proactive notifications, install the daemon, configure Telegram, read Telegram updates, or expose the advanced event stream. Use `setup`, `away`, and the daemon for the Telegram product flow.
 
 ## Install
 
@@ -92,7 +97,7 @@ Turn them off when you are back:
 codex-hermes-bridge away off
 ```
 
-If you want Hermes to control Codex when you ask it directly:
+Optional: if you want Hermes to control Codex when you ask it directly:
 
 ```bash
 codex-hermes-bridge hermes install --dry-run
@@ -203,7 +208,7 @@ codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
 
 `watch --exec` is for trusted local automation. It pipes each event to the command on stdin.
 
-### Hermes MCP
+### Optional Hermes MCP
 
 ```bash
 codex-hermes-bridge mcp

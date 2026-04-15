@@ -7225,6 +7225,11 @@ mod tests {
         }
         for hidden in [
             "codex_watch",
+            "codex_follow",
+            "codex_sync",
+            "codex_setup",
+            "codex_daemon",
+            "codex_telegram",
             "codex_new",
             "codex_fork",
             "codex_archive",
@@ -7314,6 +7319,12 @@ mod tests {
             "codex_unarchive",
             "codex_away",
             "codex_notify_away",
+            "codex_watch",
+            "codex_follow",
+            "codex_sync",
+            "codex_setup",
+            "codex_daemon",
+            "codex_telegram",
         ] {
             let response = mcp_handle_message(json!({
                 "jsonrpc": "2.0",
