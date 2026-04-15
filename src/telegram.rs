@@ -1161,6 +1161,46 @@ pub(crate) fn process_telegram_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::{daemon_config_path, write_daemon_config, DaemonConfig, TelegramConfig};
+
+    fn config_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ConfigBackup {
+        path: std::path::PathBuf,
+        contents: Option<Vec<u8>>,
+    }
+
+    impl ConfigBackup {
+        fn capture() -> anyhow::Result<Self> {
+            let path = daemon_config_path()?;
+            let contents = fs::read(&path).ok();
+            Ok(Self { path, contents })
+        }
+    }
+
+    impl Drop for ConfigBackup {
+        fn drop(&mut self) {
+            match &self.contents {
+                Some(contents) => {
+                    if let Some(parent) = self.path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(&self.path, contents);
+                }
+                None => {
+                    if self.path.exists() {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
@@ -1189,6 +1229,33 @@ mod tests {
                 .contains("123:secret"),
             "setup output must not leak Telegram bot token"
         );
+    }
+
+    #[test]
+    fn telegram_disable_dry_run_reports_config_removal_without_deleting_file() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _backup = ConfigBackup::capture().expect("capture config backup");
+        let path = write_daemon_config(&DaemonConfig {
+            version: 3,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            projects: Vec::new(),
+        })
+        .expect("write config");
+
+        let result = telegram_disable_result(true).expect("telegram disable dry run");
+
+        assert_eq!(result["action"], "telegram_disable");
+        assert_eq!(result["dryRun"], true);
+        assert_eq!(result["hadTelegram"], true);
+        assert_eq!(result["removedConfig"], true);
+        assert_eq!(result["configPath"], path.display().to_string());
+        assert!(path.exists(), "dry run should leave config in place");
     }
 
     #[test]

@@ -879,3 +879,308 @@ fn enum_property(description: &str, values: Vec<&str>) -> Value {
         "description": description
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn mcp_initialize_advertises_tools_capability() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "hermes-test", "version": "1.0.0" }
+            }
+        }))
+        .expect("initialize response");
+
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+        assert_eq!(
+            response["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["resources"]["listChanged"],
+            false
+        );
+        assert_eq!(
+            response["result"]["capabilities"]["prompts"]["listChanged"],
+            false
+        );
+        assert_eq!(
+            response["result"]["serverInfo"]["name"],
+            "codex-telegram-bridge"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_list_exposes_codex_control_surface_without_watch() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .expect("tools/list response");
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<BTreeSet<_>>();
+
+        for expected in [
+            "codex_doctor",
+            "codex_threads",
+            "codex_inbox",
+            "codex_waiting",
+            "codex_show",
+            "codex_reply",
+            "codex_approve",
+        ] {
+            assert!(names.contains(expected), "missing MCP tool {expected}");
+        }
+        for hidden in [
+            "codex_watch",
+            "codex_follow",
+            "codex_sync",
+            "codex_setup",
+            "codex_daemon",
+            "codex_telegram",
+            "codex_new",
+            "codex_fork",
+            "codex_archive",
+            "codex_unarchive",
+            "codex_away",
+            "codex_notify_away",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} should stay out of the default Hermes MCP surface"
+            );
+        }
+
+        let doctor = tools
+            .iter()
+            .find(|tool| tool["name"] == "codex_doctor")
+            .expect("doctor tool");
+        assert_eq!(doctor["annotations"]["readOnlyHint"], true);
+
+        let reply = tools
+            .iter()
+            .find(|tool| tool["name"] == "codex_reply")
+            .expect("reply tool");
+        assert_eq!(
+            reply["inputSchema"]["required"],
+            json!(["threadId", "message"])
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_returns_structured_dry_run_result() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "codex_reply",
+                "arguments": {
+                    "threadId": "thr_1",
+                    "message": "ship it",
+                    "dryRun": true
+                }
+            }
+        }))
+        .expect("tools/call response");
+
+        let result = &response["result"];
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["action"], "reply");
+        assert_eq!(result["structuredContent"]["dry_run"], true);
+        assert_eq!(result["structuredContent"]["thread_id"], "thr_1");
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"action\": \"reply\""));
+    }
+
+    #[test]
+    fn mcp_tool_errors_return_tool_result_errors() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "codex_reply",
+                "arguments": {
+                    "threadId": "thr_1",
+                    "dryRun": true
+                }
+            }
+        }))
+        .expect("tools/call response");
+
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("argument message is required"));
+    }
+
+    #[test]
+    fn mcp_rejects_unlisted_control_tools() {
+        for name in [
+            "codex_new",
+            "codex_fork",
+            "codex_archive",
+            "codex_unarchive",
+            "codex_away",
+            "codex_notify_away",
+            "codex_watch",
+            "codex_follow",
+            "codex_sync",
+            "codex_setup",
+            "codex_daemon",
+            "codex_telegram",
+        ] {
+            let response = mcp_handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": {}
+                }
+            }))
+            .expect("tools/call response");
+
+            assert_eq!(response["result"]["isError"], true);
+            assert!(response["result"]["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown MCP tool"));
+        }
+    }
+
+    #[test]
+    fn mcp_stdio_server_handles_handshake_discovery_and_dry_run_call() {
+        let input = [
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": MCP_PROTOCOL_VERSION }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "codex_approve",
+                    "arguments": {
+                        "threadId": "thr_2",
+                        "decision": "approve",
+                        "dryRun": true
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut output = Vec::new();
+
+        run_mcp_server(std::io::Cursor::new(input), &mut output).expect("stdio MCP run");
+
+        let lines = String::from_utf8(output)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("json line"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0]["result"]["capabilities"]["tools"]["listChanged"],
+            false
+        );
+        assert!(lines[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "codex_approve"));
+        assert_eq!(lines[2]["result"]["structuredContent"]["action"], "approve");
+        assert_eq!(lines[2]["result"]["structuredContent"]["sent_text"], "YES");
+    }
+
+    #[test]
+    fn mcp_resources_list_exposes_thread_context_resources() {
+        let response = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "resources/list",
+            "params": {}
+        }))
+        .expect("resources/list response");
+
+        let resources = response["result"]["resources"]
+            .as_array()
+            .expect("resources array");
+        assert!(resources
+            .iter()
+            .any(|resource| resource["uri"] == "codex://inbox"));
+        assert!(resources
+            .iter()
+            .any(|resource| resource["uri"] == "codex://waiting"));
+    }
+
+    #[test]
+    fn mcp_prompts_list_and_get_codex_reply_prompt() {
+        let list = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "prompts/list",
+            "params": {}
+        }))
+        .expect("prompts/list response");
+        assert!(list["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt["name"] == "codex_reply"));
+
+        let get = mcp_handle_message(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "prompts/get",
+            "params": {
+                "name": "codex_reply",
+                "arguments": {
+                    "threadId": "thr_1",
+                    "message": "Continue with tests."
+                }
+            }
+        }))
+        .expect("prompts/get response");
+        let text = get["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("prompt text");
+        assert!(text.contains("codex_reply"));
+        assert!(text.contains("thr_1"));
+        assert!(text.contains("Continue with tests."));
+    }
+}

@@ -484,3 +484,115 @@ fn xml_escape(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::set_away_mode;
+    use crate::state::{create_state_db_in_memory, pending_outbound_count};
+
+    #[test]
+    fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
+        let result =
+            install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/codex-telegram-bridge", true)
+                .expect("daemon install dry run");
+        let expected = std::env::current_dir()
+            .expect("cwd")
+            .join("bin/codex-telegram-bridge")
+            .display()
+            .to_string();
+        assert!(result["contents"]
+            .as_str()
+            .expect("service contents")
+            .contains(&expected));
+    }
+
+    #[test]
+    fn daemon_notification_policy_only_enqueues_events_while_away() {
+        let conn = create_state_db_in_memory().expect("db");
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 1500
+        });
+
+        let off_count =
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&event), 2000)
+                .expect("away off enqueue");
+        assert_eq!(
+            off_count, 0,
+            "daemon should stay quiet while user is present"
+        );
+
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let on_count =
+            enqueue_daemon_notification_events(&conn, &[event], 2000).expect("away on enqueue");
+        assert_eq!(on_count, 1, "daemon should notify while user is away");
+    }
+
+    #[test]
+    fn daemon_notification_policy_skips_events_before_away_started() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 2000).expect("away on");
+        let events = vec![
+            json!({
+                "type": "thread_waiting",
+                "threadId": "thr_old",
+                "updatedAt": 1500
+            }),
+            json!({
+                "type": "thread_waiting",
+                "threadId": "thr_new",
+                "updatedAt": 2500
+            }),
+        ];
+
+        let count = enqueue_daemon_notification_events(&conn, &events, 3000).expect("enqueue");
+
+        assert_eq!(count, 1);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+    }
+
+    #[test]
+    fn daemon_notification_policy_accepts_codex_second_timestamps() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1_776_219_288_240).expect("away on");
+        let events = vec![
+            json!({
+                "type": "thread_completed",
+                "threadId": "thr_old",
+                "updatedAt": 1_776_219_200
+            }),
+            json!({
+                "type": "thread_completed",
+                "threadId": "thr_new",
+                "updatedAt": 1_776_219_396
+            }),
+        ];
+
+        let count = enqueue_daemon_notification_events(&conn, &events, 1_776_219_397_000)
+            .expect("mixed timestamp enqueue");
+
+        assert_eq!(count, 1);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+    }
+
+    #[test]
+    fn away_off_clears_pending_daemon_notifications() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 1500
+        });
+        enqueue_daemon_notification_events(&conn, &[event], 2000).expect("enqueue");
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+
+        let disabled = set_away_mode(&conn, false, 2500).expect("away off");
+
+        assert_eq!(disabled["away"], false);
+        assert_eq!(disabled["clearedPendingNotifications"], 1);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
+    }
+}
