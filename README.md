@@ -17,12 +17,11 @@ Hermes is optional. It uses the local MCP server when you ask Hermes to inspect,
 - Presence gate: `away on`, `away off`, `away status`
 - Direct Telegram transport: `telegram setup/status/test/disable`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
-- Thread inspection: `threads`, `show`, `waiting`, `inbox`, `sync`
+- Thread inspection: `threads`, `show`, `waiting`, `inbox`
 - Thread actions: `reply`, `approve`
-- Follow and event streams: `follow`, `watch`
 - Local Hermes MCP: `mcp`, `hermes install`
 
-Lower-level commands such as `new`, `fork`, `archive`, `unarchive`, and `watch --exec` remain available for local automation and maintenance, but they are not the recommended OSS onboarding path.
+Advanced commands such as `sync`, `follow`, `watch`, `new`, `fork`, `archive`, `unarchive`, and `watch --exec` remain available for local automation and maintenance, but they are hidden from default help and are not the recommended OSS onboarding path.
 
 ## Install
 

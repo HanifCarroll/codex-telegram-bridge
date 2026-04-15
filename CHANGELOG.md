@@ -17,4 +17,6 @@ Initial OSS release candidate.
 - Expose a stdio MCP server for Hermes with structured Codex control tools.
 - Expose MCP resources and prompts for Codex thread context and safer Hermes workflows.
 - Add a `hermes install` helper that registers the bridge through `hermes mcp add`.
+- Prune legacy away-summary and hidden MCP control paths so the daemon and documented MCP tools are the only notification/control lanes.
+- Hide advanced local sync, event-stream, and maintenance commands from default CLI help while keeping them available for automation.
 - Keep hook examples generic and leave Telegram delivery to the bridge daemon.
