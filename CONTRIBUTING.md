@@ -17,12 +17,13 @@ Keep changes narrowly scoped. Prefer small, reviewable diffs over broad refactor
 ## Scope
 
 The current public surface is intentionally focused on:
+- product setup (`setup`)
 - thread inspection (`threads`, `show`, `waiting`, `inbox`, `sync`)
 - thread actions (`reply`, `approve`)
 - event streaming (`follow`, `watch`)
 - archive flows (`archive`, `unarchive`)
-- away-mode summaries (`away`, `notify-away`)
-- Hermes MCP and notification integration (`mcp`, `hermes install`, `hermes post-webhook`)
+- presence-gated Telegram notifications (`away`, `telegram setup/status/test/disable`, `daemon run/install/start/stop/status/logs`)
+- Hermes MCP integration (`mcp`, `hermes install`)
 
 If you want to add new commands or broaden the product surface, open an issue first.
 
@@ -43,4 +44,4 @@ Before opening a PR, make sure:
 - `cargo package --allow-dirty --target-dir target/package-check` verifies the release package
 - docs/examples still match the CLI surface
 - MCP tool schemas and Hermes setup docs still match the implemented tool surface
-- Hermes notification docs still describe a proactive `watch --exec` route, not a Hermes-initiated polling flow
+- Telegram notification docs still describe bridge-owned delivery gated by `away on/off`

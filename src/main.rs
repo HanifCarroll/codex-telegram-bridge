@@ -8,8 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -27,9 +26,38 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    #[command(about = "Configure Telegram delivery, daemon service, and optional Hermes MCP")]
+    Setup {
+        #[arg(long)]
+        bot_token: Option<String>,
+        #[arg(long)]
+        chat_id: Option<String>,
+        #[arg(long)]
+        allowed_user_id: Option<String>,
+        #[arg(long, default_value = DEFAULT_NOTIFICATION_EVENTS)]
+        events: String,
+        #[arg(long, default_value = "codex-hermes-bridge")]
+        bridge_command: String,
+        #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
+        daemon_label: String,
+        #[arg(long = "no-install-daemon", default_value_t = true, action = clap::ArgAction::SetFalse)]
+        install_daemon: bool,
+        #[arg(long = "no-start-daemon", default_value_t = true, action = clap::ArgAction::SetFalse)]
+        start_daemon: bool,
+        #[arg(long, default_value_t = false)]
+        register_hermes: bool,
+        #[arg(long, default_value = "codex")]
+        hermes_server_name: String,
+        #[arg(long, default_value = "hermes")]
+        hermes_command: String,
+        #[arg(long, default_value_t = 60_000)]
+        pair_timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     #[command(about = "Inspect Codex setup")]
     Doctor,
-    #[command(about = "Manage away-mode notification state")]
+    #[command(about = "Choose whether Codex may notify you remotely")]
     Away {
         #[command(subcommand)]
         command: AwayCommands,
@@ -86,7 +114,7 @@ enum Commands {
         #[arg(long)]
         events: Option<String>,
     },
-    #[command(about = "Run and manage the proactive Hermes notification daemon")]
+    #[command(about = "Run and manage the proactive Codex notification daemon")]
     Daemon {
         #[command(subcommand)]
         command: DaemonCommands,
@@ -96,7 +124,7 @@ enum Commands {
         #[command(subcommand)]
         command: TelegramCommands,
     },
-    #[command(about = "Emit away-mode notification summaries")]
+    #[command(hide = true, about = "Emit legacy away-mode notification summaries")]
     NotifyAway {
         #[arg(long = "no-completed", default_value_t = true, action = clap::ArgAction::SetFalse)]
         completed: bool,
@@ -223,7 +251,7 @@ enum AwayCommands {
 
 #[derive(Subcommand, Debug)]
 enum HermesCommands {
-    #[command(about = "Register this bridge with Hermes MCP and optional notification delivery")]
+    #[command(about = "Register this bridge with Hermes MCP")]
     Install {
         #[arg(long, default_value = "codex")]
         server_name: String,
@@ -231,33 +259,14 @@ enum HermesCommands {
         hermes_command: String,
         #[arg(long, default_value = "codex-hermes-bridge")]
         bridge_command: String,
-        #[arg(long, default_value = "codex-watch")]
-        webhook_name: String,
-        #[arg(long, default_value = DEFAULT_HERMES_WEBHOOK_EVENTS)]
-        webhook_events: String,
-        #[arg(long)]
-        webhook_deliver: Option<String>,
-        #[arg(long)]
-        webhook_deliver_chat_id: Option<String>,
-        #[arg(long)]
-        webhook_secret: Option<String>,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
-    },
-    #[command(about = "Post one watch event to a signed Hermes webhook")]
-    PostWebhook {
-        #[arg(long)]
-        url: String,
-        #[arg(long)]
-        secret: Option<String>,
-        #[arg(long, default_value_t = 10000)]
-        timeout_ms: u64,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum DaemonCommands {
-    #[command(about = "Run the proactive Hermes notification daemon")]
+    #[command(about = "Run the proactive Codex notification daemon")]
     Run {
         #[arg(long, default_value_t = false)]
         once: bool,
@@ -318,7 +327,7 @@ enum TelegramCommands {
         chat_id: Option<String>,
         #[arg(long)]
         allowed_user_id: Option<String>,
-        #[arg(long, default_value = DEFAULT_HERMES_WEBHOOK_EVENTS)]
+        #[arg(long, default_value = DEFAULT_NOTIFICATION_EVENTS)]
         events: String,
         #[arg(long, default_value = "codex-hermes-bridge")]
         bridge_command: String,
@@ -329,6 +338,15 @@ enum TelegramCommands {
     },
     #[command(about = "Show direct Telegram transport configuration")]
     Status,
+    #[command(about = "Send a test Telegram notification using the bridge config")]
+    Test {
+        #[arg(long, default_value = "Codex Telegram bridge test")]
+        message: String,
+        #[arg(long, default_value_t = 10000)]
+        timeout_ms: u64,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     #[command(about = "Remove direct Telegram transport configuration")]
     Disable {
         #[arg(long, default_value_t = false)]
@@ -353,6 +371,7 @@ struct ErrorBody {
 struct DoctorEnvelope {
     ok: bool,
     codex: DoctorCodex,
+    bridge: DoctorBridge,
 }
 
 #[derive(Serialize)]
@@ -360,6 +379,15 @@ struct DoctorCodex {
     resolved_path: String,
     source: String,
     version_stdout: String,
+}
+
+#[derive(Serialize)]
+struct DoctorBridge {
+    config_path: String,
+    config_exists: bool,
+    telegram_configured: bool,
+    daemon_service_path: String,
+    daemon_service_exists: bool,
 }
 
 #[derive(Serialize)]
@@ -524,6 +552,38 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Setup {
+            bot_token,
+            chat_id,
+            allowed_user_id,
+            events,
+            bridge_command,
+            daemon_label,
+            install_daemon,
+            start_daemon,
+            register_hermes,
+            hermes_server_name,
+            hermes_command,
+            pair_timeout_ms,
+            dry_run,
+        } => {
+            let result = setup_result(SetupOptions {
+                bot_token: bot_token.as_deref(),
+                chat_id: chat_id.as_deref(),
+                allowed_user_id: allowed_user_id.as_deref(),
+                events: &events,
+                bridge_command: &bridge_command,
+                daemon_label: &daemon_label,
+                install_daemon,
+                start_daemon,
+                register_hermes,
+                hermes_server_name: &hermes_server_name,
+                hermes_command: &hermes_command,
+                dry_run,
+                pair_timeout_ms,
+            })?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Commands::Doctor => {
             let resolved = resolve_codex_binary()?;
             let output = Command::new(&resolved.path)
@@ -545,6 +605,7 @@ fn run() -> Result<()> {
                     source: resolved.source.to_string(),
                     version_stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
                 },
+                bridge: doctor_bridge()?,
             };
             println!("{}", serde_json::to_string(&payload)?);
         }
@@ -783,6 +844,15 @@ fn run() -> Result<()> {
             }
             TelegramCommands::Status => {
                 let result = telegram_status_result()?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            TelegramCommands::Test {
+                message,
+                timeout_ms,
+                dry_run,
+            } => {
+                let result =
+                    telegram_test_result(&message, Duration::from_millis(timeout_ms), dry_run)?;
                 println!("{}", serde_json::to_string(&result)?);
             }
             TelegramCommands::Disable { dry_run } => {
@@ -1226,43 +1296,14 @@ fn run() -> Result<()> {
                 server_name,
                 hermes_command,
                 bridge_command,
-                webhook_name,
-                webhook_events,
-                webhook_deliver,
-                webhook_deliver_chat_id,
-                webhook_secret,
                 dry_run,
             } => {
                 let result = run_hermes_install(HermesInstallOptions {
                     server_name: &server_name,
                     hermes_command: &hermes_command,
                     bridge_command: &bridge_command,
-                    webhook_name: &webhook_name,
-                    webhook_events: &webhook_events,
-                    webhook_deliver: webhook_deliver.as_deref(),
-                    webhook_deliver_chat_id: webhook_deliver_chat_id.as_deref(),
-                    webhook_secret: webhook_secret.as_deref(),
                     dry_run,
                 })?;
-                println!("{}", serde_json::to_string(&result)?);
-            }
-            HermesCommands::PostWebhook {
-                url,
-                secret,
-                timeout_ms,
-            } => {
-                let mut input = String::new();
-                std::io::stdin().read_to_string(&mut input)?;
-                let event: Value = serde_json::from_str(input.trim())
-                    .context("failed to parse watch event JSON from stdin")?;
-                let secret = match secret {
-                    Some(secret) => secret,
-                    None => load_daemon_config()?
-                        .webhook_secret
-                        .context("daemon config does not contain a Hermes webhook secret")?,
-                };
-                let result =
-                    post_hermes_webhook(&url, &secret, &event, Duration::from_millis(timeout_ms))?;
                 println!("{}", serde_json::to_string(&result)?);
             }
         },
@@ -2952,6 +2993,7 @@ fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<Value> {
             "awaySessionId": now.to_string()
         }))
     } else {
+        let cleared_pending = clear_pending_outbound_events(conn)?;
         conn.execute(
             "DELETE FROM settings WHERE key = ?1",
             params!["away_started_at"],
@@ -2964,7 +3006,8 @@ fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<Value> {
             "ok": true,
             "away": false,
             "awayStartedAt": Value::Null,
-            "awaySessionId": Value::Null
+            "awaySessionId": Value::Null,
+            "clearedPendingNotifications": cleared_pending
         }))
     }
 }
@@ -3983,15 +4026,7 @@ fn watch_once_from_db(conn: &Connection) -> Result<Vec<Value>> {
 struct DaemonConfig {
     version: u32,
     bridge_command: String,
-    #[serde(default)]
-    webhook_url: Option<String>,
-    #[serde(default)]
-    webhook_secret: Option<String>,
     events: String,
-    #[serde(default)]
-    deliver: Option<String>,
-    #[serde(default)]
-    deliver_chat_id: Option<String>,
     #[serde(default)]
     telegram: Option<TelegramConfig>,
 }
@@ -4012,6 +4047,23 @@ struct TelegramSetupOptions<'a> {
     allowed_user_id: Option<&'a str>,
     events: &'a str,
     bridge_command: &'a str,
+    dry_run: bool,
+    pair_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SetupOptions<'a> {
+    bot_token: Option<&'a str>,
+    chat_id: Option<&'a str>,
+    allowed_user_id: Option<&'a str>,
+    events: &'a str,
+    bridge_command: &'a str,
+    daemon_label: &'a str,
+    install_daemon: bool,
+    start_daemon: bool,
+    register_hermes: bool,
+    hermes_server_name: &'a str,
+    hermes_command: &'a str,
     dry_run: bool,
     pair_timeout_ms: u64,
 }
@@ -4069,7 +4121,7 @@ struct RoutedTelegramCallback {
     action: TelegramCallbackAction,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct OutboxDeliverySummary {
     attempted: usize,
@@ -4104,26 +4156,7 @@ fn load_daemon_config() -> Result<DaemonConfig> {
     if config.events.trim().is_empty() {
         bail!("daemon config events cannot be empty");
     }
-    let has_hermes = match (&config.webhook_url, &config.webhook_secret) {
-        (Some(url), Some(secret)) => {
-            if url.trim().is_empty() {
-                bail!(
-                    "daemon config webhookUrl cannot be empty when Hermes delivery is configured"
-                );
-            }
-            if secret.trim().is_empty() {
-                bail!(
-                    "daemon config webhookSecret cannot be empty when Hermes delivery is configured"
-                );
-            }
-            true
-        }
-        (None, None) => false,
-        _ => bail!(
-            "daemon config must include both webhookUrl and webhookSecret for Hermes delivery"
-        ),
-    };
-    let has_telegram = match config.telegram.as_ref() {
+    match config.telegram.as_ref() {
         Some(telegram) => {
             if telegram.bot_token.trim().is_empty() {
                 bail!("daemon config telegram.botToken cannot be empty");
@@ -4131,12 +4164,8 @@ fn load_daemon_config() -> Result<DaemonConfig> {
             if telegram.chat_id.trim().is_empty() {
                 bail!("daemon config telegram.chatId cannot be empty");
             }
-            true
         }
-        None => false,
-    };
-    if !has_hermes && !has_telegram {
-        bail!("daemon config needs at least one delivery target: telegram or Hermes webhook");
+        None => bail!("daemon config must include Telegram transport. Run `codex-hermes-bridge setup` or `codex-hermes-bridge telegram setup`."),
     }
     Ok(config)
 }
@@ -4145,11 +4174,7 @@ fn redacted_daemon_config(config: &DaemonConfig) -> Value {
     json!({
         "version": config.version,
         "bridgeCommand": config.bridge_command,
-        "webhookUrl": config.webhook_url,
-        "webhookSecret": config.webhook_secret.as_ref().map(|_| "<redacted>"),
         "events": config.events,
-        "deliver": config.deliver,
-        "deliverChatId": config.deliver_chat_id,
         "telegram": config.telegram.as_ref().map(|telegram| json!({
             "botToken": "<redacted>",
             "chatId": telegram.chat_id,
@@ -4162,8 +4187,20 @@ fn daemon_run_command(bridge_command: &str) -> String {
     format!("{} daemon run", shell_quote(bridge_command))
 }
 
-fn daemon_run_once_command(bridge_command: &str) -> String {
-    format!("{} daemon run --once", shell_quote(bridge_command))
+fn doctor_bridge() -> Result<DoctorBridge> {
+    let config_path = daemon_config_path()?;
+    let config = read_daemon_config_raw()?;
+    let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-hermes-bridge")?;
+    Ok(DoctorBridge {
+        config_path: config_path.display().to_string(),
+        config_exists: config_path.exists(),
+        telegram_configured: config
+            .as_ref()
+            .and_then(|config| config.telegram.as_ref())
+            .is_some(),
+        daemon_service_path: service.service_path.display().to_string(),
+        daemon_service_exists: service.service_path.exists(),
+    })
 }
 
 fn read_daemon_config_raw() -> Result<Option<DaemonConfig>> {
@@ -4192,6 +4229,64 @@ fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<String> {
         .context(
             "Telegram bot token is required. Pass --bot-token or set TELEGRAM_BOT_TOKEN after creating a bot with @BotFather.",
         )
+}
+
+fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
+    let resolved = resolve_codex_binary()?;
+    let telegram = telegram_setup_result(TelegramSetupOptions {
+        bot_token: options.bot_token,
+        chat_id: options.chat_id,
+        allowed_user_id: options.allowed_user_id,
+        events: options.events,
+        bridge_command: options.bridge_command,
+        dry_run: options.dry_run,
+        pair_timeout_ms: options.pair_timeout_ms,
+    })?;
+    let daemon_install = if options.install_daemon {
+        Some(install_daemon_service(
+            options.daemon_label,
+            options.bridge_command,
+            options.dry_run,
+        )?)
+    } else {
+        None
+    };
+    let daemon_start = if options.start_daemon {
+        Some(start_daemon_service(options.daemon_label, options.dry_run)?)
+    } else {
+        None
+    };
+    let hermes = if options.register_hermes {
+        Some(run_hermes_install(HermesInstallOptions {
+            server_name: options.hermes_server_name,
+            hermes_command: options.hermes_command,
+            bridge_command: options.bridge_command,
+            dry_run: options.dry_run,
+        })?)
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "ok": true,
+        "action": "setup",
+        "dryRun": options.dry_run,
+        "codex": {
+            "resolvedPath": resolved.path.display().to_string(),
+            "source": resolved.source
+        },
+        "telegram": telegram,
+        "daemon": {
+            "install": daemon_install,
+            "start": daemon_start
+        },
+        "hermes": hermes,
+        "nextStep": if options.dry_run {
+            "Run setup without --dry-run, then use away on when leaving your computer."
+        } else {
+            "Use away on when leaving your computer. Reply to Codex Telegram messages to keep working from Telegram."
+        }
+    }))
 }
 
 fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
@@ -4242,16 +4337,6 @@ fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
         bridge_command: bridge_command.to_string(),
         events: events.to_string(),
         telegram: Some(paired.clone()),
-        ..read_daemon_config_raw()?.unwrap_or_else(|| DaemonConfig {
-            version: 2,
-            bridge_command: bridge_command.to_string(),
-            webhook_url: None,
-            webhook_secret: None,
-            events: events.to_string(),
-            deliver: None,
-            deliver_chat_id: None,
-            telegram: None,
-        })
     };
 
     let config_path = if options.dry_run {
@@ -4290,28 +4375,46 @@ fn telegram_status_result() -> Result<Value> {
     }))
 }
 
+fn telegram_test_result(message: &str, timeout: Duration, dry_run: bool) -> Result<Value> {
+    let config = load_daemon_config()?;
+    let telegram = config
+        .telegram
+        .as_ref()
+        .context("Telegram is not configured. Run telegram setup first.")?;
+    let text = normalized_message(Some(message))
+        .unwrap_or_else(|| "Codex Telegram bridge test".to_string());
+    let payload = json!({
+        "chat_id": telegram.chat_id,
+        "text": text,
+        "disable_web_page_preview": true
+    });
+    if dry_run {
+        return Ok(json!({
+            "ok": true,
+            "action": "telegram_test",
+            "dryRun": true,
+            "payload": payload
+        }));
+    }
+    let sent = telegram_send_message(telegram, &payload, timeout)?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_test",
+        "dryRun": false,
+        "messageId": sent.pointer("/result/message_id").cloned().unwrap_or(Value::Null)
+    }))
+}
+
 fn telegram_disable_result(dry_run: bool) -> Result<Value> {
     let path = daemon_config_path()?;
-    let mut config = read_daemon_config_raw()?;
+    let config = read_daemon_config_raw()?;
     let had_telegram = config
         .as_ref()
         .and_then(|config| config.telegram.as_ref())
         .is_some();
-    let removes_config = config
-        .as_ref()
-        .map(|config| config.webhook_url.is_none() && config.webhook_secret.is_none())
-        .unwrap_or(false);
-    if !dry_run {
-        if let Some(mut current) = config.take() {
-            current.telegram = None;
-            if removes_config {
-                if path.exists() {
-                    fs::remove_file(&path)?;
-                }
-            } else {
-                write_daemon_config(&current)?;
-            }
-        }
+    let removes_config = config.is_some();
+    if !dry_run && removes_config && path.exists() {
+        fs::remove_file(&path)?;
     }
     Ok(json!({
         "ok": true,
@@ -4571,7 +4674,7 @@ fn prepare_telegram_delivery(chat_id: &str, event: &Value) -> Result<PreparedTel
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("codex_event");
-    let event_id = hermes_webhook_delivery_id(event);
+    let event_id = notification_event_id(event);
     let thread_id = event_thread_id(event);
     let mut lines = vec![format!(
         "{}: {}",
@@ -5001,7 +5104,7 @@ fn process_telegram_updates(
 }
 
 fn enqueue_outbound_event(conn: &Connection, event: &Value, now: u64) -> Result<bool> {
-    let event_id = hermes_webhook_delivery_id(event);
+    let event_id = notification_event_id(event);
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -5021,6 +5124,52 @@ fn enqueue_outbound_event(conn: &Connection, event: &Value, now: u64) -> Result<
     Ok(inserted > 0)
 }
 
+fn event_observed_at(event: &Value) -> Option<u64> {
+    event
+        .get("updatedAt")
+        .and_then(Value::as_u64)
+        .or_else(|| event.get("observedAt").and_then(Value::as_u64))
+        .or_else(|| event.pointer("/thread/updatedAt").and_then(Value::as_u64))
+}
+
+fn should_enqueue_daemon_notification(conn: &Connection, event: &Value) -> Result<bool> {
+    let away_status = get_away_mode(conn)?;
+    if !away_notifications_enabled_from_status(&away_status) {
+        return Ok(false);
+    }
+    let away_started_at = away_status.get("awayStartedAt").and_then(Value::as_u64);
+    Ok(should_emit_for_away_window(
+        away_started_at,
+        event_observed_at(event),
+    ))
+}
+
+fn enqueue_daemon_notification_events(
+    conn: &Connection,
+    events: &[Value],
+    now: u64,
+) -> Result<usize> {
+    let mut enqueued = 0usize;
+    for event in events {
+        if should_enqueue_daemon_notification(conn, event)?
+            && enqueue_outbound_event(conn, event, now)?
+        {
+            enqueued += 1;
+        }
+    }
+    Ok(enqueued)
+}
+
+fn away_notifications_enabled_from_status(away_status: &Value) -> bool {
+    away_status.get("away").and_then(Value::as_bool) == Some(true)
+}
+
+fn away_notifications_enabled(conn: &Connection) -> Result<bool> {
+    Ok(away_notifications_enabled_from_status(&get_away_mode(
+        conn,
+    )?))
+}
+
 fn pending_outbound_count(conn: &Connection) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM outbound_events WHERE status != 'delivered'",
@@ -5028,6 +5177,14 @@ fn pending_outbound_count(conn: &Connection) -> Result<u64> {
         |row| row.get(0),
     )?;
     from_sql_i64(count)
+}
+
+fn clear_pending_outbound_events(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM outbound_events WHERE status != 'delivered'",
+        [],
+    )?;
+    Ok(deleted)
 }
 
 fn transport_delivery_exists(conn: &Connection, event_id: &str, transport: &str) -> Result<bool> {
@@ -5142,35 +5299,19 @@ fn deliver_outbound_events(
     timeout: Duration,
 ) -> Result<OutboxDeliverySummary> {
     deliver_due_outbound_events(conn, now, 100, |event| {
-        let event_id = hermes_webhook_delivery_id(event);
-        let mut delivered = serde_json::Map::new();
-        if let (Some(webhook_url), Some(webhook_secret)) = (
-            config.webhook_url.as_deref(),
-            config.webhook_secret.as_deref(),
-        ) {
-            let result = if transport_delivery_exists(conn, &event_id, "hermes")? {
-                json!({ "ok": true, "transport": "hermes", "skipped": "already_delivered" })
-            } else {
-                let result = post_hermes_webhook(webhook_url, webhook_secret, event, timeout)?;
-                record_transport_delivery(conn, &event_id, "hermes", &result, now)?;
-                result
-            };
-            delivered.insert("hermes".to_string(), result);
-        }
-        if let Some(telegram) = config.telegram.as_ref() {
-            let result = if transport_delivery_exists(conn, &event_id, "telegram")? {
-                json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
-            } else {
-                let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
-                record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
-                result
-            };
-            delivered.insert("telegram".to_string(), result);
-        }
-        if delivered.is_empty() {
-            bail!("no daemon delivery target is configured");
-        }
-        Ok(Value::Object(delivered))
+        let event_id = notification_event_id(event);
+        let telegram = config
+            .telegram
+            .as_ref()
+            .context("Telegram is not configured. Run setup first.")?;
+        let result = if transport_delivery_exists(conn, &event_id, "telegram")? {
+            json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
+        } else {
+            let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
+            record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
+            result
+        };
+        Ok(json!({ "telegram": result }))
     })
 }
 
@@ -5192,13 +5333,12 @@ fn daemon_cycle(
         Ok(events) => events,
         Err(error) => filter_watch_events(vec![watch_thread_error_event(&error)], filter.as_ref()),
     };
-    let mut enqueued = 0usize;
-    for event in &events {
-        if enqueue_outbound_event(conn, event, now)? {
-            enqueued += 1;
-        }
-    }
-    let delivery = deliver_outbound_events(conn, config, now, timeout)?;
+    let enqueued = enqueue_daemon_notification_events(conn, &events, now)?;
+    let delivery = if away_notifications_enabled(conn)? {
+        deliver_outbound_events(conn, config, now, timeout)?
+    } else {
+        OutboxDeliverySummary::default()
+    };
     let telegram_updates = match config.telegram.as_ref() {
         Some(telegram) => match process_telegram_updates(conn, telegram, now, timeout) {
             Ok(result) => result,
@@ -5551,50 +5691,20 @@ fn xml_escape(value: &str) -> String {
 }
 
 const DEFAULT_DAEMON_LABEL: &str = "com.hanifcarroll.codex-hermes-bridge";
-const DEFAULT_HERMES_WEBHOOK_EVENTS: &str = "thread_waiting,thread_completed,thread_status_changed";
-
-const HERMES_WEBHOOK_PROMPT: &str = r#"Codex changed without you asking.
-
-Use the event payload to send Hanif a concise notification. If the event says Codex needs a reply or approval, ask for the exact reply or decision. If Hanif responds, use the Codex MCP tools for this same thread_id.
-
-The payload includes structured reply_route metadata. Hermes should persist that metadata against the delivered platform message so a Telegram reply-to-message can call codex_reply for the same thread_id.
-
-Event payload:
-{__raw__}"#;
+const DEFAULT_NOTIFICATION_EVENTS: &str = "thread_waiting,thread_completed";
 
 #[derive(Debug, Clone, Copy)]
 struct HermesInstallOptions<'a> {
     server_name: &'a str,
     hermes_command: &'a str,
     bridge_command: &'a str,
-    webhook_name: &'a str,
-    webhook_events: &'a str,
-    webhook_deliver: Option<&'a str>,
-    webhook_deliver_chat_id: Option<&'a str>,
-    webhook_secret: Option<&'a str>,
     dry_run: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HermesWebhookSubscription {
-    url: Option<String>,
-    secret: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HttpTarget {
-    host: String,
-    port: u16,
-    path: String,
-    host_header: String,
 }
 
 fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
     let server_name = options.server_name.trim();
     let hermes_command = options.hermes_command.trim();
     let bridge_command = options.bridge_command.trim();
-    let webhook_name = options.webhook_name.trim();
-    let webhook_events = options.webhook_events.trim();
 
     if server_name.is_empty() {
         bail!("server name cannot be empty");
@@ -5604,12 +5714,6 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
     }
     if bridge_command.is_empty() {
         bail!("bridge command cannot be empty");
-    }
-    if webhook_name.is_empty() {
-        bail!("webhook name cannot be empty");
-    }
-    if webhook_events.is_empty() {
-        bail!("webhook events cannot be empty");
     }
 
     let mcp_args = vec![
@@ -5621,38 +5725,6 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
         "--args".to_string(),
         "mcp".to_string(),
     ];
-    let planned_webhook_url = default_hermes_webhook_url(webhook_name);
-    let webhook_secret = options
-        .webhook_secret
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let planned_daemon_config = DaemonConfig {
-        version: 1,
-        bridge_command: bridge_command.to_string(),
-        webhook_url: Some(planned_webhook_url.clone()),
-        webhook_secret: Some("<secret printed by hermes webhook subscribe>".to_string()),
-        events: webhook_events.to_string(),
-        deliver: None,
-        deliver_chat_id: None,
-        telegram: None,
-    };
-    let webhook_deliver = options
-        .webhook_deliver
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let webhook_deliver_chat_id = options
-        .webhook_deliver_chat_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let webhook_args = webhook_deliver.map(|deliver| {
-        hermes_webhook_subscribe_args(
-            webhook_name,
-            webhook_events,
-            deliver,
-            webhook_deliver_chat_id,
-            webhook_secret,
-        )
-    });
 
     let base = json!({
         "ok": true,
@@ -5667,31 +5739,7 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
             "args": mcp_args.clone(),
             "nextStep": "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
         },
-        "notificationLane": {
-            "configured": webhook_args.is_some(),
-            "webhookName": webhook_name,
-            "events": webhook_events,
-            "deliver": webhook_deliver,
-            "deliverChatId": webhook_deliver_chat_id,
-            "webhookUrl": planned_webhook_url,
-            "webhookArgs": webhook_args.as_ref().map(|args| redacted_command_args(args, webhook_secret)),
-            "configPath": daemon_config_path()?.display().to_string(),
-            "config": redacted_daemon_config(&DaemonConfig {
-                deliver: webhook_deliver.map(str::to_string),
-                deliver_chat_id: webhook_deliver_chat_id.map(str::to_string),
-                ..planned_daemon_config.clone()
-            }),
-            "daemonCommand": daemon_run_command(bridge_command),
-            "daemonOnceCommand": daemon_run_once_command(bridge_command),
-            "daemonInstallCommand": format!("{} daemon install --bridge-command {}", shell_quote(bridge_command), shell_quote(bridge_command)),
-            "daemonStatusCommand": format!("{} daemon status", shell_quote(bridge_command)),
-            "nextStep": if webhook_args.is_some() {
-                "Run daemonInstallCommand, then daemon start. The daemon stores the Hermes webhook secret in the bridge config instead of a long-lived process argv."
-            } else {
-                "Pass --webhook-deliver, for example --webhook-deliver telegram, to install proactive Hermes notifications."
-            }
-        },
-        "nextStep": "Restart Hermes for MCP discovery, then install and start the notification daemon if notificationLane.configured is true."
+        "nextStep": "Restart Hermes for MCP discovery. Telegram notifications are configured with the top-level setup command, not through Hermes."
     });
     if options.dry_run {
         return Ok(base);
@@ -5709,60 +5757,6 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
         );
     }
 
-    let notification_result = if let Some(webhook_args) = webhook_args {
-        let output = Command::new(hermes_command)
-            .args(&webhook_args)
-            .output()
-            .with_context(|| format!("failed to run {hermes_command} webhook subscribe"))?;
-        if !output.status.success() {
-            bail!(
-                "Hermes webhook subscription failed with status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let parsed = parse_hermes_webhook_subscribe_output(&stdout);
-        let webhook_url = parsed
-            .url
-            .clone()
-            .unwrap_or_else(|| default_hermes_webhook_url(webhook_name));
-        let resolved_secret = webhook_secret
-            .map(str::to_string)
-            .or(parsed.secret.clone())
-            .context("Hermes webhook subscription did not print a secret; pass --webhook-secret")?;
-        let daemon_config = DaemonConfig {
-            version: 1,
-            bridge_command: bridge_command.to_string(),
-            webhook_url: Some(webhook_url.clone()),
-            webhook_secret: Some(resolved_secret.clone()),
-            events: webhook_events.to_string(),
-            deliver: webhook_deliver.map(str::to_string),
-            deliver_chat_id: webhook_deliver_chat_id.map(str::to_string),
-            telegram: read_daemon_config_raw()?.and_then(|config| config.telegram),
-        };
-        let config_path = write_daemon_config(&daemon_config)?;
-        Some(json!({
-            "configured": true,
-            "args": redacted_command_args(&webhook_args, Some(&resolved_secret)),
-            "stdout": redact_secret_text(&stdout, &resolved_secret),
-            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
-            "webhookUrl": webhook_url,
-            "configPath": config_path.display().to_string(),
-            "config": redacted_daemon_config(&daemon_config),
-            "daemonCommand": daemon_run_command(bridge_command),
-            "daemonOnceCommand": daemon_run_once_command(bridge_command),
-            "daemonInstallCommand": format!("{} daemon install --bridge-command {}", shell_quote(bridge_command), shell_quote(bridge_command)),
-            "daemonStatusCommand": format!("{} daemon status", shell_quote(bridge_command)),
-            "parsed": {
-                "url": parsed.url,
-                "secret": parsed.secret.map(|_| "<redacted>")
-            }
-        }))
-    } else {
-        None
-    };
-
     Ok(json!({
         "ok": true,
         "action": "hermes_install",
@@ -5776,24 +5770,8 @@ fn run_hermes_install(options: HermesInstallOptions<'_>) -> Result<Value> {
             "stdout": String::from_utf8_lossy(&mcp_output.stdout).trim(),
             "stderr": String::from_utf8_lossy(&mcp_output.stderr).trim()
         },
-        "notificationLane": notification_result.unwrap_or_else(|| json!({
-            "configured": false,
-            "nextStep": "Pass --webhook-deliver, for example --webhook-deliver telegram, to install proactive Hermes notifications."
-        })),
-        "nextStep": "Restart Hermes for MCP discovery, then install and start the notification daemon if notificationLane.configured is true."
+        "nextStep": "Restart Hermes for MCP discovery. Telegram notifications are configured with the top-level setup command, not through Hermes."
     }))
-}
-
-fn redacted_command_args(args: &[String], secret: Option<&str>) -> Vec<String> {
-    let mut redacted = args.to_vec();
-    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
-        for arg in &mut redacted {
-            if arg == secret {
-                *arg = "<redacted>".to_string();
-            }
-        }
-    }
-    redacted
 }
 
 fn redact_secret_text(text: &str, secret: &str) -> String {
@@ -5802,41 +5780,6 @@ fn redact_secret_text(text: &str, secret: &str) -> String {
     } else {
         text.replace(secret, "<redacted>")
     }
-}
-
-fn hermes_webhook_subscribe_args(
-    webhook_name: &str,
-    webhook_events: &str,
-    deliver: &str,
-    deliver_chat_id: Option<&str>,
-    secret: Option<&str>,
-) -> Vec<String> {
-    let mut args = vec![
-        "webhook".to_string(),
-        "subscribe".to_string(),
-        webhook_name.to_string(),
-        "--description".to_string(),
-        "Proactive Codex thread notifications from codex-hermes-bridge".to_string(),
-        "--events".to_string(),
-        webhook_events.to_string(),
-        "--prompt".to_string(),
-        HERMES_WEBHOOK_PROMPT.to_string(),
-        "--deliver".to_string(),
-        deliver.to_string(),
-    ];
-    if let Some(chat_id) = deliver_chat_id {
-        args.push("--deliver-chat-id".to_string());
-        args.push(chat_id.to_string());
-    }
-    if let Some(secret) = secret {
-        args.push("--secret".to_string());
-        args.push(secret.to_string());
-    }
-    args
-}
-
-fn default_hermes_webhook_url(webhook_name: &str) -> String {
-    format!("http://localhost:8644/webhooks/{webhook_name}")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -5851,166 +5794,6 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn parse_hermes_webhook_subscribe_output(output: &str) -> HermesWebhookSubscription {
-    let mut subscription = HermesWebhookSubscription {
-        url: None,
-        secret: None,
-    };
-    for line in output.lines() {
-        let trimmed = line.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if (lower.starts_with("url:") || lower.starts_with("webhook url:"))
-            && subscription.url.is_none()
-        {
-            if let Some((_, value)) = trimmed.split_once(':') {
-                subscription.url = Some(value.trim().to_string());
-            }
-        } else if lower.starts_with("secret:") && subscription.secret.is_none() {
-            if let Some((_, value)) = trimmed.split_once(':') {
-                subscription.secret = Some(value.trim().to_string());
-            }
-        }
-    }
-    subscription
-}
-
-fn post_hermes_webhook(url: &str, secret: &str, event: &Value, timeout: Duration) -> Result<Value> {
-    if secret.trim().is_empty() {
-        bail!("webhook secret cannot be empty");
-    }
-    let target = parse_http_url(url)?;
-    let payload = hermes_webhook_payload(event);
-    let body = serde_json::to_vec(&payload)?;
-    let event_type = payload
-        .get("event_type")
-        .and_then(Value::as_str)
-        .unwrap_or("codex_event")
-        .to_string();
-    let delivery_id = hermes_webhook_delivery_id(event);
-    let signature = hmac_sha256_hex(secret.trim().as_bytes(), &body);
-    let mut stream = TcpStream::connect((target.host.as_str(), target.port))
-        .with_context(|| format!("failed to connect to Hermes webhook at {url}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Hub-Signature-256: sha256={}\r\nX-GitHub-Event: {}\r\nX-GitHub-Delivery: {}\r\nConnection: close\r\n\r\n",
-        target.path,
-        target.host_header,
-        body.len(),
-        signature,
-        event_type,
-        delivery_id
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let status_line = response.lines().next().unwrap_or_default().to_string();
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .context("Hermes webhook response did not include an HTTP status")?;
-    if !(200..300).contains(&status_code) {
-        bail!("Hermes webhook returned {status_line}");
-    }
-
-    Ok(json!({
-        "ok": true,
-        "action": "hermes_post_webhook",
-        "eventType": event_type,
-        "deliveryId": delivery_id,
-        "statusCode": status_code,
-        "statusLine": status_line
-    }))
-}
-
-fn parse_http_url(url: &str) -> Result<HttpTarget> {
-    let trimmed = url.trim();
-    let rest = trimmed
-        .strip_prefix("http://")
-        .context("Hermes webhook URL must use http://")?;
-    let (authority, path_suffix) = rest.split_once('/').unwrap_or((rest, ""));
-    if authority.is_empty() {
-        bail!("Hermes webhook URL is missing a host");
-    }
-    if authority.contains('@') {
-        bail!("Hermes webhook URL must not include credentials");
-    }
-    let (host, port, explicit_port) = if authority.starts_with('[') {
-        let end = authority
-            .find(']')
-            .context("IPv6 webhook URL host is missing closing bracket")?;
-        let host = authority[1..end].to_string();
-        let suffix = &authority[(end + 1)..];
-        let port = if let Some(raw) = suffix.strip_prefix(':') {
-            raw.parse::<u16>()
-                .with_context(|| format!("invalid webhook port: {raw}"))?
-        } else if suffix.is_empty() {
-            80
-        } else {
-            bail!("invalid webhook URL authority: {authority}");
-        };
-        (host, port, port != 80)
-    } else if let Some((host, raw_port)) = authority.rsplit_once(':') {
-        if host.is_empty() {
-            bail!("Hermes webhook URL is missing a host");
-        }
-        let port = raw_port
-            .parse::<u16>()
-            .with_context(|| format!("invalid webhook port: {raw_port}"))?;
-        (host.to_string(), port, port != 80)
-    } else {
-        (authority.to_string(), 80, false)
-    };
-    if host.trim().is_empty() {
-        bail!("Hermes webhook URL is missing a host");
-    }
-    let path = format!("/{}", path_suffix);
-    let host_header = if explicit_port {
-        if authority.starts_with('[') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        }
-    } else {
-        host.clone()
-    };
-    Ok(HttpTarget {
-        host,
-        port,
-        path,
-        host_header,
-    })
-}
-
-fn hermes_webhook_payload(event: &Value) -> Value {
-    let event_type = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("codex_event");
-    let thread_id = event_thread_id(event);
-    let reply_route = thread_id.as_ref().map(|thread_id| {
-        json!({
-            "route_kind": "codex_reply",
-            "thread_id": thread_id
-        })
-    });
-    json!({
-        "event_type": event_type,
-        "source": "codex-hermes-bridge",
-        "thread_id": thread_id,
-        "route_kind": "codex_reply",
-        "reply_route": reply_route,
-        "reply_route_marker": reply_route.as_ref().map(|route| {
-            format!("THREAD_ROUTE {}", serde_json::to_string(route).unwrap_or_default())
-        }),
-        "event": event
-    })
-}
-
 fn event_thread_id(event: &Value) -> Option<String> {
     event
         .get("threadId")
@@ -6020,7 +5803,7 @@ fn event_thread_id(event: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn hermes_webhook_delivery_id(event: &Value) -> String {
+fn notification_event_id(event: &Value) -> String {
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -6061,34 +5844,6 @@ fn sanitize_delivery_id(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
-    const BLOCK_SIZE: usize = 64;
-    let mut key_block = [0u8; BLOCK_SIZE];
-    if key.len() > BLOCK_SIZE {
-        let digest = Sha256::digest(key);
-        key_block[..digest.len()].copy_from_slice(&digest);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut outer_key_pad = [0u8; BLOCK_SIZE];
-    let mut inner_key_pad = [0u8; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        outer_key_pad[i] = key_block[i] ^ 0x5c;
-        inner_key_pad[i] = key_block[i] ^ 0x36;
-    }
-
-    let mut inner = Sha256::new();
-    inner.update(inner_key_pad);
-    inner.update(message);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(outer_key_pad);
-    outer.update(inner_hash);
-    hex_lower(&outer.finalize())
 }
 
 fn sha256_hex(message: &[u8]) -> String {
@@ -6337,6 +6092,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
                     source: resolved.source.to_string(),
                     version_stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
                 },
+                bridge: doctor_bridge()?,
             })
             .map_err(Into::into)
         }
@@ -6687,29 +6443,6 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
                 Some(client.request("thread/unarchive", json!({ "threadId": thread_id }))?)
             };
             unarchive_thread_result(&conn, &thread_id, dry_run, now, live_result)
-        }
-        "codex_away" => {
-            let action = mcp_required_string(arguments, &["action"])?;
-            let now = now_millis()?;
-            let db_path = state_db_path()?;
-            let conn = create_state_db(&db_path)?;
-            match action.as_str() {
-                "on" => set_away_mode(&conn, true, now),
-                "off" => set_away_mode(&conn, false, now),
-                "status" => get_away_mode(&conn),
-                _ => bail!("away action must be on, off, or status"),
-            }
-        }
-        "codex_notify_away" => {
-            let completed = mcp_arg_bool(arguments, &["completed"], true)?;
-            let mark_delivered =
-                mcp_arg_bool(arguments, &["markDelivered", "mark_delivered"], false)?;
-            let now = now_millis()?;
-            let db_path = state_db_path()?;
-            let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
-            sync_state_from_live(&mut client, &conn, now, 50, true)?;
-            build_notify_away_from_db(&conn, now, completed, mark_delivered)
         }
         _ => bail!("Unknown MCP tool: {name}"),
     }
@@ -7535,7 +7268,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_accepts_hermes_notification_install_flags() {
+    fn cli_rejects_legacy_hermes_notification_flags() {
         let parsed = Cli::try_parse_from([
             "codex-hermes-bridge",
             "hermes",
@@ -7551,13 +7284,13 @@ mod tests {
             "--dry-run",
         ]);
         assert!(
-            parsed.is_ok(),
-            "hermes install should accept notification lane flags: {parsed:?}"
+            parsed.is_err(),
+            "Hermes install should stay MCP-only; Telegram setup owns notifications"
         );
     }
 
     #[test]
-    fn cli_accepts_hermes_post_webhook_command() {
+    fn cli_rejects_legacy_hermes_post_webhook_command() {
         let parsed = Cli::try_parse_from([
             "codex-hermes-bridge",
             "hermes",
@@ -7568,8 +7301,8 @@ mod tests {
             "test-secret",
         ]);
         assert!(
-            parsed.is_ok(),
-            "hermes post-webhook should parse: {parsed:?}"
+            parsed.is_err(),
+            "hermes post-webhook should not be part of the product surface"
         );
     }
 
@@ -7612,6 +7345,14 @@ mod tests {
                 "--dry-run",
             ],
             vec!["codex-hermes-bridge", "telegram", "status"],
+            vec![
+                "codex-hermes-bridge",
+                "telegram",
+                "test",
+                "--message",
+                "hello",
+                "--dry-run",
+            ],
             vec!["codex-hermes-bridge", "telegram", "disable", "--dry-run"],
         ] {
             let parsed = Cli::try_parse_from(args.clone());
@@ -7623,12 +7364,30 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_product_setup_command() {
+        let parsed = Cli::try_parse_from([
+            "codex-hermes-bridge",
+            "setup",
+            "--bot-token",
+            "123:abc",
+            "--chat-id",
+            "456",
+            "--allowed-user-id",
+            "789",
+            "--no-install-daemon",
+            "--no-start-daemon",
+            "--dry-run",
+        ]);
+        assert!(parsed.is_ok(), "setup command should parse: {parsed:?}");
+    }
+
+    #[test]
     fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
         let result = telegram_setup_result(TelegramSetupOptions {
             bot_token: Some("123:secret"),
             chat_id: Some("456"),
             allowed_user_id: Some("789"),
-            events: DEFAULT_HERMES_WEBHOOK_EVENTS,
+            events: DEFAULT_NOTIFICATION_EVENTS,
             bridge_command: "codex-hermes-bridge",
             dry_run: true,
             pair_timeout_ms: 1000,
@@ -7784,11 +7543,6 @@ mod tests {
             server_name: "codex",
             hermes_command: "hermes-se",
             bridge_command: "codex-hermes-bridge",
-            webhook_name: "codex-watch",
-            webhook_events: DEFAULT_HERMES_WEBHOOK_EVENTS,
-            webhook_deliver: None,
-            webhook_deliver_chat_id: None,
-            webhook_secret: None,
             dry_run: true,
         })
         .expect("dry-run install result");
@@ -7808,195 +7562,14 @@ mod tests {
                 "mcp"
             ])
         );
-    }
-
-    #[test]
-    fn hermes_install_dry_run_builds_notification_lane() {
-        let result = run_hermes_install(HermesInstallOptions {
-            server_name: "codex",
-            hermes_command: "hermes-se",
-            bridge_command: "codex-hermes-bridge",
-            webhook_name: "codex-watch",
-            webhook_events: DEFAULT_HERMES_WEBHOOK_EVENTS,
-            webhook_deliver: Some("telegram"),
-            webhook_deliver_chat_id: Some("12345"),
-            webhook_secret: Some("test-secret"),
-            dry_run: true,
-        })
-        .expect("dry-run install result");
-
-        assert_eq!(result["notificationLane"]["configured"], true);
-        assert_eq!(result["notificationLane"]["deliver"], "telegram");
         assert_eq!(
-            result["notificationLane"]["webhookUrl"],
-            "http://localhost:8644/webhooks/codex-watch"
-        );
-        assert_eq!(
-            result["notificationLane"]["webhookArgs"],
-            json!([
-                "webhook",
-                "subscribe",
-                "codex-watch",
-                "--description",
-                "Proactive Codex thread notifications from codex-hermes-bridge",
-                "--events",
-                DEFAULT_HERMES_WEBHOOK_EVENTS,
-                "--prompt",
-                HERMES_WEBHOOK_PROMPT,
-                "--deliver",
-                "telegram",
-                "--deliver-chat-id",
-                "12345",
-                "--secret",
-                "<redacted>"
-            ])
-        );
-        let daemon = result["notificationLane"]["daemonCommand"]
-            .as_str()
-            .expect("daemon command");
-        assert_eq!(daemon, "codex-hermes-bridge daemon run");
-        assert!(
-            !serde_json::to_string(&result)
-                .unwrap()
-                .contains("--secret test-secret"),
-            "install output must not ask users to run a long-lived command with a secret argv"
-        );
-    }
-
-    #[test]
-    fn parse_hermes_webhook_subscribe_output_extracts_url_and_secret() {
-        let parsed = parse_hermes_webhook_subscribe_output(
-            "Subscribed.\nURL: http://localhost:8644/webhooks/codex-watch\nSecret: abc123\n",
-        );
-
-        assert_eq!(
-            parsed,
-            HermesWebhookSubscription {
-                url: Some("http://localhost:8644/webhooks/codex-watch".to_string()),
-                secret: Some("abc123".to_string())
-            }
-        );
-    }
-
-    #[test]
-    fn parse_http_url_handles_localhost_webhook() {
-        let parsed =
-            parse_http_url("http://localhost:8644/webhooks/codex-watch").expect("parsed URL");
-
-        assert_eq!(
-            parsed,
-            HttpTarget {
-                host: "localhost".to_string(),
-                port: 8644,
-                path: "/webhooks/codex-watch".to_string(),
-                host_header: "localhost:8644".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn hmac_sha256_hex_matches_known_vector() {
-        assert_eq!(
-            hmac_sha256_hex(b"key", b"The quick brown fox jumps over the lazy dog"),
-            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
-        );
-    }
-
-    #[test]
-    fn hermes_webhook_payload_includes_reply_route_marker() {
-        let payload = hermes_webhook_payload(&json!({
-            "type": "thread_waiting",
-            "threadId": "thr_1",
-            "thread": {
-                "displayName": "Needs reply"
-            }
-        }));
-
-        assert_eq!(payload["event_type"], "thread_waiting");
-        assert_eq!(payload["thread_id"], "thr_1");
-        assert_eq!(payload["reply_route"]["route_kind"], "codex_reply");
-        assert_eq!(payload["reply_route"]["thread_id"], "thr_1");
-        assert_eq!(
-            payload["reply_route_marker"],
-            "THREAD_ROUTE {\"route_kind\":\"codex_reply\",\"thread_id\":\"thr_1\"}"
-        );
-    }
-
-    #[test]
-    fn hermes_webhook_prompt_does_not_depend_on_model_echoing_route_markers() {
-        assert!(
-            !HERMES_WEBHOOK_PROMPT.contains("reply_route_marker"),
-            "Telegram reply routing must come from structured webhook metadata, not model output"
+            result["mcp"]["nextStep"],
+            "Restart Hermes so it reconnects to MCP servers and discovers codex_* tools."
         );
         assert!(
-            HERMES_WEBHOOK_PROMPT.contains("reply_route"),
-            "prompt should still explain that structured reply metadata exists"
+            result.get("notificationLane").is_none(),
+            "Hermes install should not configure Telegram notifications"
         );
-    }
-
-    #[test]
-    fn post_hermes_webhook_posts_signed_request_to_local_server() {
-        fn header_end(data: &[u8]) -> Option<usize> {
-            data.windows(4).position(|window| window == b"\r\n\r\n")
-        }
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept webhook request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("read timeout");
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer).expect("read request");
-                assert_ne!(read, 0, "client closed before request completed");
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(end) = header_end(&request) {
-                    let headers = String::from_utf8_lossy(&request[..end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("Content-Length: ")
-                                .and_then(|raw| raw.parse::<usize>().ok())
-                        })
-                        .expect("content length");
-                    if request.len() >= end + 4 + content_length {
-                        break;
-                    }
-                }
-            }
-            stream
-                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\nOK")
-                .expect("write response");
-            String::from_utf8(request).expect("request utf8")
-        });
-
-        let event = json!({
-            "type": "thread_waiting",
-            "threadId": "thr_1",
-            "updatedAt": 42
-        });
-        let result = post_hermes_webhook(
-            &format!("http://{addr}/webhooks/codex-watch"),
-            "test-secret",
-            &event,
-            Duration::from_secs(2),
-        )
-        .expect("post webhook");
-        let request = server.join().expect("server thread");
-        let (headers, body) = request.split_once("\r\n\r\n").expect("request body");
-        let expected_signature = hmac_sha256_hex(b"test-secret", body.as_bytes());
-        let payload: Value = serde_json::from_str(body).expect("payload json");
-
-        assert_eq!(result["statusCode"], 202);
-        assert!(headers.starts_with("POST /webhooks/codex-watch HTTP/1.1"));
-        assert!(headers.contains("X-GitHub-Event: thread_waiting"));
-        assert!(headers.contains("X-GitHub-Delivery: codex-thread_waiting-thr_1-42"));
-        assert!(headers.contains(&format!("X-Hub-Signature-256: sha256={expected_signature}")));
-        assert_eq!(payload["event_type"], "thread_waiting");
-        assert_eq!(payload["thread_id"], "thr_1");
     }
 
     #[test]
@@ -8068,6 +7641,71 @@ mod tests {
             !transport_delivery_exists(&conn, "event_1", "hermes").expect("lookup"),
             "other transports for the same event must remain pending"
         );
+    }
+
+    #[test]
+    fn daemon_notification_policy_only_enqueues_events_while_away() {
+        let conn = create_state_db_in_memory().expect("db");
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 1500
+        });
+
+        let off_count =
+            enqueue_daemon_notification_events(&conn, std::slice::from_ref(&event), 2000)
+                .expect("away off enqueue");
+        assert_eq!(
+            off_count, 0,
+            "daemon should stay quiet while user is present"
+        );
+
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let on_count =
+            enqueue_daemon_notification_events(&conn, &[event], 2000).expect("away on enqueue");
+        assert_eq!(on_count, 1, "daemon should notify while user is away");
+    }
+
+    #[test]
+    fn daemon_notification_policy_skips_events_before_away_started() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 2000).expect("away on");
+        let events = vec![
+            json!({
+                "type": "thread_waiting",
+                "threadId": "thr_old",
+                "updatedAt": 1500
+            }),
+            json!({
+                "type": "thread_waiting",
+                "threadId": "thr_new",
+                "updatedAt": 2500
+            }),
+        ];
+
+        let count = enqueue_daemon_notification_events(&conn, &events, 3000).expect("enqueue");
+
+        assert_eq!(count, 1);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+    }
+
+    #[test]
+    fn away_off_clears_pending_daemon_notifications() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 1500
+        });
+        enqueue_daemon_notification_events(&conn, &[event], 2000).expect("enqueue");
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+
+        let disabled = set_away_mode(&conn, false, 2500).expect("away off");
+
+        assert_eq!(disabled["away"], false);
+        assert_eq!(disabled["clearedPendingNotifications"], 1);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
     }
 
     #[test]
@@ -8239,6 +7877,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("argument message is required"));
+    }
+
+    #[test]
+    fn mcp_rejects_legacy_away_notification_tools() {
+        for name in ["codex_away", "codex_notify_away"] {
+            let response = mcp_handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": {}
+                }
+            }))
+            .expect("tools/call response");
+
+            assert_eq!(response["result"]["isError"], true);
+            assert!(response["result"]["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown MCP tool"));
+        }
     }
 
     #[test]

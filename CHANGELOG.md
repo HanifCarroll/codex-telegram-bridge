@@ -10,9 +10,11 @@ Initial OSS release candidate.
 - Take thread actions with `new`, `fork`, `reply`, `approve`, `archive`, and `unarchive`.
 - Stream normalized JSON events with `follow` and `watch`.
 - Run trusted local hooks with `watch --exec`.
-- Emit away-mode notification summaries with `away` and `notify-away`.
+- Configure the full product path with `setup`.
+- Gate outbound Telegram notifications with `away on/off` so users are not notified while present.
+- Send proactive Codex notifications directly through Telegram with `telegram setup`, `telegram test`, and the local daemon.
+- Route Telegram reply-to-message text and approval buttons back to the originating Codex thread.
 - Expose a stdio MCP server for Hermes with structured Codex control tools.
 - Expose MCP resources and prompts for Codex thread context and safer Hermes workflows.
-- Add a `hermes install` helper that registers the bridge through `hermes mcp add` and can subscribe a Hermes webhook notification route.
-- Add `hermes post-webhook` so `watch --exec` can push signed Codex change events into Hermes proactively.
-- Include generic hook examples for printing events and sending Telegram notifications.
+- Add a `hermes install` helper that registers the bridge through `hermes mcp add`.
+- Keep hook examples generic and leave Telegram delivery to the bridge daemon.

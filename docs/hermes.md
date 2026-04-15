@@ -2,7 +2,7 @@
 
 Hermes is the optional agent control plane for `codex-hermes-bridge`.
 
-The bridge owns proactive Telegram delivery and direct reply routing. Hermes should use MCP when the user asks Hermes to inspect Codex work, reply to a thread, or approve a waiting prompt.
+Use Hermes when you want to ask an agent to inspect Codex work, reply to a thread, or approve a waiting prompt. Use the bridge daemon plus Telegram for proactive notifications and remote reply routing.
 
 For Telegram setup, see [telegram.md](telegram.md).
 
@@ -97,7 +97,7 @@ Hermes tool names are usually prefixed by the MCP server name. With server name 
 
 The MCP server exposes these bridge tools:
 
-- `codex_doctor`: inspect the local Codex executable.
+- `codex_doctor`: inspect the local Codex executable and bridge configuration.
 - `codex_threads`: sync and list recent threads.
 - `codex_inbox`: list actionable inbox rows.
 - `codex_waiting`: list threads waiting on user input or approval.
@@ -105,7 +105,7 @@ The MCP server exposes these bridge tools:
 - `codex_reply`: resume and reply to a thread.
 - `codex_approve`: send `YES` or `NO` for an approval prompt.
 
-`watch`, `new`, `fork`, `archive`, `unarchive`, `away`, and `notify-away` are not exposed as default MCP tools. The MCP lane stays bounded and action-focused; proactive notification belongs in the daemon and Telegram transport.
+`watch`, `new`, `fork`, `archive`, `unarchive`, and `away` are not exposed as default MCP tools. The MCP lane stays bounded and action-focused; proactive notification belongs in the daemon and Telegram transport.
 
 ## Resources
 
@@ -128,20 +128,6 @@ The MCP server exposes small user-controlled prompts:
 
 Prompts do not mutate Codex. They give Hermes safer phrasing for when and how to call the tools.
 
-## Optional Hermes Webhook Lane
-
-The Hermes webhook lane remains available for advanced setups that explicitly want Hermes to receive Codex events:
-
-```bash
-codex-hermes-bridge hermes install \
-  --webhook-deliver telegram \
-  --webhook-deliver-chat-id <chat-id>
-```
-
-This is no longer the recommended route for direct Telegram reply-to-message control. If Hermes owns Telegram delivery, Hermes must persist platform message routes and forward replies back to the bridge. Direct bridge-owned Telegram avoids that dependency.
-
-`hermes post-webhook` remains available as the low-level signed HTTP poster. If `--secret` is omitted, it reads the secret from the daemon config written by `hermes install --webhook-deliver ...`.
-
 ## Suggested Hermes Instruction
 
 If your Hermes setup supports custom profile instructions or skills, add:
@@ -154,5 +140,6 @@ When the user asks about Codex work, use the Codex MCP tools first. Check codex_
 
 - This is a local trust boundary. Do not expose `codex-hermes-bridge mcp` on a remote transport.
 - MCP tools can read thread content and perform local Codex actions.
+- Telegram notifications and reply routing are configured with `codex-hermes-bridge setup`, not through Hermes.
 - Keep `sampling.enabled: false` unless you have a specific reason to let this server request model sampling from the client.
 - Use `dryRun: true` for reply and approve checks when you want Hermes to show the action shape before mutating Codex.

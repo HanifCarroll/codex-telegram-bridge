@@ -1,15 +1,16 @@
 # Telegram Setup
 
-Direct Telegram delivery is the primary product path for proactive Codex control.
+Telegram is the bridge-owned remote control surface for Codex.
 
-The bridge owns the Telegram bot transport:
+The intended behavior:
 
-- `daemon run` watches Codex state and sends Telegram messages directly.
-- The daemon stores Telegram `message_id -> thread_id` routes in SQLite.
-- A Telegram reply to a bridge-sent message is sent back to the originating Codex thread.
-- Approval notifications include `Approve` and `Deny` buttons that map to the same thread.
+- no Telegram notifications while you are at your computer
+- `away on` enables outbound Telegram notifications for new Codex updates
+- `away off` disables outbound Telegram notifications
+- replies to bridge-sent Telegram messages are routed back to the originating Codex thread
+- approval messages include `Approve` and `Deny` buttons
 
-Hermes is still useful as an agent control plane through MCP, but Hermes does not need to own Telegram delivery for direct reply routing to work.
+Hermes can still control Codex through MCP, but Hermes does not need to own Telegram delivery.
 
 ## Install
 
@@ -18,12 +19,12 @@ cargo install --path .
 codex-hermes-bridge doctor
 ```
 
-## Pair Telegram
+## One Command Setup
 
 Create a Telegram bot with `@BotFather`, then run:
 
 ```bash
-codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
+codex-hermes-bridge setup --bot-token <telegram-bot-token>
 ```
 
 When prompted by the JSON output, send `/start` to the bot from the chat that should receive Codex updates. The bridge records the chat id and user id in `~/.codex-hermes-bridge/config.json` with user-only file permissions.
@@ -31,13 +32,33 @@ When prompted by the JSON output, send `/start` to the bot from the chat that sh
 For non-interactive setup:
 
 ```bash
-codex-hermes-bridge telegram setup \
+codex-hermes-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
 ```
 
 The token can also come from `TELEGRAM_BOT_TOKEN`.
+
+## Lower-Level Telegram Setup
+
+If you want to configure Telegram without installing or starting the daemon:
+
+```bash
+codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
+codex-hermes-bridge telegram setup \
+  --bot-token <telegram-bot-token> \
+  --chat-id <telegram-chat-id> \
+  --allowed-user-id <telegram-user-id>
+```
+
+`telegram setup` clears any existing Telegram webhook for that bot token because the daemon uses local long polling for replies and button callbacks.
+
+## Test Delivery
+
+```bash
+codex-hermes-bridge telegram test --message "Codex bridge is ready"
+```
 
 ## Run The Daemon
 
@@ -55,17 +76,27 @@ codex-hermes-bridge daemon run --once
 codex-hermes-bridge daemon run
 ```
 
+## Presence Gate
+
+```bash
+codex-hermes-bridge away status
+codex-hermes-bridge away on
+codex-hermes-bridge away off
+```
+
+`away on` starts a new away session. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave. `away off` clears pending outbound notifications so delayed retries do not notify you after you return.
+
+Inbound Telegram replies and button callbacks are processed whenever the daemon is running. The away state only controls outbound notifications.
+
 ## Reply Flow
 
-When Codex needs attention, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, and calls the local Codex thread reply flow.
+When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, and calls the local Codex thread reply flow.
 
 For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
 
 ## Token Ownership
 
 Use a Telegram bot token dedicated to this bridge. Telegram update delivery should have one owner. If the same token is already used by another process or webhook, direct reply routing becomes ambiguous and unreliable.
-
-`telegram setup` clears an existing Telegram webhook before enabling local long polling for the bridge-owned bot.
 
 ## Status And Disable
 
@@ -74,6 +105,8 @@ codex-hermes-bridge telegram status
 codex-hermes-bridge telegram disable --dry-run
 codex-hermes-bridge telegram disable
 ```
+
+Disabling Telegram removes the daemon config file because Telegram is the only supported notification transport.
 
 ## Security Notes
 

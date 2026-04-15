@@ -1,21 +1,28 @@
 # codex-hermes-bridge
 
-`codex-hermes-bridge` is a Rust CLI for inspecting Codex threads, replying or approving when Codex needs attention, and streaming normalized JSON events for automation.
+`codex-hermes-bridge` lets a local assistant inspect and control Codex threads, and lets you keep working through Telegram when you explicitly mark yourself away.
 
-## Stable public surface
+The product rule is simple:
 
-This repo is currently focused on a small stable surface:
-- inspect threads and waiting work (`threads`, `show`, `waiting`, `inbox`, `sync`)
-- take action on a thread (`reply`, `approve`)
-- stream thread updates (`follow`, `watch`)
-- configure direct Telegram delivery and reply routing (`telegram setup/status/disable`)
-- run the proactive notification daemon (`daemon run/install/start/stop/status/logs`)
-- expose a local MCP control plane for Hermes (`mcp`, `hermes install`)
-- optionally push signed local webhook events into Hermes (`hermes post-webhook`)
+- when you are present at your computer, Codex does not send Telegram notifications
+- when you run `away on`, Codex updates go to Telegram
+- replying directly to a bridge-sent Telegram message sends that reply back to the originating Codex thread
+- `away off` stops outbound Telegram notifications again
 
-The CLI still includes lower-level maintenance commands such as `archive`, `unarchive`, `away`, and `notify-away`, but they are not part of the default Hermes MCP surface for the OSS release path.
+Hermes is optional. It uses the local MCP server when you ask Hermes to inspect, reply to, or approve Codex work. Hermes does not own Telegram notification delivery.
 
-Everything documented below is intended to be part of that public surface.
+## Stable Public Surface
+
+- Product setup: `setup`
+- Presence gate: `away on`, `away off`, `away status`
+- Direct Telegram transport: `telegram setup/status/test/disable`
+- Proactive daemon: `daemon run/install/start/stop/status/logs`
+- Thread inspection: `threads`, `show`, `waiting`, `inbox`, `sync`
+- Thread actions: `reply`, `approve`
+- Follow and event streams: `follow`, `watch`
+- Local Hermes MCP: `mcp`, `hermes install`
+
+Lower-level commands such as `new`, `fork`, `archive`, `unarchive`, and `watch --exec` remain available for local automation and maintenance, but they are not the recommended OSS onboarding path.
 
 ## Install
 
@@ -45,141 +52,102 @@ bin/codex-hermes-bridge --help
 
 The wrapper prefers `target/release/codex-hermes-bridge`, falls back to `target/debug/codex-hermes-bridge`, and builds the release binary on first use.
 
-`codex-hermes-bridge` resolves the Codex binary by checking each candidate with `codex --version`.
-If `CODEX_BIN` points at a missing or broken executable, the bridge skips it and falls back to other known candidates before using `PATH`.
+## Quick Start
 
-## Quick start
-
-Inspect the current Codex setup:
+Inspect your local Codex and bridge setup:
 
 ```bash
 codex-hermes-bridge doctor
 ```
 
-List recent threads:
+Configure Telegram and the daemon in one command:
 
 ```bash
-codex-hermes-bridge threads --limit 5
-```
-
-Run a one-shot watch pass and return normalized events:
-
-```bash
-codex-hermes-bridge watch --once
-```
-
-Configure direct Telegram delivery. The bridge owns the Telegram bot transport, stores message routes locally, and sends Telegram replies back to the originating Codex thread:
-
-```bash
-codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
+codex-hermes-bridge setup --bot-token <telegram-bot-token>
 ```
 
 For non-interactive setup:
 
 ```bash
-codex-hermes-bridge telegram setup \
+codex-hermes-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
 ```
 
-Install and start the local daemon:
+Test Telegram delivery:
 
 ```bash
-codex-hermes-bridge daemon install --dry-run
-codex-hermes-bridge daemon install
-codex-hermes-bridge daemon start
-codex-hermes-bridge daemon status
+codex-hermes-bridge telegram test --message "Codex bridge is ready"
 ```
 
-The daemon is what makes Codex changes notify you without another agent asking first. It writes outbound events and Telegram route state to local SQLite. Reply directly to a bridge-sent Telegram message to send that text back to the Codex thread.
+Turn on remote notifications when you leave your computer:
 
-To let Hermes inspect and control Codex when you ask Hermes directly, install the MCP control lane:
+```bash
+codex-hermes-bridge away on
+```
+
+Turn them off when you are back:
+
+```bash
+codex-hermes-bridge away off
+```
+
+If you want Hermes to control Codex when you ask it directly:
 
 ```bash
 codex-hermes-bridge hermes install --dry-run
 codex-hermes-bridge hermes install
 ```
 
-If you use a profile wrapper, pass it explicitly:
-
-```bash
-codex-hermes-bridge hermes install --hermes-command hermes-se
-```
-
 Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools.
+
+## How It Works
+
+`setup` writes `~/.codex-hermes-bridge/config.json` with user-only permissions, clears any existing Telegram webhook for the bot token, installs the local daemon service unless disabled, and can optionally register the Hermes MCP server.
+
+The daemon runs locally. Each cycle:
+
+1. syncs Codex thread state
+2. checks the local away state
+3. enqueues new notification events only when away is on
+4. sends queued events to Telegram
+5. processes Telegram replies and approval button callbacks
+
+Inbound Telegram replies are processed whenever the daemon is running. The away gate only controls outbound notifications.
+
+Use a Telegram bot token dedicated to this bridge. Telegram update delivery should have one owner.
 
 ## Commands
 
-### Inspect threads
+### Setup And Doctor
 
 ```bash
-codex-hermes-bridge threads --limit 25
-codex-hermes-bridge show <threadId>
-codex-hermes-bridge waiting --limit 25
-codex-hermes-bridge sync --limit 50
+codex-hermes-bridge setup --bot-token <telegram-bot-token>
+codex-hermes-bridge setup --bot-token <telegram-bot-token> --register-hermes
+codex-hermes-bridge doctor
 ```
 
-### Reply or approve
+Useful setup flags:
+
+- `--chat-id <id>`: skip `/start` pairing
+- `--allowed-user-id <id>`: restrict inbound replies/buttons to one Telegram user
+- `--no-install-daemon`: write config without installing a service
+- `--no-start-daemon`: install without starting the service
+- `--register-hermes`: also run `hermes mcp add`
+- `--dry-run`: print the planned shape without changing files or services
+
+### Presence Gate
 
 ```bash
-codex-hermes-bridge reply <threadId> --message "please continue"
-codex-hermes-bridge approve <threadId> --decision approve
+codex-hermes-bridge away status
+codex-hermes-bridge away on
+codex-hermes-bridge away off
 ```
 
-### Follow a thread
+`away on` starts a new away session. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave. `away off` clears pending outbound notifications so delayed retries do not notify you after you return.
 
-Stream normalized JSON events for a thread.
-
-```bash
-codex-hermes-bridge follow <threadId>
-codex-hermes-bridge follow <threadId> --message "please continue" --duration 3000
-codex-hermes-bridge follow <threadId> --poll-interval 500
-codex-hermes-bridge follow <threadId> --events follow_snapshot,item_completed
-```
-
-Useful flags:
-- `--message <text>`: starts a turn before following
-- `--duration <ms>`: follow window length
-- `--poll-interval <ms>`: periodic thread snapshot refresh cadence
-- `--events <csv>`: only emit matching event types
-
-### Composed follow flows
-
-Run the action and follow in the same app-server session.
-
-```bash
-codex-hermes-bridge new --message "start work" --follow
-codex-hermes-bridge reply <threadId> --message "please continue" --follow
-codex-hermes-bridge approve <threadId> approve --follow
-codex-hermes-bridge fork <threadId> --message "try another path" --follow
-```
-
-By default, composed follow events are embedded in the final JSON result at `follow.events`.
-
-For live JSONL streaming instead, add `--stream`:
-
-```bash
-codex-hermes-bridge new --message "start work" --follow --stream --events follow_snapshot,item_completed
-```
-
-### Watch for changes
-
-Stream normalized JSON events from sync reconciliation.
-
-```bash
-codex-hermes-bridge watch
-codex-hermes-bridge watch --once
-codex-hermes-bridge watch --events thread_waiting,thread_completed,item_completed
-codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
-```
-
-Useful flags:
-- `--once`: run one sync pass and return JSON
-- `--events <csv>`: filter emitted events
-- `--exec <command>`: pipe each emitted event to a hook command on stdin
-
-### Direct Telegram transport
+### Telegram
 
 ```bash
 codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
@@ -187,20 +155,14 @@ codex-hermes-bridge telegram setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
+codex-hermes-bridge telegram test --message "test"
 codex-hermes-bridge telegram status
-codex-hermes-bridge telegram disable --dry-run
 codex-hermes-bridge telegram disable
 ```
 
-`telegram setup` writes `~/.codex-hermes-bridge/config.json` with user-only permissions. It clears any existing Telegram webhook for that bot token because the daemon uses local long polling to receive replies and button callbacks.
-
-Use a dedicated Telegram bot token for this bridge. Telegram update delivery should have one owner.
-
 See [docs/telegram.md](docs/telegram.md).
 
-### Proactive daemon
-
-The daemon watches Codex state, writes outbound notification events to SQLite, sends configured delivery transports, and processes Telegram replies/buttons.
+### Daemon
 
 ```bash
 codex-hermes-bridge daemon run --once
@@ -218,86 +180,47 @@ codex-hermes-bridge daemon logs
 - macOS: `~/Library/LaunchAgents/com.hanifcarroll.codex-hermes-bridge.plist`
 - Linux: `~/.config/systemd/user/com.hanifcarroll.codex-hermes-bridge.service`
 
-### Manual webhook posting
-
-`hermes post-webhook` is the lower-level Hermes webhook lane. It reads one watch event from stdin, wraps it for Hermes, signs it with `X-Hub-Signature-256`, and posts it to a local Hermes webhook route.
+### Inspect And Act On Threads
 
 ```bash
-codex-hermes-bridge hermes post-webhook \
-  --url http://localhost:8644/webhooks/codex-watch < event.json
+codex-hermes-bridge threads --limit 25
+codex-hermes-bridge show <threadId>
+codex-hermes-bridge waiting --limit 25
+codex-hermes-bridge inbox --limit 25
+codex-hermes-bridge reply <threadId> --message "please continue"
+codex-hermes-bridge approve <threadId> --decision approve
 ```
 
-If `--secret` is omitted, the command reads the secret from `~/.codex-hermes-bridge/config.json`.
-
-### Archive threads
-
-Archive explicit threads or selected inbox rows.
+### Follow And Watch
 
 ```bash
-codex-hermes-bridge archive --thread-id thr_123 --dry-run
-codex-hermes-bridge archive --project my-app --status idle --dry-run
-codex-hermes-bridge archive --project my-app --status idle --yes
-codex-hermes-bridge unarchive thr_123 --dry-run
-```
-
-Archive commands that select from the inbox are treated as bulk operations.
-They require `--dry-run` or `--yes`; explicit thread IDs do not require the bulk confirmation.
-
-### Away mode
-
-Track when you are away and emit attention-needed summaries.
-
-```bash
-codex-hermes-bridge away on
-codex-hermes-bridge notify-away
-codex-hermes-bridge notify-away --no-completed
-codex-hermes-bridge away off
-```
-
-`notify-away` syncs live Codex state first, dedupes notifications, and returns thread context for reply, approval, and completed-thread prompts. Completed-thread notifications are included by default; pass `--no-completed` to only emit active attention prompts.
-
-### Hermes MCP
-
-Run a stdio MCP server that exposes Codex thread tools to Hermes:
-
-```bash
-codex-hermes-bridge mcp
-```
-
-The default MCP server exposes structured tools for `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve`. It also exposes resources for thread context and prompts for safe inbox/reply/approval workflows.
-
-`watch`, `new`, `fork`, `archive`, `unarchive`, `away`, and `notify-away` are intentionally not exposed as default MCP tools. The MCP lane should stay bounded and action-focused; proactive notification belongs in the daemon lane.
-
-See [docs/hermes.md](docs/hermes.md) for the Hermes MCP setup guide.
-
-## Hook examples
-
-`watch --exec` pipes one event at a time to the given command on stdin. Hook stdout and stderr pass through to the terminal, and a nonzero hook exit fails the bridge command.
-
-### Print matching events
-
-```bash
+codex-hermes-bridge follow <threadId>
+codex-hermes-bridge follow <threadId> --message "please continue" --duration 3000
+codex-hermes-bridge follow <threadId> --events follow_snapshot,item_completed
+codex-hermes-bridge watch --once
+codex-hermes-bridge watch --events thread_waiting,thread_completed,item_completed
 codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
 ```
 
-### Custom Telegram notifications
+`watch --exec` is for trusted local automation. It pipes each event to the command on stdin.
+
+### Hermes MCP
 
 ```bash
-export TELEGRAM_BOT_TOKEN=...
-export TELEGRAM_CHAT_ID=...
-codex-hermes-bridge watch --exec "python3 examples/notify-telegram.py"
+codex-hermes-bridge mcp
+codex-hermes-bridge hermes install --dry-run
+codex-hermes-bridge hermes install
+codex-hermes-bridge hermes install --hermes-command hermes-se
 ```
 
-This example is a low-level hook for custom scripts. The product path is `telegram setup` plus `daemon run`, which handles reply routing. The example expects:
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+The MCP server exposes `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve` tools, plus thread resources and safe prompts.
 
-Do not hardcode secrets in the example file or commit them to the repo.
+See [docs/hermes.md](docs/hermes.md).
 
-## Event schema
+## Event Schema
 
-The stream is newline-delimited JSON.
-Common stable event types include:
+The stream is newline-delimited JSON. Common event types include:
+
 - `watch_started`
 - `thread_waiting`
 - `thread_completed`
@@ -326,22 +249,9 @@ Example `thread_waiting` event:
 }
 ```
 
-Example `follow_snapshot` event:
-
-```json
-{
-  "type": "follow_snapshot",
-  "threadId": "thr_123",
-  "thread": {
-    "id": "thr_123",
-    "name": "Need reply"
-  }
-}
-```
-
 ## Notes
 
 - Hook commands are arbitrary local code. Only run trusted commands with `watch --exec`.
 - MCP tools can read and mutate local Codex threads. Only register this server with trusted local agents.
-- The bridge stores local state in its SQLite cache so repeated commands can reconcile thread state efficiently.
-- `doctor` is the fastest way to verify that the Codex binary can actually be resolved from your environment.
+- The Telegram bot token is stored in the local bridge config and redacted from command output.
+- `doctor` is the fastest way to verify that the Codex binary and bridge configuration are discoverable from your environment.

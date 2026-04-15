@@ -15,6 +15,10 @@ Instead, report vulnerabilities privately to the maintainer with:
 This project can:
 - execute local hook commands via `watch --exec`
 - read and persist local Codex thread metadata/state
-- send notifications through user-supplied integrations/examples
+- store a local Telegram bot token for bridge-owned notification delivery
+- send Telegram notifications only when the local away gate is enabled
+- route Telegram replies and approval button callbacks back into local Codex threads
 
-Please treat local environment details, thread content, and secrets used in downstream hooks as potentially sensitive.
+Please treat local environment details, thread content, Telegram bot tokens, and secrets used in downstream hooks as potentially sensitive.
+
+Do not expose the MCP stdio server or daemon state directory to untrusted users. Use a Telegram bot token dedicated to this bridge, and set `--allowed-user-id` during setup when possible.
