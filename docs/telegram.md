@@ -9,7 +9,7 @@ The intended behavior:
 - `away off` disables outbound Telegram notifications
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - approval messages include `Approve` and `Deny` buttons
-- slash commands can toggle away mode, inspect state, and start new Codex threads from Telegram
+- slash commands can toggle away mode, inspect state, pick a project, and start new Codex threads from Telegram
 
 Hermes can still control Codex through MCP when you ask it to, but Hermes and MCP do not own Telegram delivery.
 
@@ -127,6 +127,23 @@ Use the buttons below, or use Telegram's Reply action on this message.
 
 Codex app directives such as `::inbox-item{...}` are not stripped or summarized. They are part of the Codex answer body, so Telegram receives the same final answer that appears in the Codex app.
 
+## Project Registry
+
+Telegram-created threads use the bridge's local project registry so every remote thread starts with an explicit `cwd`.
+
+Manage the registry locally:
+
+```bash
+codex-telegram-bridge projects list
+codex-telegram-bridge projects add /absolute/path --id bridge --label "Codex Telegram Bridge"
+codex-telegram-bridge projects import --limit 25
+codex-telegram-bridge projects remove bridge
+```
+
+`projects import` bootstraps the registry from observed `cwd` values already cached in the bridge's local `threads_cache` table. Imported ids are derived from the directory name and made unique automatically.
+
+Each Telegram chat/user also keeps a current project selection in the local bridge state. `/new_thread` uses that selected project unless there is only one configured project.
+
 ## Slash Commands
 
 The bridge accepts these standalone Telegram commands from the paired chat and allowed user:
@@ -136,8 +153,12 @@ The bridge accepts these standalone Telegram commands from the paired chat and a
 - `/away_on`: enable away mode notifications
 - `/away_off`: disable away mode notifications and clear pending outbound notifications
 - `/status`: show away mode, pending delivery count, and waiting thread count
-- `/new_thread <prompt>`: create a new Codex thread and send the prompt immediately
-- `/new_thread`: ask for a prompt; use Telegram's Reply action on the prompt message to create the thread
+- `/project <id>`: set the current project for future Telegram-created threads
+- `/project`: show the current project selection
+- `/projects`: list configured projects and recent observed workspaces
+- `/new_thread <prompt>`: create a new Codex thread in the current project and send the prompt immediately
+- `/new_thread <project>: <prompt>`: override the current project once for that thread
+- `/new_thread`: ask for a prompt; use Telegram's Reply action on the prompt message to create the thread in the selected project
 - `/inbox`: show actionable cached Codex inbox rows
 - `/waiting`: show cached threads waiting for user input or approval
 - `/recent`: show recent cached Codex threads
@@ -145,7 +166,7 @@ The bridge accepts these standalone Telegram commands from the paired chat and a
 
 Commands only run as standalone messages. If a message is a Telegram reply to a Codex notification, the text is sent back to that Codex thread verbatim, even if it starts with `/`.
 
-When `/new_thread` succeeds, the confirmation message now includes the working directory returned by Codex, if the app server assigned one. The bridge itself currently does not set an explicit cwd for Telegram-created threads; it calls `thread/start` without a cwd and reports back what Codex returned.
+When `/new_thread` succeeds, the bridge sends the selected project `cwd` into `thread/start` and `turn/start`, then includes the confirmed working directory in the Telegram confirmation message.
 
 ## Token Ownership
 

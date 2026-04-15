@@ -124,6 +124,11 @@ enum Commands {
         #[command(subcommand)]
         command: TelegramCommands,
     },
+    #[command(about = "Manage the curated project registry for Telegram-created threads")]
+    Projects {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
     #[command(
         hide = true,
         about = "Sync live Codex thread state into the local cache"
@@ -345,6 +350,40 @@ enum TelegramCommands {
     },
     #[command(about = "Remove direct Telegram transport configuration")]
     Disable {
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectCommands {
+    #[command(about = "List configured projects and observed workspace candidates")]
+    List {
+        #[arg(long, default_value_t = 10)]
+        observed_limit: u64,
+    },
+    #[command(about = "Add one curated project to the registry")]
+    Add {
+        cwd: String,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long = "alias")]
+        aliases: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    #[command(about = "Import curated project entries from observed Codex workspaces")]
+    Import {
+        #[arg(long, default_value_t = 25)]
+        limit: u64,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    #[command(about = "Remove one project from the curated registry")]
+    Remove {
+        id: String,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -854,6 +893,31 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string(&result)?);
             }
         },
+        Commands::Projects { command } => match command {
+            ProjectCommands::List { observed_limit } => {
+                let result = projects_list_result(observed_limit)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            ProjectCommands::Add {
+                cwd,
+                id,
+                label,
+                aliases,
+                dry_run,
+            } => {
+                let result =
+                    project_add_result(&cwd, id.as_deref(), label.as_deref(), &aliases, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            ProjectCommands::Import { limit, dry_run } => {
+                let result = project_import_result(limit, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            ProjectCommands::Remove { id, dry_run } => {
+                let result = project_remove_result(&id, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+        },
         Commands::Sync { limit } => {
             let now = now_millis()?;
             let db_path = state_db_path()?;
@@ -1335,6 +1399,207 @@ fn derive_project_label(cwd: Option<&str>) -> Option<String> {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn slugify_project_token(value: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut last_was_sep = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if matches!(ch, '-' | '_' | ' ' | '.') && !last_was_sep {
+            slug.push('-');
+            last_was_sep = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    (!slug.is_empty()).then_some(slug)
+}
+
+fn normalize_project_aliases(aliases: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for alias in aliases {
+        if let Some(alias) = slugify_project_token(alias) {
+            if seen.insert(alias.clone()) {
+                normalized.push(alias);
+            }
+        }
+    }
+    normalized
+}
+
+fn ensure_unique_project_id(base: &str, existing_ids: &BTreeSet<String>) -> String {
+    if !existing_ids.contains(base) {
+        return base.to_string();
+    }
+    let mut index = 2_u64;
+    loop {
+        let candidate = format!("{base}-{index}");
+        if !existing_ids.contains(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn canonicalize_project_cwd(cwd: &str) -> Result<String> {
+    let path = PathBuf::from(cwd.trim());
+    if path.as_os_str().is_empty() {
+        bail!("project cwd cannot be empty");
+    }
+    if !path.is_absolute() {
+        bail!("project cwd must be an absolute path");
+    }
+    match fs::canonicalize(&path) {
+        Ok(resolved) => Ok(resolved.display().to_string()),
+        Err(_) => Ok(path.display().to_string()),
+    }
+}
+
+fn build_registered_project(
+    cwd: &str,
+    id: Option<&str>,
+    label: Option<&str>,
+    aliases: &[String],
+    existing_projects: &[RegisteredProject],
+) -> Result<RegisteredProject> {
+    let cwd = canonicalize_project_cwd(cwd)?;
+    let label = label
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| derive_project_label(Some(&cwd)))
+        .context("could not derive project label from cwd; pass --label")?;
+    let requested_id = id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| slugify_project_token(&label))
+        .context("could not derive project id from label; pass --id")?;
+    let normalized_id = slugify_project_token(&requested_id)
+        .context("project id must contain letters or digits")?;
+    if existing_projects
+        .iter()
+        .any(|project| project.id == normalized_id && project.cwd != cwd)
+    {
+        bail!("project id `{normalized_id}` is already in use");
+    }
+    let aliases = normalize_project_aliases(aliases)
+        .into_iter()
+        .filter(|alias| alias != &normalized_id)
+        .collect::<Vec<_>>();
+    Ok(RegisteredProject {
+        id: normalized_id,
+        label,
+        cwd,
+        aliases,
+    })
+}
+
+fn resolve_project_query<'a>(
+    projects: &'a [RegisteredProject],
+    query: &str,
+) -> Result<&'a RegisteredProject> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("project query cannot be empty");
+    }
+    let normalized = query.to_ascii_lowercase();
+    let exact = projects
+        .iter()
+        .filter(|project| {
+            project.id.eq_ignore_ascii_case(&normalized)
+                || project
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&normalized))
+                || project.label.eq_ignore_ascii_case(query)
+        })
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    if exact.len() > 1 {
+        bail!("project query `{query}` is ambiguous");
+    }
+    let prefix = projects
+        .iter()
+        .filter(|project| {
+            project.id.starts_with(&normalized)
+                || project
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.starts_with(&normalized))
+                || project.label.to_ascii_lowercase().starts_with(&normalized)
+        })
+        .collect::<Vec<_>>();
+    match prefix.as_slice() {
+        [project] => Ok(*project),
+        [] => bail!("project `{query}` was not found"),
+        _ => bail!("project query `{query}` is ambiguous"),
+    }
+}
+
+fn observed_workspaces_from_db(conn: &Connection, limit: u64) -> Result<Vec<ObservedWorkspace>> {
+    let mut stmt = conn.prepare(
+        "SELECT cwd, MAX(COALESCE(updated_at, last_seen_at, 0)) AS seen_at
+         FROM threads_cache
+         WHERE cwd IS NOT NULL AND TRIM(cwd) != ''
+         GROUP BY cwd
+         ORDER BY seen_at DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![to_sql_i64(limit)?], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(cwd, seen_at)| {
+            let cwd = canonicalize_project_cwd(&cwd)?;
+            Ok(ObservedWorkspace {
+                label: derive_project_label(Some(&cwd)).unwrap_or_else(|| cwd.clone()),
+                cwd,
+                last_seen_at: optional_from_sql_i64(seen_at)?,
+            })
+        })
+        .collect()
+}
+
+fn importable_projects_from_observed(
+    observed: &[ObservedWorkspace],
+    existing_projects: &[RegisteredProject],
+) -> Vec<RegisteredProject> {
+    let mut projects = Vec::new();
+    let mut existing_ids = existing_projects
+        .iter()
+        .map(|project| project.id.clone())
+        .collect::<BTreeSet<_>>();
+    let existing_cwds = existing_projects
+        .iter()
+        .map(|project| project.cwd.clone())
+        .collect::<BTreeSet<_>>();
+    for workspace in observed {
+        if existing_cwds.contains(&workspace.cwd)
+            || projects
+                .iter()
+                .any(|project: &RegisteredProject| project.cwd == workspace.cwd)
+        {
+            continue;
+        }
+        let base_id =
+            slugify_project_token(&workspace.label).unwrap_or_else(|| "project".to_string());
+        let id = ensure_unique_project_id(&base_id, &existing_ids);
+        existing_ids.insert(id.clone());
+        projects.push(RegisteredProject {
+            id,
+            label: workspace.label.clone(),
+            cwd: workspace.cwd.clone(),
+            aliases: Vec::new(),
+        });
+    }
+    projects
 }
 
 fn derive_thread_display_name(
@@ -1846,6 +2111,7 @@ fn init_state_db(conn: &Connection) -> Result<()> {
           chat_id TEXT NOT NULL,
           message_id INTEGER NOT NULL,
           command TEXT NOT NULL,
+          payload_json TEXT,
           created_at INTEGER NOT NULL,
           used_at INTEGER,
           PRIMARY KEY(chat_id, message_id)
@@ -1882,6 +2148,7 @@ fn init_state_db(conn: &Connection) -> Result<()> {
     )?;
     ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
+    ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
     Ok(())
 }
 
@@ -2840,6 +3107,35 @@ fn get_setting_text(conn: &Connection, key: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
+fn telegram_current_project_key(chat_id: &str, user_id: Option<&str>) -> String {
+    format!(
+        "telegram_current_project:{}:{}",
+        chat_id,
+        user_id.unwrap_or("*")
+    )
+}
+
+fn get_telegram_current_project_id(
+    conn: &Connection,
+    chat_id: &str,
+    user_id: Option<&str>,
+) -> Result<Option<String>> {
+    get_setting_text(conn, &telegram_current_project_key(chat_id, user_id))
+}
+
+fn set_telegram_current_project_id(
+    conn: &Connection,
+    chat_id: &str,
+    user_id: Option<&str>,
+    project_id: &str,
+) -> Result<()> {
+    set_setting_text(
+        conn,
+        &telegram_current_project_key(chat_id, user_id),
+        project_id,
+    )
+}
+
 fn get_away_mode(conn: &Connection) -> Result<Value> {
     let away_started_at = get_setting_number(conn, "away_started_at")?;
     if get_setting_text(conn, "away")?.is_none() {
@@ -3793,6 +4089,8 @@ struct DaemonConfig {
     events: String,
     #[serde(default)]
     telegram: Option<TelegramConfig>,
+    #[serde(default)]
+    projects: Vec<RegisteredProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3802,6 +4100,23 @@ struct TelegramConfig {
     chat_id: String,
     #[serde(default)]
     allowed_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct RegisteredProject {
+    id: String,
+    label: String,
+    cwd: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedWorkspace {
+    cwd: String,
+    label: String,
+    last_seen_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3848,6 +4163,8 @@ enum TelegramInboundCommand {
     AwayOff,
     Status,
     NewThread(Option<String>),
+    Project(Option<String>),
+    Projects,
     Inbox,
     Waiting,
     Recent,
@@ -3879,6 +4196,7 @@ impl TelegramCommandRouteKind {
 struct RoutedTelegramCommandPromptReply {
     kind: TelegramCommandRouteKind,
     message: String,
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3934,8 +4252,31 @@ struct OutboxDeliverySummary {
     failed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedNewThreadRequest<'a> {
+    project: &'a RegisteredProject,
+    prompt: Option<String>,
+}
+
 fn daemon_config_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("config.json"))
+}
+
+fn merged_daemon_config(
+    existing: Option<&DaemonConfig>,
+    bridge_command: &str,
+    events: &str,
+    telegram: TelegramConfig,
+) -> DaemonConfig {
+    DaemonConfig {
+        version: 3,
+        bridge_command: bridge_command.to_string(),
+        events: events.to_string(),
+        telegram: Some(telegram),
+        projects: existing
+            .map(|config| config.projects.clone())
+            .unwrap_or_default(),
+    }
 }
 
 fn write_daemon_config(config: &DaemonConfig) -> Result<PathBuf> {
@@ -3972,6 +4313,17 @@ fn load_daemon_config() -> Result<DaemonConfig> {
         }
         None => bail!("daemon config must include Telegram transport. Run `codex-telegram-bridge setup` or `codex-telegram-bridge telegram setup`."),
     }
+    for project in &config.projects {
+        if project.id.trim().is_empty() {
+            bail!("daemon config project id cannot be empty");
+        }
+        if project.label.trim().is_empty() {
+            bail!("daemon config project label cannot be empty");
+        }
+        if project.cwd.trim().is_empty() {
+            bail!("daemon config project cwd cannot be empty");
+        }
+    }
     Ok(config)
 }
 
@@ -3984,7 +4336,13 @@ fn redacted_daemon_config(config: &DaemonConfig) -> Value {
             "botToken": "<redacted>",
             "chatId": telegram.chat_id,
             "allowedUserId": telegram.allowed_user_id
-        }))
+        })),
+        "projects": config.projects.iter().map(|project| json!({
+            "id": project.id,
+            "label": project.label,
+            "cwd": project.cwd,
+            "aliases": project.aliases
+        })).collect::<Vec<_>>()
     })
 }
 
@@ -4137,12 +4495,8 @@ fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result<Value> {
         discover_telegram_pairing(&bot_token, options.pair_timeout_ms)?
     };
 
-    let config = DaemonConfig {
-        version: 2,
-        bridge_command: bridge_command.to_string(),
-        events: events.to_string(),
-        telegram: Some(paired.clone()),
-    };
+    let existing = read_daemon_config_raw()?;
+    let config = merged_daemon_config(existing.as_ref(), bridge_command, events, paired.clone());
     let commands = telegram_bot_commands();
     let commands_registration = if options.dry_run {
         json!({ "registered": false, "dryRun": true, "commands": commands })
@@ -4240,6 +4594,94 @@ fn telegram_disable_result(dry_run: bool) -> Result<Value> {
         "hadTelegram": had_telegram,
         "configPath": path.display().to_string(),
         "removedConfig": removes_config
+    }))
+}
+
+fn projects_list_result(observed_limit: u64) -> Result<Value> {
+    let config = load_daemon_config()?;
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    let observed = observed_workspaces_from_db(&conn, observed_limit)?;
+    let importable = importable_projects_from_observed(&observed, &config.projects);
+    Ok(json!({
+        "ok": true,
+        "action": "projects_list",
+        "configured": config.projects,
+        "observed": observed.into_iter().map(|workspace| json!({
+            "label": workspace.label,
+            "cwd": workspace.cwd,
+            "lastSeenAt": workspace.last_seen_at
+        })).collect::<Vec<_>>(),
+        "importable": importable
+    }))
+}
+
+fn project_add_result(
+    cwd: &str,
+    id: Option<&str>,
+    label: Option<&str>,
+    aliases: &[String],
+    dry_run: bool,
+) -> Result<Value> {
+    let mut config = load_daemon_config()?;
+    let project = build_registered_project(cwd, id, label, aliases, &config.projects)?;
+    if config
+        .projects
+        .iter()
+        .any(|existing| existing.cwd == project.cwd)
+    {
+        bail!("project cwd `{}` is already registered", project.cwd);
+    }
+    if !dry_run {
+        config.projects.push(project.clone());
+        write_daemon_config(&config)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "projects_add",
+        "dryRun": dry_run,
+        "project": project
+    }))
+}
+
+fn project_import_result(limit: u64, dry_run: bool) -> Result<Value> {
+    let mut config = load_daemon_config()?;
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    let observed = observed_workspaces_from_db(&conn, limit)?;
+    let importable = importable_projects_from_observed(&observed, &config.projects);
+    if !dry_run && !importable.is_empty() {
+        config.projects.extend(importable.clone());
+        write_daemon_config(&config)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "projects_import",
+        "dryRun": dry_run,
+        "imported": importable,
+        "count": importable.len()
+    }))
+}
+
+fn project_remove_result(id: &str, dry_run: bool) -> Result<Value> {
+    let mut config = load_daemon_config()?;
+    let Some(project) = config
+        .projects
+        .iter()
+        .find(|project| project.id == id)
+        .cloned()
+    else {
+        bail!("project `{id}` was not found");
+    };
+    if !dry_run {
+        config.projects.retain(|candidate| candidate.id != id);
+        write_daemon_config(&config)?;
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "projects_remove",
+        "dryRun": dry_run,
+        "project": project
     }))
 }
 
@@ -4365,6 +4807,8 @@ fn telegram_bot_commands() -> Vec<Value> {
         json!({ "command": "away_off", "description": "Disable away mode notifications" }),
         json!({ "command": "status", "description": "Show away mode and pending delivery status" }),
         json!({ "command": "new_thread", "description": "Start a new Codex thread from Telegram" }),
+        json!({ "command": "project", "description": "Show or switch the current project" }),
+        json!({ "command": "projects", "description": "List configured projects and suggestions" }),
         json!({ "command": "inbox", "description": "Show actionable Codex inbox rows" }),
         json!({ "command": "waiting", "description": "Show threads waiting for you" }),
         json!({ "command": "recent", "description": "Show recent Codex threads" }),
@@ -4503,6 +4947,8 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
         "/away_off" => Some(TelegramInboundCommand::AwayOff),
         "/status" => Some(TelegramInboundCommand::Status),
         "/new_thread" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
+        "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
+        "/projects" => Some(TelegramInboundCommand::Projects),
         "/inbox" => Some(TelegramInboundCommand::Inbox),
         "/waiting" => Some(TelegramInboundCommand::Waiting),
         "/recent" => Some(TelegramInboundCommand::Recent),
@@ -4778,15 +5224,17 @@ fn insert_telegram_command_route(
     chat_id: &str,
     message_id: i64,
     kind: TelegramCommandRouteKind,
+    payload: Option<&Value>,
     now: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO telegram_command_routes(chat_id, message_id, command, created_at, used_at)
-         VALUES (?1, ?2, ?3, ?4, NULL)",
+        "INSERT OR REPLACE INTO telegram_command_routes(chat_id, message_id, command, payload_json, created_at, used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
         params![
             chat_id,
             message_id,
             kind.as_str(),
+            payload.map(serde_json::to_string).transpose()?,
             to_sql_i64(now)?
         ],
     )?;
@@ -4823,18 +5271,26 @@ fn lookup_telegram_command_route(
     conn: &Connection,
     chat_id: &str,
     message_id: i64,
-) -> Result<Option<TelegramCommandRouteKind>> {
+) -> Result<Option<(TelegramCommandRouteKind, Option<Value>)>> {
     let command = conn
         .query_row(
-            "SELECT command FROM telegram_command_routes
+            "SELECT command, payload_json FROM telegram_command_routes
              WHERE chat_id = ?1 AND message_id = ?2 AND used_at IS NULL",
             params![chat_id, message_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
         .optional()?;
-    Ok(command
-        .as_deref()
-        .and_then(TelegramCommandRouteKind::from_str))
+    match command {
+        Some((command, payload_json)) => {
+            Ok(TelegramCommandRouteKind::from_str(&command).map(|kind| {
+                (
+                    kind,
+                    payload_json.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()),
+                )
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 fn mark_telegram_command_route_used(
@@ -4911,12 +5367,18 @@ fn extract_telegram_command_prompt_reply(
     else {
         return Ok(None);
     };
-    let Some(kind) = lookup_telegram_command_route(conn, &chat_id, reply_message_id)? else {
+    let Some((kind, payload)) = lookup_telegram_command_route(conn, &chat_id, reply_message_id)?
+    else {
         return Ok(None);
     };
     Ok(Some(RoutedTelegramCommandPromptReply {
         kind,
         message: message_text.to_string(),
+        project_id: payload
+            .as_ref()
+            .and_then(|value| value.get("projectId"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }))
 }
 
@@ -5120,6 +5582,123 @@ fn send_codex_approval_to_thread(
     }))
 }
 
+fn current_project_for_identity<'a>(
+    config: &'a DaemonConfig,
+    conn: &Connection,
+    chat_id: &str,
+    user_id: Option<&str>,
+) -> Result<Option<&'a RegisteredProject>> {
+    if let Some(project_id) = get_telegram_current_project_id(conn, chat_id, user_id)? {
+        if let Some(project) = config
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)
+        {
+            return Ok(Some(project));
+        }
+    }
+    if config.projects.len() == 1 {
+        return Ok(config.projects.first());
+    }
+    Ok(None)
+}
+
+fn resolve_new_thread_request<'a>(
+    projects: &'a [RegisteredProject],
+    current_project: Option<&'a RegisteredProject>,
+    raw_prompt: Option<&str>,
+) -> Result<ResolvedNewThreadRequest<'a>> {
+    let prompt = raw_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (project, prompt) = match prompt {
+        Some(prompt) => {
+            if let Some((project_query, rest)) = prompt.split_once(':') {
+                let project_query = project_query.trim();
+                let rest = rest.trim();
+                if !project_query.is_empty() {
+                    if let Ok(project) = resolve_project_query(projects, project_query) {
+                        return Ok(ResolvedNewThreadRequest {
+                            project,
+                            prompt: (!rest.is_empty()).then_some(rest.to_string()),
+                        });
+                    }
+                }
+            }
+            match current_project.or_else(|| (projects.len() == 1).then_some(&projects[0])) {
+                Some(project) => (project, Some(prompt)),
+                None => bail!("No current project selected. Use /project <id> first."),
+            }
+        }
+        None => match current_project.or_else(|| (projects.len() == 1).then_some(&projects[0])) {
+            Some(project) => (project, None),
+            None => bail!("No current project selected. Use /project <id> first."),
+        },
+    };
+    Ok(ResolvedNewThreadRequest { project, prompt })
+}
+
+fn telegram_projects_text(
+    config: &DaemonConfig,
+    current_project: Option<&RegisteredProject>,
+    observed: &[ObservedWorkspace],
+) -> String {
+    let mut lines = vec!["Projects".to_string(), String::new()];
+    match current_project {
+        Some(project) => lines.push(format!("Current: {} ({})", project.id, project.label)),
+        None => lines.push("Current: none selected".to_string()),
+    }
+    if config.projects.is_empty() {
+        lines.push(String::new());
+        lines.push("No projects are configured yet.".to_string());
+    } else {
+        lines.push(String::new());
+        lines.push("Configured:".to_string());
+        for project in &config.projects {
+            let current = current_project
+                .map(|current| current.id == project.id)
+                .unwrap_or(false);
+            let marker = if current { "•" } else { "-" };
+            lines.push(format!(
+                "{marker} {} - {}",
+                project.id,
+                trim_for_telegram_line(&project.label, 80)
+            ));
+            lines.push(format!("  {}", project.cwd));
+        }
+    }
+    if !observed.is_empty() {
+        lines.push(String::new());
+        lines.push("Observed from recent Codex history:".to_string());
+        for workspace in observed.iter().take(5) {
+            lines.push(format!(
+                "- {} - {}",
+                workspace.label,
+                trim_for_telegram_line(&workspace.cwd, 90)
+            ));
+        }
+        lines.push(
+            "Run `codex-telegram-bridge projects import` locally to promote observed workspaces into the curated registry."
+                .to_string(),
+        );
+    }
+    lines.push(String::new());
+    lines.push("Use /project <id> to switch the current project.".to_string());
+    lines.join("\n")
+}
+
+fn telegram_project_text(project: Option<&RegisteredProject>) -> String {
+    match project {
+        Some(project) => format!(
+            "Current project\n\n{} ({})\n{}\n\nNew Telegram threads will start here until you switch again.",
+            project.id, project.label, project.cwd
+        ),
+        None => "No current project is selected.\n\nUse /projects to inspect the registry, then /project <id> to choose one."
+            .to_string(),
+    }
+}
+
 fn telegram_help_text() -> String {
     [
         "Codex remote is ready.",
@@ -5131,6 +5710,8 @@ fn telegram_help_text() -> String {
         "/status - show bridge status",
         "/new_thread <prompt> - start a new Codex thread",
         "/new_thread - ask for a prompt in a reply",
+        "/project <id> - switch the current project",
+        "/projects - list configured projects",
         "/inbox - show actionable threads",
         "/waiting - show threads waiting for you",
         "/recent - show recent threads",
@@ -5176,7 +5757,11 @@ fn telegram_status_text(conn: &Connection) -> Result<String> {
     ))
 }
 
-fn telegram_settings_text(telegram: &TelegramConfig, conn: &Connection) -> Result<String> {
+fn telegram_settings_text(
+    telegram: &TelegramConfig,
+    conn: &Connection,
+    configured_projects: usize,
+) -> Result<String> {
     let away = get_away_mode(conn)?;
     let allowed_user = telegram
         .allowed_user_id
@@ -5188,7 +5773,7 @@ fn telegram_settings_text(telegram: &TelegramConfig, conn: &Connection) -> Resul
         "off"
     };
     Ok(format!(
-        "Telegram bridge settings\n\nChat: connected\nAllowed user: {allowed_user}\nAway mode: {away_label}\n\nNotifications keep Codex's final answer verbatim. To continue a thread, use Telegram's Reply action on that specific notification."
+        "Telegram bridge settings\n\nChat: connected\nAllowed user: {allowed_user}\nAway mode: {away_label}\nConfigured projects: {configured_projects}\n\nNotifications keep Codex's final answer verbatim. To continue a thread, use Telegram's Reply action on that specific notification."
     ))
 }
 
@@ -5285,18 +5870,29 @@ fn telegram_recent_text(conn: &Connection) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-fn start_new_thread_from_telegram(conn: &Connection, message: &str, now: u64) -> Result<Value> {
+fn start_new_thread_from_telegram(
+    conn: &Connection,
+    project: &RegisteredProject,
+    message: &str,
+    now: u64,
+) -> Result<Value> {
     let mut client = CodexAppServerClient::connect()?;
-    let created = client.request("thread/start", thread_start_params(None))?;
+    let created = client.request("thread/start", thread_start_params(Some(&project.cwd)))?;
     let thread_id = thread_id_from_response(&created)
         .context("Codex app-server thread/start response missing thread.id")?;
-    let started = client.request("turn/start", turn_start_params(&thread_id, None, message))?;
-    let result = new_thread_live_result(None, Some(message), created, Some(started));
+    let started = client.request(
+        "turn/start",
+        turn_start_params(&thread_id, Some(&project.cwd), message),
+    )?;
+    let result = new_thread_live_result(Some(&project.cwd), Some(message), created, Some(started));
     record_action(
         conn,
         &thread_id,
         "telegram_new_thread",
         json!({
+            "projectId": project.id,
+            "projectLabel": project.label,
+            "cwd": project.cwd,
             "message": message,
             "result": result.clone(),
             "sentAt": now
@@ -5306,19 +5902,27 @@ fn start_new_thread_from_telegram(conn: &Connection, message: &str, now: u64) ->
     Ok(result)
 }
 
-fn telegram_new_thread_confirmation_text(result: &Value) -> Result<String> {
+fn telegram_new_thread_confirmation_text(
+    project: &RegisteredProject,
+    result: &Value,
+) -> Result<String> {
     let cwd = result.get("cwd").and_then(Value::as_str);
     Ok(match cwd {
         Some(cwd) if !cwd.trim().is_empty() => format!(
-            "Started a new Codex thread in:\n{cwd}\n\nUse Telegram's Reply action on this message to continue it."
+            "Started a new Codex thread in {}.\n{cwd}\n\nUse Telegram's Reply action on this message to continue it.",
+            project.label
         ),
-        _ => "Started a new Codex thread with no explicit working directory.\n\nUse Telegram's Reply action on this message to continue it.".to_string(),
+        _ => format!(
+            "Started a new Codex thread in {} with no explicit working directory reported back.\n\nUse Telegram's Reply action on this message to continue it.",
+            project.label
+        ),
     })
 }
 
 fn send_new_thread_confirmation(
     conn: &Connection,
     telegram: &TelegramConfig,
+    project: &RegisteredProject,
     result: &Value,
     timeout: Duration,
     now: u64,
@@ -5327,7 +5931,7 @@ fn send_new_thread_confirmation(
         .get("threadId")
         .and_then(Value::as_str)
         .context("new thread result missing threadId")?;
-    let text = telegram_new_thread_confirmation_text(result)?;
+    let text = telegram_new_thread_confirmation_text(project, result)?;
     let message_id = telegram_send_text_message_id(telegram, &text, timeout)?;
     insert_telegram_message_route(
         conn,
@@ -5345,13 +5949,44 @@ fn send_new_thread_confirmation(
     }))
 }
 
+fn send_new_thread_prompt_for_project(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    project: &RegisteredProject,
+    timeout: Duration,
+    now: u64,
+) -> Result<Value> {
+    let text = format!(
+        "What should Codex work on in {}?\n{}\n\nUse Telegram's Reply action on this message with the prompt for the new thread.",
+        project.label, project.cwd
+    );
+    let message_id = telegram_send_text_message_id(telegram, &text, timeout)?;
+    insert_telegram_command_route(
+        conn,
+        &telegram.chat_id,
+        message_id,
+        TelegramCommandRouteKind::NewThread,
+        Some(&json!({ "projectId": project.id })),
+        now,
+    )?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_new_thread_prompt",
+        "projectId": project.id,
+        "messageId": message_id
+    }))
+}
+
 fn execute_telegram_command(
     conn: &Connection,
     telegram: &TelegramConfig,
+    message: &Value,
     command: TelegramInboundCommand,
     now: u64,
     timeout: Duration,
 ) -> Result<Value> {
+    let chat_id = telegram_chat_id(message).context("Telegram command missing chat.id")?;
+    let user_id = telegram_from_user_id(message);
     match command {
         TelegramInboundCommand::Start | TelegramInboundCommand::Help => {
             let sent = telegram_send_text(telegram, &telegram_help_text(), timeout)?;
@@ -5384,25 +6019,151 @@ fn execute_telegram_command(
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
         TelegramInboundCommand::NewThread(Some(prompt)) => {
-            let result = start_new_thread_from_telegram(conn, &prompt, now)?;
-            let confirmation = send_new_thread_confirmation(conn, telegram, &result, timeout, now)?;
-            Ok(
-                json!({ "ok": true, "action": "telegram_new_thread", "result": result, "confirmation": confirmation }),
-            )
+            let config = load_daemon_config()?;
+            let current_project =
+                current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
+            match resolve_new_thread_request(&config.projects, current_project, Some(&prompt)) {
+                Ok(request) => {
+                    if let Some(prompt) = request.prompt.as_deref() {
+                        let result =
+                            start_new_thread_from_telegram(conn, request.project, prompt, now)?;
+                        let confirmation = send_new_thread_confirmation(
+                            conn,
+                            telegram,
+                            request.project,
+                            &result,
+                            timeout,
+                            now,
+                        )?;
+                        Ok(json!({
+                            "ok": true,
+                            "action": "telegram_new_thread",
+                            "projectId": request.project.id,
+                            "result": result,
+                            "confirmation": confirmation
+                        }))
+                    } else {
+                        send_new_thread_prompt_for_project(
+                            conn,
+                            telegram,
+                            request.project,
+                            timeout,
+                            now,
+                        )
+                    }
+                }
+                Err(error) => {
+                    let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
+                    let sent = telegram_send_text(
+                        telegram,
+                        &format!(
+                            "{}\n\n{}",
+                            error,
+                            telegram_projects_text(&config, current_project, &observed)
+                        ),
+                        timeout,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "action": "telegram_new_thread_needs_project",
+                        "sent": sent
+                    }))
+                }
+            }
         }
         TelegramInboundCommand::NewThread(None) => {
-            let text = "What should Codex work on?\n\nUse Telegram's Reply action on this message with the prompt for the new thread.";
-            let message_id = telegram_send_text_message_id(telegram, text, timeout)?;
-            insert_telegram_command_route(
-                conn,
-                &telegram.chat_id,
-                message_id,
-                TelegramCommandRouteKind::NewThread,
-                now,
+            let config = load_daemon_config()?;
+            let current_project =
+                current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
+            match resolve_new_thread_request(&config.projects, current_project, None) {
+                Ok(request) => send_new_thread_prompt_for_project(
+                    conn,
+                    telegram,
+                    request.project,
+                    timeout,
+                    now,
+                ),
+                Err(error) => {
+                    let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
+                    let sent = telegram_send_text(
+                        telegram,
+                        &format!(
+                            "{}\n\n{}",
+                            error,
+                            telegram_projects_text(&config, current_project, &observed)
+                        ),
+                        timeout,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "action": "telegram_new_thread_needs_project",
+                        "sent": sent
+                    }))
+                }
+            }
+        }
+        TelegramInboundCommand::Project(Some(query)) => {
+            let config = load_daemon_config()?;
+            match resolve_project_query(&config.projects, &query) {
+                Ok(project) => {
+                    set_telegram_current_project_id(
+                        conn,
+                        &chat_id,
+                        user_id.as_deref(),
+                        &project.id,
+                    )?;
+                    let sent = telegram_send_text(
+                        telegram,
+                        &telegram_project_text(Some(project)),
+                        timeout,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "action": "telegram_project_set",
+                        "projectId": project.id,
+                        "sent": sent
+                    }))
+                }
+                Err(error) => {
+                    let current_project =
+                        current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
+                    let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
+                    let sent = telegram_send_text(
+                        telegram,
+                        &format!(
+                            "{}\n\n{}",
+                            error,
+                            telegram_projects_text(&config, current_project, &observed)
+                        ),
+                        timeout,
+                    )?;
+                    Ok(json!({
+                        "ok": true,
+                        "action": "telegram_project_not_found",
+                        "sent": sent
+                    }))
+                }
+            }
+        }
+        TelegramInboundCommand::Project(None) => {
+            let config = load_daemon_config()?;
+            let current_project =
+                current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
+            let sent =
+                telegram_send_text(telegram, &telegram_project_text(current_project), timeout)?;
+            Ok(json!({ "ok": true, "action": "telegram_project", "sent": sent }))
+        }
+        TelegramInboundCommand::Projects => {
+            let config = load_daemon_config()?;
+            let current_project =
+                current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
+            let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
+            let sent = telegram_send_text(
+                telegram,
+                &telegram_projects_text(&config, current_project, &observed),
+                timeout,
             )?;
-            Ok(
-                json!({ "ok": true, "action": "telegram_new_thread_prompt", "messageId": message_id }),
-            )
+            Ok(json!({ "ok": true, "action": "telegram_projects", "sent": sent }))
         }
         TelegramInboundCommand::Inbox => {
             let sent = telegram_send_text(telegram, &telegram_inbox_text(conn, now)?, timeout)?;
@@ -5417,8 +6178,12 @@ fn execute_telegram_command(
             Ok(json!({ "ok": true, "action": "telegram_recent", "sent": sent }))
         }
         TelegramInboundCommand::Settings => {
-            let sent =
-                telegram_send_text(telegram, &telegram_settings_text(telegram, conn)?, timeout)?;
+            let config = load_daemon_config()?;
+            let sent = telegram_send_text(
+                telegram,
+                &telegram_settings_text(telegram, conn, config.projects.len())?,
+                timeout,
+            )?;
             Ok(json!({ "ok": true, "action": "telegram_settings", "sent": sent }))
         }
         TelegramInboundCommand::Unknown(command) => {
@@ -5444,18 +6209,68 @@ fn execute_telegram_command_prompt_reply(
 ) -> Result<Value> {
     let chat_id =
         telegram_chat_id(message).context("Telegram command prompt reply missing chat.id")?;
+    let user_id = telegram_from_user_id(message);
     let reply_message_id = message
         .get("reply_to_message")
         .and_then(telegram_message_id)
         .context("Telegram command prompt reply missing reply_to_message.message_id")?;
     match route.kind {
         TelegramCommandRouteKind::NewThread => {
-            let result = start_new_thread_from_telegram(conn, &route.message, now)?;
+            let config = load_daemon_config()?;
+            let current_project =
+                current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
+            let project = match route.project_id.as_deref() {
+                Some(project_id) => match config
+                    .projects
+                    .iter()
+                    .find(|project| project.id == project_id)
+                {
+                    Some(project) => Some(project),
+                    None => {
+                        let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
+                        let sent = telegram_send_text(
+                            telegram,
+                            &format!(
+                                "That project is no longer available. Pick a project first, then start the thread again.\n\n{}",
+                                telegram_projects_text(&config, current_project, &observed)
+                            ),
+                            timeout,
+                        )?;
+                        mark_telegram_command_route_used(conn, &chat_id, reply_message_id, now)?;
+                        return Ok(json!({
+                            "ok": true,
+                            "action": "telegram_new_thread_prompt_missing_project",
+                            "sent": sent
+                        }));
+                    }
+                },
+                None => current_project,
+            };
+            let Some(project) = project else {
+                let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
+                let sent = telegram_send_text(
+                    telegram,
+                    &format!(
+                        "No project is selected for that prompt. Use /project <id> first, then try /new_thread again.\n\n{}",
+                        telegram_projects_text(&config, current_project, &observed)
+                    ),
+                    timeout,
+                )?;
+                mark_telegram_command_route_used(conn, &chat_id, reply_message_id, now)?;
+                return Ok(json!({
+                    "ok": true,
+                    "action": "telegram_new_thread_prompt_needs_project",
+                    "sent": sent
+                }));
+            };
+            let result = start_new_thread_from_telegram(conn, project, &route.message, now)?;
             mark_telegram_command_route_used(conn, &chat_id, reply_message_id, now)?;
-            let confirmation = send_new_thread_confirmation(conn, telegram, &result, timeout, now)?;
+            let confirmation =
+                send_new_thread_confirmation(conn, telegram, project, &result, timeout, now)?;
             Ok(json!({
                 "ok": true,
                 "action": "telegram_new_thread_prompt_reply",
+                "projectId": project.id,
                 "result": result,
                 "confirmation": confirmation
             }))
@@ -5526,7 +6341,8 @@ fn process_telegram_updates(
                 }
                 command_prompt_replies += 1;
             } else if let Some(command) = extract_telegram_command(message, telegram)? {
-                let result = execute_telegram_command(conn, telegram, command, now, timeout)?;
+                let result =
+                    execute_telegram_command(conn, telegram, message, command, now, timeout)?;
                 if let Some(update_id) = update_id {
                     record_telegram_inbound_processed(
                         conn,
@@ -7913,6 +8729,18 @@ mod tests {
             Some(TelegramInboundCommand::NewThread(None))
         );
         assert_eq!(
+            parse_telegram_command_text("/project bridge"),
+            Some(TelegramInboundCommand::Project(Some("bridge".to_string())))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/project"),
+            Some(TelegramInboundCommand::Project(None))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/projects"),
+            Some(TelegramInboundCommand::Projects)
+        );
+        assert_eq!(
             parse_telegram_command_text("/unknown"),
             Some(TelegramInboundCommand::Unknown("/unknown".to_string()))
         );
@@ -7963,8 +8791,15 @@ mod tests {
     #[test]
     fn telegram_command_prompt_routes_map_reply_to_new_thread_prompt() {
         let conn = create_state_db_in_memory().expect("db");
-        insert_telegram_command_route(&conn, "456", 222, TelegramCommandRouteKind::NewThread, 1000)
-            .expect("insert command route");
+        insert_telegram_command_route(
+            &conn,
+            "456",
+            222,
+            TelegramCommandRouteKind::NewThread,
+            Some(&json!({ "projectId": "bridge" })),
+            1000,
+        )
+        .expect("insert command route");
 
         let route = extract_telegram_command_prompt_reply(
             &conn,
@@ -7985,6 +8820,7 @@ mod tests {
 
         assert_eq!(route.kind, TelegramCommandRouteKind::NewThread);
         assert_eq!(route.message, "Build the mobile proof report");
+        assert_eq!(route.project_id.as_deref(), Some("bridge"));
     }
 
     #[test]
@@ -8004,6 +8840,8 @@ mod tests {
                 "away_off",
                 "status",
                 "new_thread",
+                "project",
+                "projects",
                 "inbox",
                 "waiting",
                 "recent",
@@ -9771,13 +10609,210 @@ raise SystemExit(1)
 
     #[test]
     fn telegram_new_thread_confirmation_reports_working_directory() {
-        let message = telegram_new_thread_confirmation_text(&json!({
-            "threadId": "thr_new",
-            "cwd": "/Users/hanifcarroll/projects/ui-experiment"
-        }))
+        let message = telegram_new_thread_confirmation_text(
+            &RegisteredProject {
+                id: "ui-exp".to_string(),
+                label: "UI Experiment".to_string(),
+                cwd: "/Users/hanifcarroll/projects/ui-experiment".to_string(),
+                aliases: Vec::new(),
+            },
+            &json!({
+                "threadId": "thr_new",
+                "cwd": "/Users/hanifcarroll/projects/ui-experiment"
+            }),
+        )
         .expect("message");
 
         assert!(message.contains("/Users/hanifcarroll/projects/ui-experiment"));
         assert!(message.contains("Use Telegram's Reply action on this message to continue it."));
+    }
+
+    #[test]
+    fn cli_accepts_project_registry_commands() {
+        for args in [
+            vec!["codex-telegram-bridge", "projects", "list"],
+            vec![
+                "codex-telegram-bridge",
+                "projects",
+                "add",
+                "/Users/hanifcarroll/projects/codex-telegram-bridge",
+                "--id",
+                "bridge",
+                "--label",
+                "Codex Telegram Bridge",
+                "--alias",
+                "codex",
+            ],
+            vec![
+                "codex-telegram-bridge",
+                "projects",
+                "import",
+                "--limit",
+                "10",
+            ],
+            vec![
+                "codex-telegram-bridge",
+                "projects",
+                "remove",
+                "bridge",
+                "--dry-run",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(args.clone());
+            assert!(
+                parsed.is_ok(),
+                "projects command should parse: {args:?}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_daemon_config_preserves_existing_projects() {
+        let merged = merged_daemon_config(
+            Some(&DaemonConfig {
+                version: 2,
+                bridge_command: "old-bridge".to_string(),
+                events: "thread_waiting".to_string(),
+                telegram: Some(TelegramConfig {
+                    bot_token: "old".to_string(),
+                    chat_id: "old-chat".to_string(),
+                    allowed_user_id: None,
+                }),
+                projects: vec![RegisteredProject {
+                    id: "bridge".to_string(),
+                    label: "Codex Telegram Bridge".to_string(),
+                    cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
+                    aliases: vec!["codex".to_string()],
+                }],
+            }),
+            "codex-telegram-bridge",
+            DEFAULT_NOTIFICATION_EVENTS,
+            TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            },
+        );
+
+        assert_eq!(merged.version, 3);
+        assert_eq!(merged.projects.len(), 1);
+        assert_eq!(merged.projects[0].id, "bridge");
+        assert_eq!(merged.telegram.as_ref().unwrap().chat_id, "456");
+    }
+
+    #[test]
+    fn project_query_matches_id_alias_and_label() {
+        let projects = vec![
+            RegisteredProject {
+                id: "bridge".to_string(),
+                label: "Codex Telegram Bridge".to_string(),
+                cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
+                aliases: vec!["codex".to_string(), "telegram-bridge".to_string()],
+            },
+            RegisteredProject {
+                id: "ui-exp".to_string(),
+                label: "UI Experiment".to_string(),
+                cwd: "/Users/hanifcarroll/projects/ui-experiment".to_string(),
+                aliases: vec!["ui".to_string()],
+            },
+        ];
+
+        assert_eq!(
+            resolve_project_query(&projects, "bridge").expect("id").id,
+            "bridge"
+        );
+        assert_eq!(
+            resolve_project_query(&projects, "codex").expect("alias").id,
+            "bridge"
+        );
+        assert_eq!(
+            resolve_project_query(&projects, "UI Experiment")
+                .expect("label")
+                .id,
+            "ui-exp"
+        );
+    }
+
+    #[test]
+    fn new_thread_request_uses_current_project_and_override() {
+        let projects = vec![
+            RegisteredProject {
+                id: "bridge".to_string(),
+                label: "Codex Telegram Bridge".to_string(),
+                cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
+                aliases: vec!["codex".to_string()],
+            },
+            RegisteredProject {
+                id: "ui-exp".to_string(),
+                label: "UI Experiment".to_string(),
+                cwd: "/Users/hanifcarroll/projects/ui-experiment".to_string(),
+                aliases: vec!["ui".to_string()],
+            },
+        ];
+
+        let current = resolve_project_query(&projects, "bridge").expect("current");
+        let defaulted =
+            resolve_new_thread_request(&projects, Some(current), Some("Fix Telegram UX"))
+                .expect("default request");
+        assert_eq!(defaulted.project.id, "bridge");
+        assert_eq!(defaulted.prompt.as_deref(), Some("Fix Telegram UX"));
+
+        let overridden =
+            resolve_new_thread_request(&projects, Some(current), Some("ui: tighten hero spacing"))
+                .expect("override request");
+        assert_eq!(overridden.project.id, "ui-exp");
+        assert_eq!(overridden.prompt.as_deref(), Some("tighten hero spacing"));
+    }
+
+    #[test]
+    fn project_current_selection_round_trips_per_identity() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_telegram_current_project_id(&conn, "chat-1", Some("user-1"), "bridge")
+            .expect("set current");
+
+        assert_eq!(
+            get_telegram_current_project_id(&conn, "chat-1", Some("user-1"))
+                .expect("get current")
+                .as_deref(),
+            Some("bridge")
+        );
+        assert_eq!(
+            get_telegram_current_project_id(&conn, "chat-1", Some("user-2"))
+                .expect("get other")
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn project_import_suggests_unique_ids_from_observed_workspaces() {
+        let conn = create_state_db_in_memory().expect("db");
+        let alpha = snapshot_fixture(
+            "thr_alpha",
+            "/Users/hanifcarroll/projects/client-a/app",
+            2000,
+            "active",
+            vec![],
+            Some("in_progress"),
+        );
+        let beta = snapshot_fixture(
+            "thr_beta",
+            "/Users/hanifcarroll/projects/client-b/app",
+            3000,
+            "active",
+            vec![],
+            Some("in_progress"),
+        );
+        upsert_thread_snapshot(&conn, &alpha, 2000).expect("upsert alpha");
+        upsert_thread_snapshot(&conn, &beta, 3000).expect("upsert beta");
+
+        let imported = importable_projects_from_observed(
+            &observed_workspaces_from_db(&conn, 10).expect("observed"),
+            &[],
+        );
+
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].id, "app");
+        assert_eq!(imported[1].id, "app-2");
     }
 }

@@ -18,8 +18,9 @@ You do not need Hermes for the default product flow. A normal install is Codex p
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
 - Direct Telegram transport: `telegram setup/status/test/disable`
-- Telegram remote controls: `/away_on`, `/away_off`, `/status`, `/new_thread`, `/inbox`, `/waiting`, `/recent`, `/settings`
+- Telegram remote controls: `/away_on`, `/away_off`, `/status`, `/project`, `/projects`, `/new_thread`, `/inbox`, `/waiting`, `/recent`, `/settings`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
+- Project registry: `projects list/add/import/remove`
 - Thread inspection: `threads`, `show`, `waiting`, `inbox`
 - Thread actions: `reply`, `approve`
 
@@ -127,6 +128,8 @@ Inbound Telegram replies are processed whenever the daemon is running. The away 
 
 Telegram notifications use a compact header, keep Codex's answer body verbatim, and omit internal thread ids. To continue the conversation remotely, use Telegram's Reply action on the specific Codex notification.
 
+Telegram-created threads run in an explicit registered project working directory. Set the current project from Telegram with `/project <id>`, inspect choices with `/projects`, or manage the registry locally with `codex-telegram-bridge projects ...`.
+
 Use a Telegram bot token dedicated to this bridge. Telegram update delivery should have one owner.
 
 ## Commands
@@ -172,6 +175,17 @@ codex-telegram-bridge telegram disable
 ```
 
 See [docs/telegram.md](docs/telegram.md).
+
+### Projects
+
+```bash
+codex-telegram-bridge projects list
+codex-telegram-bridge projects add /absolute/path --id bridge --label "Codex Telegram Bridge"
+codex-telegram-bridge projects import --limit 25
+codex-telegram-bridge projects remove bridge
+```
+
+Use the project registry to give Telegram-created threads deterministic working directories. `projects import` suggests entries from observed Codex thread `cwd` values in the local state cache; `projects add` is the explicit source of truth.
 
 ### Daemon
 
