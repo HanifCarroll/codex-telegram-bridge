@@ -697,9 +697,10 @@ fn run() -> Result<()> {
         } => {
             let mut targets = Vec::new();
             if let Some(raw) = thread_id_option {
+                let raw = raw.as_str();
                 targets.extend(
                     raw.split(',')
-                        .map(|value: &str| value.trim())
+                        .map(str::trim)
                         .filter(|value| !value.is_empty())
                         .map(str::to_string),
                 );
