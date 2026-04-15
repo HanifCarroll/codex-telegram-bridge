@@ -41,6 +41,13 @@ codex-telegram-bridge setup \
 
 The token can also come from `TELEGRAM_BOT_TOKEN`.
 
+For manual recovery or first-run audits, sample files live at:
+
+- [examples/config.example.json](../examples/config.example.json)
+- [examples/telegram.env.example](../examples/telegram.env.example)
+
+The preferred setup path is still `setup` or `telegram setup`, because those flows also validate the token, clear old webhooks, and pair the target chat/user.
+
 ## Lower-Level Telegram Setup
 
 If you want to configure Telegram without installing or starting the daemon:
@@ -188,3 +195,32 @@ Disabling Telegram removes the daemon config file because Telegram is the only s
 - Command output redacts the bot token.
 - `allowed_user_id` restricts inbound Telegram replies and button callbacks to the paired user.
 - MCP remains local stdio only; do not expose it on an untrusted remote transport.
+
+## Token Rotation
+
+If the Telegram bot token is exposed or you want to rotate it:
+
+1. revoke or rotate the token with `@BotFather`
+2. run `codex-telegram-bridge telegram disable` if you want to remove the old local config immediately
+3. run `codex-telegram-bridge setup --bot-token <new-token>` or `codex-telegram-bridge telegram setup --bot-token <new-token>`
+4. restart the daemon if you rotated the token without rerunning the full `setup` flow
+
+The bridge does not keep historical token versions. Once the config file is replaced, only the latest token remains on disk.
+
+## Local Retention And Deletion
+
+The local bridge state lives under `~/.codex-telegram-bridge/` and typically contains:
+
+- `config.json`: bridge/Telegram config and project registry
+- `state.db`: cached thread metadata, message routing ids, inbound update dedupe, and other local bridge state
+- `daemon.out.log` and `daemon.err.log`: daemon logs
+
+Retention is local and indefinite until you delete or replace those files.
+
+To remove only the Telegram config:
+
+```bash
+codex-telegram-bridge telegram disable
+```
+
+To remove all local bridge state, stop the daemon first and then delete `~/.codex-telegram-bridge/`.

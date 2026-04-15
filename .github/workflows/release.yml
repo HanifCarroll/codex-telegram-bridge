@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Verify package
+        run: cargo package --locked --target-dir target/package-check
+
+  build:
+    name: Build ${{ matrix.os }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGET_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+          STAGING_DIR="dist/codex-telegram-bridge-${VERSION}-${TARGET_TRIPLE}"
+          mkdir -p "$STAGING_DIR"
+          cp target/release/codex-telegram-bridge "$STAGING_DIR/"
+          cp README.md LICENSE CHANGELOG.md "$STAGING_DIR/"
+          ARCHIVE="codex-telegram-bridge-${VERSION}-${TARGET_TRIPLE}.tar.gz"
+          tar -C dist -czf "$ARCHIVE" "$(basename "$STAGING_DIR")"
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Generate release notes from changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - <<'PY' "$VERSION" > RELEASE_NOTES.md
+          import sys
+          version = sys.argv[1]
+          header = f"## {version} - "
+          lines = open("CHANGELOG.md", encoding="utf-8").read().splitlines()
+          capture = False
+          collected = []
+          for line in lines:
+              if line.startswith(header):
+                  capture = True
+                  continue
+              if capture and line.startswith("## "):
+                  break
+              if capture:
+                  collected.append(line)
+          text = "\n".join(collected).strip()
+          if not text:
+              raise SystemExit(f"Missing changelog entry for {version}")
+          print(text)
+          PY
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md
+          fi
+          find dist -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' \) -print0 \
+            | xargs -0 gh release upload "$TAG" --clobber
+
+      - name: Publish to crates.io when token is configured
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not configured; skipping crates.io publish."
+            exit 0
+          fi
+          VERSION="$(sed -n 's/^version = \"\\(.*\\)\"/\\1/p' Cargo.toml | head -n 1)"
+          if cargo search codex-telegram-bridge --limit 1 | grep -q "codex-telegram-bridge = \"${VERSION}\""; then
+            echo "codex-telegram-bridge ${VERSION} is already published; skipping."
+            exit 0
+          fi
+          cargo publish --locked

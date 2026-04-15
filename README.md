@@ -52,6 +52,8 @@ Install from Git:
 cargo install --git https://github.com/hanifcarroll/codex-telegram-bridge
 ```
 
+Download a prebuilt archive from [GitHub Releases](https://github.com/HanifCarroll/codex-telegram-bridge/releases) when a tagged release is available.
+
 Run through the wrapper without installing:
 
 ```bash
@@ -59,6 +61,8 @@ bin/codex-telegram-bridge --help
 ```
 
 The wrapper prefers `target/release/codex-telegram-bridge`, falls back to `target/debug/codex-telegram-bridge`, and builds the release binary on first use.
+
+If you need a manual recovery template instead of the interactive setup path, copy [examples/config.example.json](examples/config.example.json) to `~/.codex-telegram-bridge/config.json`, replace the placeholder values, and keep the file mode user-only (`chmod 600 ~/.codex-telegram-bridge/config.json`). For token-only setup from environment, see [examples/telegram.env.example](examples/telegram.env.example).
 
 ## Quick Start
 
@@ -175,6 +179,8 @@ codex-telegram-bridge telegram disable
 ```
 
 See [docs/telegram.md](docs/telegram.md).
+
+Release mechanics are documented in [docs/releasing.md](docs/releasing.md).
 
 ### Projects
 

@@ -7,9 +7,9 @@ Thanks for contributing to `codex-telegram-bridge`.
 ```bash
 cargo fmt --check
 cargo test
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
-cargo package --allow-dirty --target-dir target/package-check
+cargo package --locked --target-dir target/package-check
 ```
 
 Keep changes narrowly scoped. Prefer small, reviewable diffs over broad refactors.
@@ -40,8 +40,12 @@ Never commit credentials, tokens, or local environment files. Keep examples envi
 Before opening a PR, make sure:
 - `cargo fmt --check` passes
 - `cargo test` passes
-- `cargo clippy --all-targets -- -D warnings` passes
-- `cargo package --allow-dirty --target-dir target/package-check` verifies the release package
+- `cargo clippy --all-targets --all-features -- -D warnings` passes
+- `cargo package --locked --target-dir target/package-check` verifies the release package
 - docs/examples still match the CLI surface
 - MCP tool schemas and Hermes setup docs still match the implemented tool surface
 - Telegram notification docs still describe bridge-owned delivery gated by `away on/off`
+
+## Releases
+
+Tagged releases are documented in [docs/releasing.md](docs/releasing.md). The short version: update `CHANGELOG.md`, verify the repo locally, tag `vX.Y.Z`, and push the tag to trigger the GitHub release workflow.

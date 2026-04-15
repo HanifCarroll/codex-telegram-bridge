@@ -2,7 +2,11 @@
 
 All notable changes to `codex-telegram-bridge` will be documented here.
 
-## 0.1.0 - Unreleased
+## Unreleased
+
+No unreleased changes yet.
+
+## 0.1.0 - 2026-04-15
 
 Initial OSS release candidate.
 

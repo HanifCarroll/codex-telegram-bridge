@@ -27,7 +27,7 @@ jobs:
         run: cargo test
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Verify package
-        run: cargo package --allow-dirty --target-dir target/package-check
+        run: cargo package --locked --target-dir target/package-check
