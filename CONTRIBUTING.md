@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to `codex-hermes-bridge`.
+Thanks for contributing to `codex-telegram-bridge`.
 
 ## Development workflow
 

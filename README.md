@@ -1,6 +1,6 @@
-# codex-hermes-bridge
+# codex-telegram-bridge
 
-`codex-hermes-bridge` lets a local assistant inspect and control Codex threads, and lets you keep working through Telegram when you explicitly mark yourself away.
+`codex-telegram-bridge` lets a local assistant inspect and control Codex threads, and lets you keep working through Telegram when you explicitly mark yourself away.
 
 The product rule is simple:
 
@@ -24,7 +24,7 @@ Advanced commands such as `sync`, `follow`, `watch`, `new`, `fork`, `archive`, `
 
 ## Optional Agent Adapter
 
-MCP is an optional local adapter for Hermes and other trusted agent clients. It exposes only `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve` through `codex-hermes-bridge mcp`.
+MCP is an optional local adapter for Hermes and other trusted agent clients. It exposes only `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve` through `codex-telegram-bridge mcp`.
 
 MCP does not send proactive notifications, install the daemon, configure Telegram, read Telegram updates, or expose the advanced event stream. Use `setup`, `away`, and the daemon for the Telegram product flow.
 
@@ -45,35 +45,35 @@ cargo install --path .
 Install from Git:
 
 ```bash
-cargo install --git https://github.com/hanifcarroll/codex-hermes-bridge
+cargo install --git https://github.com/hanifcarroll/codex-telegram-bridge
 ```
 
 Run through the wrapper without installing:
 
 ```bash
-bin/codex-hermes-bridge --help
+bin/codex-telegram-bridge --help
 ```
 
-The wrapper prefers `target/release/codex-hermes-bridge`, falls back to `target/debug/codex-hermes-bridge`, and builds the release binary on first use.
+The wrapper prefers `target/release/codex-telegram-bridge`, falls back to `target/debug/codex-telegram-bridge`, and builds the release binary on first use.
 
 ## Quick Start
 
 Inspect your local Codex and bridge setup:
 
 ```bash
-codex-hermes-bridge doctor
+codex-telegram-bridge doctor
 ```
 
 Configure Telegram and the daemon in one command:
 
 ```bash
-codex-hermes-bridge setup --bot-token <telegram-bot-token>
+codex-telegram-bridge setup --bot-token <telegram-bot-token>
 ```
 
 For non-interactive setup:
 
 ```bash
-codex-hermes-bridge setup \
+codex-telegram-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
@@ -82,33 +82,33 @@ codex-hermes-bridge setup \
 Test Telegram delivery:
 
 ```bash
-codex-hermes-bridge telegram test --message "Codex bridge is ready"
+codex-telegram-bridge telegram test --message "Codex bridge is ready"
 ```
 
 Turn on remote notifications when you leave your computer:
 
 ```bash
-codex-hermes-bridge away on
+codex-telegram-bridge away on
 ```
 
 Turn them off when you are back:
 
 ```bash
-codex-hermes-bridge away off
+codex-telegram-bridge away off
 ```
 
 Optional: if you want Hermes to control Codex when you ask it directly:
 
 ```bash
-codex-hermes-bridge hermes install --dry-run
-codex-hermes-bridge hermes install
+codex-telegram-bridge hermes install --dry-run
+codex-telegram-bridge hermes install
 ```
 
 Restart Hermes after registration so it reconnects to MCP servers and discovers the `codex_*` tools.
 
 ## How It Works
 
-`setup` writes `~/.codex-hermes-bridge/config.json` with user-only permissions, clears any existing Telegram webhook for the bot token, installs the local daemon service unless disabled, and can optionally register the Hermes MCP server.
+`setup` writes `~/.codex-telegram-bridge/config.json` with user-only permissions, clears any existing Telegram webhook for the bot token, installs the local daemon service unless disabled, and can optionally register the Hermes MCP server.
 
 The daemon runs locally. Each cycle:
 
@@ -127,9 +127,9 @@ Use a Telegram bot token dedicated to this bridge. Telegram update delivery shou
 ### Setup And Doctor
 
 ```bash
-codex-hermes-bridge setup --bot-token <telegram-bot-token>
-codex-hermes-bridge setup --bot-token <telegram-bot-token> --register-hermes
-codex-hermes-bridge doctor
+codex-telegram-bridge setup --bot-token <telegram-bot-token>
+codex-telegram-bridge setup --bot-token <telegram-bot-token> --register-hermes
+codex-telegram-bridge doctor
 ```
 
 Useful setup flags:
@@ -144,9 +144,9 @@ Useful setup flags:
 ### Presence Gate
 
 ```bash
-codex-hermes-bridge away status
-codex-hermes-bridge away on
-codex-hermes-bridge away off
+codex-telegram-bridge away status
+codex-telegram-bridge away on
+codex-telegram-bridge away off
 ```
 
 `away on` starts a new away session. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave. `away off` clears pending outbound notifications so delayed retries do not notify you after you return.
@@ -154,14 +154,14 @@ codex-hermes-bridge away off
 ### Telegram
 
 ```bash
-codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
-codex-hermes-bridge telegram setup \
+codex-telegram-bridge telegram setup --bot-token <telegram-bot-token>
+codex-telegram-bridge telegram setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
-codex-hermes-bridge telegram test --message "test"
-codex-hermes-bridge telegram status
-codex-hermes-bridge telegram disable
+codex-telegram-bridge telegram test --message "test"
+codex-telegram-bridge telegram status
+codex-telegram-bridge telegram disable
 ```
 
 See [docs/telegram.md](docs/telegram.md).
@@ -169,41 +169,41 @@ See [docs/telegram.md](docs/telegram.md).
 ### Daemon
 
 ```bash
-codex-hermes-bridge daemon run --once
-codex-hermes-bridge daemon run
-codex-hermes-bridge daemon install --dry-run
-codex-hermes-bridge daemon install
-codex-hermes-bridge daemon start
-codex-hermes-bridge daemon stop
-codex-hermes-bridge daemon status
-codex-hermes-bridge daemon logs
+codex-telegram-bridge daemon run --once
+codex-telegram-bridge daemon run
+codex-telegram-bridge daemon install --dry-run
+codex-telegram-bridge daemon install
+codex-telegram-bridge daemon start
+codex-telegram-bridge daemon stop
+codex-telegram-bridge daemon status
+codex-telegram-bridge daemon logs
 ```
 
 `daemon install` writes a user service:
 
-- macOS: `~/Library/LaunchAgents/com.hanifcarroll.codex-hermes-bridge.plist`
-- Linux: `~/.config/systemd/user/com.hanifcarroll.codex-hermes-bridge.service`
+- macOS: `~/Library/LaunchAgents/com.hanifcarroll.codex-telegram-bridge.plist`
+- Linux: `~/.config/systemd/user/com.hanifcarroll.codex-telegram-bridge.service`
 
 ### Inspect And Act On Threads
 
 ```bash
-codex-hermes-bridge threads --limit 25
-codex-hermes-bridge show <threadId>
-codex-hermes-bridge waiting --limit 25
-codex-hermes-bridge inbox --limit 25
-codex-hermes-bridge reply <threadId> --message "please continue"
-codex-hermes-bridge approve <threadId> --decision approve
+codex-telegram-bridge threads --limit 25
+codex-telegram-bridge show <threadId>
+codex-telegram-bridge waiting --limit 25
+codex-telegram-bridge inbox --limit 25
+codex-telegram-bridge reply <threadId> --message "please continue"
+codex-telegram-bridge approve <threadId> --decision approve
 ```
 
 ### Follow And Watch
 
 ```bash
-codex-hermes-bridge follow <threadId>
-codex-hermes-bridge follow <threadId> --message "please continue" --duration 3000
-codex-hermes-bridge follow <threadId> --events follow_snapshot,item_completed
-codex-hermes-bridge watch --once
-codex-hermes-bridge watch --events thread_waiting,thread_completed,item_completed
-codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
+codex-telegram-bridge follow <threadId>
+codex-telegram-bridge follow <threadId> --message "please continue" --duration 3000
+codex-telegram-bridge follow <threadId> --events follow_snapshot,item_completed
+codex-telegram-bridge watch --once
+codex-telegram-bridge watch --events thread_waiting,thread_completed,item_completed
+codex-telegram-bridge watch --exec "python3 examples/print-hook-event.py"
 ```
 
 `watch --exec` is for trusted local automation. It pipes each event to the command on stdin.
@@ -211,10 +211,10 @@ codex-hermes-bridge watch --exec "python3 examples/print-hook-event.py"
 ### Optional Hermes MCP
 
 ```bash
-codex-hermes-bridge mcp
-codex-hermes-bridge hermes install --dry-run
-codex-hermes-bridge hermes install
-codex-hermes-bridge hermes install --hermes-command hermes-se
+codex-telegram-bridge mcp
+codex-telegram-bridge hermes install --dry-run
+codex-telegram-bridge hermes install
+codex-telegram-bridge hermes install --hermes-command hermes-se
 ```
 
 The MCP server exposes `doctor`, `threads`, `inbox`, `waiting`, `show`, `reply`, and `approve` tools, plus thread resources and safe prompts.

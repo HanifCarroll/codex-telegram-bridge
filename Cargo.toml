@@ -1,12 +1,12 @@
 [package]
-name = "codex-hermes-bridge"
+name = "codex-telegram-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "Local bridge for Codex Telegram away-mode notifications and Hermes MCP control"
+description = "Telegram away-mode control for Codex threads with optional Hermes MCP"
 license = "MIT"
-repository = "https://github.com/hanifcarroll/codex-hermes-bridge"
+repository = "https://github.com/hanifcarroll/codex-telegram-bridge"
 rust-version = "1.81"
-keywords = ["codex", "hermes", "mcp", "telegram", "agent"]
+keywords = ["codex", "telegram", "mcp", "agent"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]

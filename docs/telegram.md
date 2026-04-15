@@ -16,7 +16,7 @@ Hermes can still control Codex through MCP when you ask it to, but Hermes and MC
 
 ```bash
 cargo install --path .
-codex-hermes-bridge doctor
+codex-telegram-bridge doctor
 ```
 
 ## One Command Setup
@@ -24,15 +24,15 @@ codex-hermes-bridge doctor
 Create a Telegram bot with `@BotFather`, then run:
 
 ```bash
-codex-hermes-bridge setup --bot-token <telegram-bot-token>
+codex-telegram-bridge setup --bot-token <telegram-bot-token>
 ```
 
-When prompted by the JSON output, send `/start` to the bot from the chat that should receive Codex updates. The bridge records the chat id and user id in `~/.codex-hermes-bridge/config.json` with user-only file permissions.
+When prompted by the JSON output, send `/start` to the bot from the chat that should receive Codex updates. The bridge records the chat id and user id in `~/.codex-telegram-bridge/config.json` with user-only file permissions.
 
 For non-interactive setup:
 
 ```bash
-codex-hermes-bridge setup \
+codex-telegram-bridge setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
@@ -45,8 +45,8 @@ The token can also come from `TELEGRAM_BOT_TOKEN`.
 If you want to configure Telegram without installing or starting the daemon:
 
 ```bash
-codex-hermes-bridge telegram setup --bot-token <telegram-bot-token>
-codex-hermes-bridge telegram setup \
+codex-telegram-bridge telegram setup --bot-token <telegram-bot-token>
+codex-telegram-bridge telegram setup \
   --bot-token <telegram-bot-token> \
   --chat-id <telegram-chat-id> \
   --allowed-user-id <telegram-user-id>
@@ -57,31 +57,31 @@ codex-hermes-bridge telegram setup \
 ## Test Delivery
 
 ```bash
-codex-hermes-bridge telegram test --message "Codex bridge is ready"
+codex-telegram-bridge telegram test --message "Codex bridge is ready"
 ```
 
 ## Run The Daemon
 
 ```bash
-codex-hermes-bridge daemon install --dry-run
-codex-hermes-bridge daemon install
-codex-hermes-bridge daemon start
-codex-hermes-bridge daemon status
+codex-telegram-bridge daemon install --dry-run
+codex-telegram-bridge daemon install
+codex-telegram-bridge daemon start
+codex-telegram-bridge daemon status
 ```
 
 For foreground testing:
 
 ```bash
-codex-hermes-bridge daemon run --once
-codex-hermes-bridge daemon run
+codex-telegram-bridge daemon run --once
+codex-telegram-bridge daemon run
 ```
 
 ## Presence Gate
 
 ```bash
-codex-hermes-bridge away status
-codex-hermes-bridge away on
-codex-hermes-bridge away off
+codex-telegram-bridge away status
+codex-telegram-bridge away on
+codex-telegram-bridge away off
 ```
 
 `away on` starts a new away session. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave. `away off` clears pending outbound notifications so delayed retries do not notify you after you return.
@@ -101,9 +101,9 @@ Use a Telegram bot token dedicated to this bridge. Telegram update delivery shou
 ## Status And Disable
 
 ```bash
-codex-hermes-bridge telegram status
-codex-hermes-bridge telegram disable --dry-run
-codex-hermes-bridge telegram disable
+codex-telegram-bridge telegram status
+codex-telegram-bridge telegram disable --dry-run
+codex-telegram-bridge telegram disable
 ```
 
 Disabling Telegram removes the daemon config file because Telegram is the only supported notification transport.

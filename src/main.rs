@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser, Debug)]
-#[command(name = "codex-hermes-bridge")]
+#[command(name = "codex-telegram-bridge")]
 #[command(version)]
 #[command(about = "Control Codex locally and keep working through Telegram when away")]
 struct Cli {
@@ -36,7 +36,7 @@ enum Commands {
         allowed_user_id: Option<String>,
         #[arg(long, default_value = DEFAULT_NOTIFICATION_EVENTS)]
         events: String,
-        #[arg(long, default_value = "codex-hermes-bridge")]
+        #[arg(long, default_value = "codex-telegram-bridge")]
         bridge_command: String,
         #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
         daemon_label: String,
@@ -253,7 +253,7 @@ enum HermesCommands {
         server_name: String,
         #[arg(long, default_value = "hermes")]
         hermes_command: String,
-        #[arg(long, default_value = "codex-hermes-bridge")]
+        #[arg(long, default_value = "codex-telegram-bridge")]
         bridge_command: String,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -277,7 +277,7 @@ enum DaemonCommands {
         dry_run: bool,
         #[arg(long, default_value = DEFAULT_DAEMON_LABEL)]
         label: String,
-        #[arg(long, default_value = "codex-hermes-bridge")]
+        #[arg(long, default_value = "codex-telegram-bridge")]
         bridge_command: String,
     },
     #[command(about = "Uninstall the proactive notification daemon user service")]
@@ -325,7 +325,7 @@ enum TelegramCommands {
         allowed_user_id: Option<String>,
         #[arg(long, default_value = DEFAULT_NOTIFICATION_EVENTS)]
         events: String,
-        #[arg(long, default_value = "codex-hermes-bridge")]
+        #[arg(long, default_value = "codex-telegram-bridge")]
         bridge_command: String,
         #[arg(long, default_value_t = 60_000)]
         pair_timeout_ms: u64,
@@ -1301,6 +1301,20 @@ fn now_millis() -> Result<u64> {
         .as_millis() as u64)
 }
 
+const UNIX_TIMESTAMP_MILLIS_THRESHOLD: u64 = 100_000_000_000;
+
+fn timestamp_to_millis(value: u64) -> u64 {
+    if value < UNIX_TIMESTAMP_MILLIS_THRESHOLD {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
+}
+
+fn timestamp_age_seconds(now: u64, then: u64) -> u64 {
+    timestamp_to_millis(now).saturating_sub(timestamp_to_millis(then)) / 1000
+}
+
 fn compact_text_preview(input: Option<String>, limit: usize) -> Option<String> {
     let text = input?.trim().replace(char::is_whitespace, " ");
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1672,7 +1686,7 @@ fn classify_inbox_item(snapshot: &BridgeThreadSnapshot, now: u64) -> InboxItem {
         last_seen_at: None,
         age_seconds: snapshot
             .updated_at
-            .map(|updated| now.saturating_sub(updated)),
+            .map(|updated| timestamp_age_seconds(now, updated)),
         status_type: snapshot.status_type.clone(),
         status_flags: snapshot.status_flags.clone(),
         last_preview: compact_text_preview(snapshot.last_preview.clone(), 220),
@@ -1864,7 +1878,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
 
 fn state_dir_path() -> Result<PathBuf> {
     let home = env::var("HOME").context("HOME is not set")?;
-    let dir = PathBuf::from(home).join(".codex-hermes-bridge");
+    let dir = PathBuf::from(home).join(".codex-telegram-bridge");
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -2049,7 +2063,9 @@ fn thread_snapshot_json(snapshot: &BridgeThreadSnapshot) -> Value {
 fn should_emit_for_away_window(away_started_at: Option<u64>, updated_at: Option<u64>) -> bool {
     match away_started_at {
         None => true,
-        Some(started_at) => updated_at.map(|value| value >= started_at).unwrap_or(false),
+        Some(started_at) => updated_at
+            .map(|value| timestamp_to_millis(value) >= timestamp_to_millis(started_at))
+            .unwrap_or(false),
     }
 }
 
@@ -3081,6 +3097,12 @@ fn normalize_notification_event(notification: &Value) -> Value {
             "turn": notification.pointer("/params/turn").cloned().unwrap_or(Value::Null),
             "raw": notification
         }),
+        Some("turn/completed") => json!({
+            "type": "turn_completed",
+            "threadId": notification.pointer("/params/threadId").cloned().unwrap_or(Value::Null),
+            "turn": notification.pointer("/params/turn").cloned().unwrap_or(Value::Null),
+            "raw": notification
+        }),
         Some("item/started") => json!({
             "type": "item_started",
             "threadId": notification.pointer("/params/threadId").cloned().unwrap_or(Value::Null),
@@ -3337,6 +3359,99 @@ fn thread_snapshot_is_terminal(thread: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn event_turn_id(event: &Value) -> Option<&str> {
+    event
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| event.pointer("/turn/id").and_then(Value::as_str))
+        .or_else(|| event.pointer("/raw/params/turnId").and_then(Value::as_str))
+        .or_else(|| event.pointer("/raw/params/turn/id").and_then(Value::as_str))
+}
+
+fn turn_id_matches(event_turn_id: Option<&str>, expected_turn_id: Option<&str>) -> bool {
+    match expected_turn_id {
+        Some(expected) => event_turn_id == Some(expected),
+        None => true,
+    }
+}
+
+fn event_is_agent_item_completed_for_turn(event: &Value, expected_turn_id: Option<&str>) -> bool {
+    if event.get("type").and_then(Value::as_str) != Some("item_completed") {
+        return false;
+    }
+    if !turn_id_matches(event_turn_id(event), expected_turn_id) {
+        return false;
+    }
+    matches!(
+        event.pointer("/item/type").and_then(Value::as_str),
+        Some("agentMessage") | Some("assistantMessage")
+    )
+}
+
+fn event_is_terminal_for_started_turn(event: &Value, expected_turn_id: Option<&str>) -> bool {
+    if event_is_agent_item_completed_for_turn(event, expected_turn_id) {
+        return true;
+    }
+
+    match event.get("type").and_then(Value::as_str) {
+        Some("turn_completed") | Some("task_complete") | Some("turn.completed") => {
+            turn_id_matches(event_turn_id(event), expected_turn_id)
+        }
+        Some("thread_status_changed") => event
+            .pointer("/status/activeFlags")
+            .and_then(Value::as_array)
+            .map(|active_flags| {
+                active_flags.iter().any(|flag| {
+                    matches!(
+                        flag.as_str(),
+                        Some("waitingOnUserInput")
+                            | Some("waitingOnInput")
+                            | Some("waitingOnApproval")
+                    )
+                })
+            })
+            .unwrap_or(false),
+        Some("approval_request") | Some("turn.waiting") => true,
+        _ => false,
+    }
+}
+
+fn thread_snapshot_started_turn_status<'a>(
+    thread: &'a Value,
+    expected_turn_id: Option<&str>,
+) -> Option<&'a str> {
+    let turns = thread.get("turns").and_then(Value::as_array)?;
+    let turn = match expected_turn_id {
+        Some(expected) => turns
+            .iter()
+            .rev()
+            .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))?,
+        None => turns.last()?,
+    };
+    turn.get("status").and_then(Value::as_str)
+}
+
+fn thread_snapshot_started_turn_is_terminal(
+    thread: &Value,
+    expected_turn_id: Option<&str>,
+) -> bool {
+    matches!(
+        thread_snapshot_started_turn_status(thread, expected_turn_id),
+        Some("completed") | Some("failed") | Some("interrupted")
+    ) || thread
+        .pointer("/status/activeFlags")
+        .and_then(Value::as_array)
+        .map(|active_flags| {
+            active_flags.iter().any(|flag| {
+                matches!(
+                    flag.as_str(),
+                    Some("waitingOnUserInput") | Some("waitingOnInput") | Some("waitingOnApproval")
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn settle_composed_follow_events(
     client: &mut CodexAppServerClient,
     thread_id: &str,
@@ -3412,6 +3527,61 @@ fn attach_follow_result(
     persist_follow_events(conn, follow.thread_id, &events, now_millis()?)?;
     let follow_summary = follow_result_summary(follow.thread_id, follow.duration_ms, &events, true);
     Ok(attach_follow_payload(result, follow_summary, false))
+}
+
+const TELEGRAM_TURN_SETTLE_TIMEOUT_MS: u64 = 120_000;
+const TELEGRAM_TURN_SETTLE_POLL_MS: u64 = 1_000;
+
+fn wait_for_started_turn(
+    client: &mut CodexAppServerClient,
+    conn: &Connection,
+    thread_id: &str,
+    started_turn_id: Option<&str>,
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> Result<Value> {
+    let mut events = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+    loop {
+        let mut terminal_event_seen = false;
+        for notification in client.drain_notifications() {
+            let event = normalize_notification_event(&notification);
+            terminal_event_seen =
+                terminal_event_seen || event_is_terminal_for_started_turn(&event, started_turn_id);
+            push_follow_event(&mut events, None, event);
+        }
+
+        let read = read_thread_with_turns_fallback(client, thread_id)?;
+        let thread = read.get("thread").cloned().unwrap_or(Value::Null);
+        let terminal = terminal_event_seen
+            || thread_snapshot_started_turn_is_terminal(&thread, started_turn_id);
+        push_follow_event(
+            &mut events,
+            None,
+            json!({
+                "type": "follow_snapshot",
+                "threadId": thread_id,
+                "thread": thread
+            }),
+        );
+        if terminal || std::time::Instant::now() >= deadline {
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
+    }
+
+    for notification in client.drain_notifications() {
+        push_follow_event(
+            &mut events,
+            None,
+            normalize_notification_event(&notification),
+        );
+    }
+
+    persist_follow_events(conn, thread_id, &events, now_millis()?)?;
+    Ok(follow_result_summary(thread_id, timeout_ms, &events, true))
 }
 
 #[cfg(test)]
@@ -3767,7 +3937,7 @@ fn load_daemon_config() -> Result<DaemonConfig> {
                 bail!("daemon config telegram.chatId cannot be empty");
             }
         }
-        None => bail!("daemon config must include Telegram transport. Run `codex-hermes-bridge setup` or `codex-hermes-bridge telegram setup`."),
+        None => bail!("daemon config must include Telegram transport. Run `codex-telegram-bridge setup` or `codex-telegram-bridge telegram setup`."),
     }
     Ok(config)
 }
@@ -3792,7 +3962,7 @@ fn daemon_run_command(bridge_command: &str) -> String {
 fn doctor_bridge() -> Result<DoctorBridge> {
     let config_path = daemon_config_path()?;
     let config = read_daemon_config_raw()?;
-    let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-hermes-bridge")?;
+    let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-telegram-bridge")?;
     Ok(DoctorBridge {
         config_path: config_path.display().to_string(),
         config_exists: config_path.exists(),
@@ -4535,6 +4705,18 @@ fn send_codex_reply_to_thread(
             "input": [text_input_value(message)]
         }),
     )?;
+    let started_turn_id = started
+        .pointer("/turn/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let follow = wait_for_started_turn(
+        &mut client,
+        conn,
+        thread_id,
+        started_turn_id.as_deref(),
+        TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
+        TELEGRAM_TURN_SETTLE_POLL_MS,
+    )?;
     record_action(
         conn,
         thread_id,
@@ -4543,6 +4725,7 @@ fn send_codex_reply_to_thread(
             "message": message,
             "resumed": resumed,
             "started": started,
+            "follow": follow.clone(),
             "sentAt": now
         }),
         now,
@@ -4552,6 +4735,7 @@ fn send_codex_reply_to_thread(
         "action": "telegram_reply",
         "threadId": thread_id,
         "message": message,
+        "follow": follow,
         "sentAt": now
     }))
 }
@@ -4575,6 +4759,18 @@ fn send_codex_approval_to_thread(
             "input": [text_input_value(sent_text)]
         }),
     )?;
+    let started_turn_id = started
+        .pointer("/turn/id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let follow = wait_for_started_turn(
+        &mut client,
+        conn,
+        thread_id,
+        started_turn_id.as_deref(),
+        TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
+        TELEGRAM_TURN_SETTLE_POLL_MS,
+    )?;
     record_action(
         conn,
         thread_id,
@@ -4584,6 +4780,7 @@ fn send_codex_approval_to_thread(
             "sentText": sent_text,
             "resumed": resumed,
             "started": started,
+            "follow": follow.clone(),
             "sentAt": now
         }),
         now,
@@ -4594,6 +4791,7 @@ fn send_codex_approval_to_thread(
         "threadId": thread_id,
         "decision": action.as_str(),
         "sentText": sent_text,
+        "follow": follow,
         "sentAt": now
     }))
 }
@@ -5102,7 +5300,7 @@ fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<DaemonServic
             .join("user")
             .join(&unit_name);
         let contents = format!(
-            "[Unit]\nDescription=Codex Hermes Bridge notification daemon\n\n[Service]\nType=simple\nExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Codex Telegram Bridge notification daemon\n\n[Service]\nType=simple\nExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
             shell_quote(&service_bridge_command),
             stdout_log.display(),
             stderr_log.display()
@@ -5178,7 +5376,7 @@ fn install_daemon_service(label: &str, bridge_command: &str, dry_run: bool) -> R
 }
 
 fn uninstall_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
-    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     let output = if dry_run {
         None
     } else {
@@ -5213,7 +5411,7 @@ fn run_shell_command(command: &str) -> Result<Value> {
 }
 
 fn start_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
-    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     let command = spec.start_command.clone();
     let output = if dry_run {
         None
@@ -5231,7 +5429,7 @@ fn start_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
 }
 
 fn stop_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
-    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     let command = spec.stop_command.clone();
     let output = if dry_run {
         None
@@ -5249,7 +5447,7 @@ fn stop_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
 }
 
 fn daemon_service_status(label: &str) -> Result<Value> {
-    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     let config_path = daemon_config_path()?;
     Ok(json!({
         "ok": true,
@@ -5268,7 +5466,7 @@ fn daemon_service_status(label: &str) -> Result<Value> {
 }
 
 fn daemon_service_logs(label: &str) -> Result<Value> {
-    let spec = daemon_service_spec(label, "codex-hermes-bridge")?;
+    let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     Ok(json!({
         "ok": true,
         "action": "daemon_logs",
@@ -5292,7 +5490,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-const DEFAULT_DAEMON_LABEL: &str = "com.hanifcarroll.codex-hermes-bridge";
+const DEFAULT_DAEMON_LABEL: &str = "com.hanifcarroll.codex-telegram-bridge";
 const DEFAULT_NOTIFICATION_EVENTS: &str = "thread_waiting,thread_completed";
 
 #[derive(Debug, Clone, Copy)]
@@ -5623,7 +5821,7 @@ fn mcp_initialize_result(params: &Value) -> Value {
         },
         "serverInfo": {
             "name": env!("CARGO_PKG_NAME"),
-            "title": "Codex Hermes Bridge",
+            "title": "Codex Telegram Bridge",
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": "Use these tools to inspect and control local Codex threads. Do not expose this server to untrusted agents or remote users."
@@ -6587,7 +6785,7 @@ mod tests {
     #[test]
     fn cli_accepts_ts_composed_follow_flags() {
         let new_cli = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "new",
             "--message",
             "hello",
@@ -6606,7 +6804,7 @@ mod tests {
         );
 
         let reply_cli = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "reply",
             "thr_1",
             "--message",
@@ -6623,7 +6821,7 @@ mod tests {
         );
 
         let approve_cli = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "approve",
             "thr_1",
             "approve",
@@ -6636,7 +6834,7 @@ mod tests {
         );
 
         let fork_cli = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "fork",
             "thr_1",
             "--message",
@@ -6668,7 +6866,7 @@ mod tests {
 
     #[test]
     fn cli_accepts_mcp_server_command() {
-        let parsed = Cli::try_parse_from(["codex-hermes-bridge", "mcp"]);
+        let parsed = Cli::try_parse_from(["codex-telegram-bridge", "mcp"]);
         assert!(parsed.is_ok(), "mcp command should parse: {parsed:?}");
 
         let mut command = Cli::command();
@@ -6679,7 +6877,7 @@ mod tests {
     #[test]
     fn cli_accepts_hermes_install_command() {
         let parsed = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "hermes",
             "install",
             "--server-name",
@@ -6687,7 +6885,7 @@ mod tests {
             "--hermes-command",
             "hermes-se",
             "--bridge-command",
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "--dry-run",
         ]);
         assert!(parsed.is_ok(), "hermes install should parse: {parsed:?}");
@@ -6696,7 +6894,7 @@ mod tests {
     #[test]
     fn cli_rejects_legacy_hermes_notification_flags() {
         let parsed = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "hermes",
             "install",
             "--hermes-command",
@@ -6718,7 +6916,7 @@ mod tests {
     #[test]
     fn cli_rejects_legacy_hermes_post_webhook_command() {
         let parsed = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "hermes",
             "post-webhook",
             "--url",
@@ -6735,19 +6933,19 @@ mod tests {
     #[test]
     fn cli_accepts_daemon_lifecycle_commands() {
         for args in [
-            vec!["codex-hermes-bridge", "daemon", "run", "--once"],
+            vec!["codex-telegram-bridge", "daemon", "run", "--once"],
             vec![
-                "codex-hermes-bridge",
+                "codex-telegram-bridge",
                 "daemon",
                 "install",
                 "--dry-run",
                 "--bridge-command",
-                "codex-hermes-bridge",
+                "codex-telegram-bridge",
             ],
-            vec!["codex-hermes-bridge", "daemon", "start", "--dry-run"],
-            vec!["codex-hermes-bridge", "daemon", "stop", "--dry-run"],
-            vec!["codex-hermes-bridge", "daemon", "status"],
-            vec!["codex-hermes-bridge", "daemon", "logs"],
+            vec!["codex-telegram-bridge", "daemon", "start", "--dry-run"],
+            vec!["codex-telegram-bridge", "daemon", "stop", "--dry-run"],
+            vec!["codex-telegram-bridge", "daemon", "status"],
+            vec!["codex-telegram-bridge", "daemon", "logs"],
         ] {
             let parsed = Cli::try_parse_from(args.clone());
             assert!(
@@ -6761,7 +6959,7 @@ mod tests {
     fn cli_accepts_telegram_setup_and_status_commands() {
         for args in [
             vec![
-                "codex-hermes-bridge",
+                "codex-telegram-bridge",
                 "telegram",
                 "setup",
                 "--bot-token",
@@ -6770,16 +6968,16 @@ mod tests {
                 "456",
                 "--dry-run",
             ],
-            vec!["codex-hermes-bridge", "telegram", "status"],
+            vec!["codex-telegram-bridge", "telegram", "status"],
             vec![
-                "codex-hermes-bridge",
+                "codex-telegram-bridge",
                 "telegram",
                 "test",
                 "--message",
                 "hello",
                 "--dry-run",
             ],
-            vec!["codex-hermes-bridge", "telegram", "disable", "--dry-run"],
+            vec!["codex-telegram-bridge", "telegram", "disable", "--dry-run"],
         ] {
             let parsed = Cli::try_parse_from(args.clone());
             assert!(
@@ -6792,7 +6990,7 @@ mod tests {
     #[test]
     fn cli_accepts_product_setup_command() {
         let parsed = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "setup",
             "--bot-token",
             "123:abc",
@@ -6814,7 +7012,7 @@ mod tests {
             chat_id: Some("456"),
             allowed_user_id: Some("789"),
             events: DEFAULT_NOTIFICATION_EVENTS,
-            bridge_command: "codex-hermes-bridge",
+            bridge_command: "codex-telegram-bridge",
             dry_run: true,
             pair_timeout_ms: 1000,
         })
@@ -6827,7 +7025,7 @@ mod tests {
         assert_eq!(result["config"]["telegram"]["botToken"], "<redacted>");
         assert_eq!(result["config"]["telegram"]["chatId"], "456");
         assert_eq!(result["config"]["telegram"]["allowedUserId"], "789");
-        assert_eq!(result["daemonCommand"], "codex-hermes-bridge daemon run");
+        assert_eq!(result["daemonCommand"], "codex-telegram-bridge daemon run");
         assert!(
             !serde_json::to_string(&result)
                 .unwrap()
@@ -6950,11 +7148,12 @@ mod tests {
 
     #[test]
     fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
-        let result = install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/codex-hermes-bridge", true)
-            .expect("daemon install dry run");
+        let result =
+            install_daemon_service(DEFAULT_DAEMON_LABEL, "bin/codex-telegram-bridge", true)
+                .expect("daemon install dry run");
         let expected = env::current_dir()
             .expect("cwd")
-            .join("bin/codex-hermes-bridge")
+            .join("bin/codex-telegram-bridge")
             .display()
             .to_string();
         assert!(result["contents"]
@@ -6968,7 +7167,7 @@ mod tests {
         let result = run_hermes_install(HermesInstallOptions {
             server_name: "codex",
             hermes_command: "hermes-se",
-            bridge_command: "codex-hermes-bridge",
+            bridge_command: "codex-telegram-bridge",
             dry_run: true,
         })
         .expect("dry-run install result");
@@ -6983,7 +7182,7 @@ mod tests {
                 "add",
                 "codex",
                 "--command",
-                "codex-hermes-bridge",
+                "codex-telegram-bridge",
                 "--args",
                 "mcp"
             ])
@@ -7116,6 +7315,46 @@ mod tests {
     }
 
     #[test]
+    fn daemon_notification_policy_accepts_codex_second_timestamps() {
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1_776_219_288_240).expect("away on");
+        let events = vec![
+            json!({
+                "type": "thread_completed",
+                "threadId": "thr_old",
+                "updatedAt": 1_776_219_200
+            }),
+            json!({
+                "type": "thread_completed",
+                "threadId": "thr_new",
+                "updatedAt": 1_776_219_396
+            }),
+        ];
+
+        let count = enqueue_daemon_notification_events(&conn, &events, 1_776_219_397_000)
+            .expect("mixed timestamp enqueue");
+
+        assert_eq!(count, 1);
+        assert_eq!(pending_outbound_count(&conn).expect("pending"), 1);
+    }
+
+    #[test]
+    fn inbox_age_seconds_handles_mixed_timestamp_units() {
+        let snapshot = snapshot_fixture(
+            "thr_recent",
+            "/tmp/project",
+            1_776_219_396,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+
+        let item = classify_inbox_item(&snapshot, 1_776_219_400_000);
+
+        assert_eq!(item.age_seconds, Some(4));
+    }
+
+    #[test]
     fn away_off_clears_pending_daemon_notifications() {
         let conn = create_state_db_in_memory().expect("db");
         set_away_mode(&conn, true, 1000).expect("away on");
@@ -7193,7 +7432,7 @@ mod tests {
         );
         assert_eq!(
             response["result"]["serverInfo"]["name"],
-            "codex-hermes-bridge"
+            "codex-telegram-bridge"
         );
     }
 
@@ -7465,7 +7704,7 @@ mod tests {
     #[test]
     fn cli_rejects_experimental_realtime_flag_for_stable_surface() {
         let parsed = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "follow",
             "thr_1",
             "--experimental-realtime",
@@ -7479,7 +7718,7 @@ mod tests {
     #[test]
     fn cli_accepts_ts_archive_filter_flags() {
         let cli = Cli::try_parse_from([
-            "codex-hermes-bridge",
+            "codex-telegram-bridge",
             "archive",
             "--thread-id",
             "thr_1,thr_2",
@@ -7561,7 +7800,7 @@ mod tests {
     fn app_server_initialize_params_use_stable_capabilities() {
         let params = initialize_params();
         assert_eq!(params["capabilities"], json!({}));
-        assert_eq!(params["clientInfo"]["name"], "codex-hermes-bridge");
+        assert_eq!(params["clientInfo"]["name"], "codex-telegram-bridge");
     }
 
     fn env_test_lock() -> &'static std::sync::Mutex<()> {
@@ -7793,6 +8032,67 @@ raise SystemExit(1)
         }));
         assert_eq!(unknown["type"], "notification");
         assert_eq!(unknown["raw"]["method"], "codex/custom");
+    }
+
+    #[test]
+    fn telegram_turn_wait_ignores_completed_user_item() {
+        let user_item = normalize_notification_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "item": { "type": "userMessage" }
+            }
+        }));
+        let agent_item = normalize_notification_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_1",
+                "item": { "type": "agentMessage" }
+            }
+        }));
+        let other_turn_agent_item = normalize_notification_event(&json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_1",
+                "turnId": "turn_2",
+                "item": { "type": "agentMessage" }
+            }
+        }));
+
+        assert!(!event_is_terminal_for_started_turn(
+            &user_item,
+            Some("turn_1")
+        ));
+        assert!(event_is_terminal_for_started_turn(
+            &agent_item,
+            Some("turn_1")
+        ));
+        assert!(!event_is_terminal_for_started_turn(
+            &other_turn_agent_item,
+            Some("turn_1")
+        ));
+    }
+
+    #[test]
+    fn telegram_turn_wait_uses_started_turn_status() {
+        let thread = json!({
+            "turns": [
+                { "id": "turn_1", "status": "completed" },
+                { "id": "turn_2", "status": "inProgress" }
+            ],
+            "status": { "type": "active", "activeFlags": [] }
+        });
+
+        assert!(!thread_snapshot_started_turn_is_terminal(
+            &thread,
+            Some("turn_2")
+        ));
+        assert!(thread_snapshot_started_turn_is_terminal(
+            &thread,
+            Some("turn_1")
+        ));
     }
 
     #[test]

@@ -6,8 +6,8 @@ from pathlib import Path
 
 
 def select_binary(root: Path) -> Path:
-    preferred = root / "target" / "release" / "codex-hermes-bridge"
-    fallback = root / "target" / "debug" / "codex-hermes-bridge"
+    preferred = root / "target" / "release" / "codex-telegram-bridge"
+    fallback = root / "target" / "debug" / "codex-telegram-bridge"
     if preferred.exists():
         return preferred
     if fallback.exists():
