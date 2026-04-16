@@ -6,6 +6,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Error as WsError, Message, WebSocket};
 use url::Url;
 
+#[derive(Debug)]
 pub(crate) struct WsJsonRpcTransport {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
 }
@@ -13,6 +14,9 @@ pub(crate) struct WsJsonRpcTransport {
 impl WsJsonRpcTransport {
     pub(crate) fn connect(url: &str) -> Result<Self> {
         let url = Url::parse(url).with_context(|| format!("invalid websocket URL: {url}"))?;
+        if url.scheme() != "ws" {
+            bail!("only ws:// shared websocket URLs are supported in this release");
+        }
         let (socket, _) = connect(url.as_str()).context("failed to connect websocket transport")?;
         Ok(Self { socket })
     }
@@ -153,5 +157,14 @@ mod tests {
             })
         );
         server.join().expect("fake ws server thread");
+    }
+
+    #[test]
+    fn websocket_transport_rejects_non_loopback_secure_urls_for_now() {
+        let error = WsJsonRpcTransport::connect("wss://127.0.0.1:4500").expect_err("reject wss");
+        assert!(
+            format!("{error:#}").contains("only ws:// shared websocket URLs are supported"),
+            "unexpected error: {error:#}"
+        );
     }
 }

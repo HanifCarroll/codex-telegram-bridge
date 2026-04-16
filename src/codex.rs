@@ -1477,6 +1477,7 @@ pub(crate) struct CodexAppServerClient {
     transport: CodexTransport,
     next_id: u64,
     notifications: Vec<Value>,
+    pending_transport_error: Option<String>,
 }
 
 enum CodexTransport {
@@ -1521,6 +1522,7 @@ impl CodexAppServerClient {
             transport,
             next_id: 1,
             notifications: Vec::new(),
+            pending_transport_error: None,
         };
 
         let _ = client.request("initialize", initialize_params())?;
@@ -1551,6 +1553,8 @@ impl CodexAppServerClient {
     }
 
     pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.take_pending_transport_error()?;
+
         let id = self.next_id;
         self.next_id += 1;
         let envelope = json!({
@@ -1624,8 +1628,23 @@ impl CodexAppServerClient {
                 }
                 None
             }
-            CodexTransport::SharedWebsocket(transport) => transport.try_read_json().unwrap_or(None),
+            CodexTransport::SharedWebsocket(transport) => match transport.try_read_json() {
+                Ok(message) => message,
+                Err(error) => {
+                    if self.pending_transport_error.is_none() {
+                        self.pending_transport_error = Some(error.to_string());
+                    }
+                    None
+                }
+            },
         }
+    }
+
+    fn take_pending_transport_error(&mut self) -> Result<()> {
+        if let Some(error) = self.pending_transport_error.take() {
+            bail!("{error}");
+        }
+        Ok(())
     }
 }
 
@@ -1957,6 +1976,13 @@ raise SystemExit(1)
         } else {
             std::env::remove_var("CODEX_BIN");
         }
+        assert_eq!(
+            client.transport_info(),
+            CodexAppServerTransportInfo {
+                transport: "spawned_stdio",
+                app_server_pid: Some(client.transport_info().app_server_pid.expect("pid")),
+            }
+        );
         let mut notifications: Vec<Value> = Vec::new();
         for _ in 0..20 {
             notifications.extend(client.drain_notifications());
