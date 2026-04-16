@@ -1475,4 +1475,42 @@ mod tests {
         .expect("extract unauthorized command");
         assert_eq!(unauthorized, None);
     }
+
+    #[test]
+    fn live_mode_commands_are_visible_but_not_reported_as_working() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+        };
+        let message = json!({
+            "chat": { "id": "456" },
+            "from": { "id": "789" }
+        });
+
+        let live_on = execute_telegram_command(
+            &conn,
+            &telegram,
+            &message,
+            TelegramInboundCommand::LiveOn,
+            0,
+            Duration::from_secs(1),
+        )
+        .expect("live on result");
+        assert_eq!(live_on["ok"], false);
+        assert_eq!(live_on["action"], "telegram_live_on_unavailable");
+
+        let live_reset = execute_telegram_command(
+            &conn,
+            &telegram,
+            &message,
+            TelegramInboundCommand::LiveReset,
+            0,
+            Duration::from_secs(1),
+        )
+        .expect("live reset result");
+        assert_eq!(live_reset["ok"], false);
+        assert_eq!(live_reset["action"], "telegram_live_reset_unavailable");
+    }
 }
