@@ -1482,6 +1482,12 @@ enum AppServerReaderMessage {
     Closed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexAppServerTransportInfo {
+    pub(crate) transport: &'static str,
+    pub(crate) app_server_pid: u32,
+}
+
 impl CodexAppServerClient {
     pub(crate) fn connect() -> Result<Self> {
         let resolved = resolve_codex_binary()?;
@@ -1517,6 +1523,13 @@ impl CodexAppServerClient {
         let _ = client.request("initialize", initialize_params())?;
         client.notify("initialized", json!({}))?;
         Ok(client)
+    }
+
+    pub(crate) fn transport_info(&self) -> CodexAppServerTransportInfo {
+        CodexAppServerTransportInfo {
+            transport: "spawned_stdio",
+            app_server_pid: self.child.id(),
+        }
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {

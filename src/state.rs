@@ -18,6 +18,15 @@ pub(crate) struct PendingPrompt {
     pub(crate) question: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TelegramInboundLogContext<'a> {
+    pub(crate) thread_id: Option<&'a str>,
+    pub(crate) route_message_id: Option<i64>,
+    pub(crate) result_action: Option<&'a str>,
+    pub(crate) codex_transport: Option<&'a str>,
+    pub(crate) codex_app_server_pid: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BridgeThreadSnapshot {
     pub(crate) thread_id: String,
@@ -533,6 +542,16 @@ pub(crate) fn init_state_db(conn: &Connection) -> Result<()> {
     ensure_column(conn, "threads_cache", "last_turn_status", "TEXT")?;
     ensure_column(conn, "threads_cache", "last_preview", "TEXT")?;
     ensure_column(conn, "telegram_command_routes", "payload_json", "TEXT")?;
+    ensure_column(conn, "telegram_inbound_log", "thread_id", "TEXT")?;
+    ensure_column(conn, "telegram_inbound_log", "route_message_id", "INTEGER")?;
+    ensure_column(conn, "telegram_inbound_log", "result_action", "TEXT")?;
+    ensure_column(conn, "telegram_inbound_log", "codex_transport", "TEXT")?;
+    ensure_column(
+        conn,
+        "telegram_inbound_log",
+        "codex_app_server_pid",
+        "INTEGER",
+    )?;
     Ok(())
 }
 
@@ -1340,17 +1359,33 @@ pub(crate) fn record_telegram_inbound_processed(
     update_id: i64,
     update_kind: &str,
     result: &Value,
+    context: TelegramInboundLogContext<'_>,
     now: u64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO telegram_inbound_log(bot_id, update_id, update_kind, result_json, processed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO telegram_inbound_log(
+            bot_id,
+            update_id,
+            update_kind,
+            result_json,
+            processed_at,
+            thread_id,
+            route_message_id,
+            result_action,
+            codex_transport,
+            codex_app_server_pid
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             bot_id,
             update_id,
             update_kind,
             serde_json::to_string(result)?,
-            to_sql_i64(now)?
+            to_sql_i64(now)?,
+            context.thread_id,
+            context.route_message_id,
+            context.result_action,
+            context.codex_transport,
+            context.codex_app_server_pid.map(i64::from),
         ],
     )?;
     Ok(())
@@ -1743,6 +1778,40 @@ mod tests {
     }
 
     #[test]
+    fn create_state_db_migrates_legacy_telegram_inbound_log_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-telegram-inbound-migrate-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("open legacy db");
+            conn.execute_batch(
+                "
+                CREATE TABLE telegram_inbound_log (
+                    bot_id TEXT NOT NULL,
+                    update_id INTEGER NOT NULL,
+                    update_kind TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    processed_at INTEGER NOT NULL,
+                    PRIMARY KEY(bot_id, update_id)
+                );
+                ",
+            )
+            .expect("create legacy inbound log");
+        }
+
+        let conn = create_state_db(&path).expect("migrated db");
+        let columns = table_columns(&conn, "telegram_inbound_log").expect("columns");
+        assert!(columns.contains(&"thread_id".to_string()));
+        assert!(columns.contains(&"route_message_id".to_string()));
+        assert!(columns.contains(&"result_action".to_string()));
+        assert!(columns.contains(&"codex_transport".to_string()));
+        assert!(columns.contains(&"codex_app_server_pid".to_string()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn telegram_command_prompt_routes_map_reply_to_new_thread_prompt() {
         let conn = create_state_db_in_memory().expect("db");
         insert_telegram_command_route(
@@ -1861,6 +1930,13 @@ mod tests {
             42,
             "message",
             &json!({ "threadId": "thr_1" }),
+            TelegramInboundLogContext {
+                thread_id: Some("thr_1"),
+                route_message_id: Some(111),
+                result_action: Some("telegram_reply"),
+                codex_transport: Some("spawned_stdio"),
+                codex_app_server_pid: Some(4242),
+            },
             1000,
         )
         .expect("record inbound update");
@@ -1873,6 +1949,29 @@ mod tests {
             !telegram_inbound_processed(&conn, &telegram_bot_id("456:other"), 42).expect("lookup"),
             "same update id from a different bot token hash must remain independent"
         );
+
+        let row = conn
+            .query_row(
+                "SELECT thread_id, route_message_id, result_action, codex_transport, codex_app_server_pid
+                 FROM telegram_inbound_log
+                 WHERE bot_id = ?1 AND update_id = ?2",
+                params![bot_id, 42],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .expect("structured inbound row");
+        assert_eq!(row.0.as_deref(), Some("thr_1"));
+        assert_eq!(row.1, Some(111));
+        assert_eq!(row.2.as_deref(), Some("telegram_reply"));
+        assert_eq!(row.3.as_deref(), Some("spawned_stdio"));
+        assert_eq!(row.4, Some(4242));
     }
 
     #[test]

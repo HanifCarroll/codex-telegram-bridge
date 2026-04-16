@@ -20,7 +20,7 @@ use crate::state::{
     lookup_telegram_message_route, mark_telegram_command_route_used, observed_workspaces_from_db,
     record_action, record_telegram_inbound_processed, set_setting, set_telegram_current_project_id,
     telegram_inbound_processed, update_telegram_callback_message_id, TelegramCallbackAction,
-    TelegramCommandRouteKind,
+    TelegramCommandRouteKind, TelegramInboundLogContext,
 };
 use crate::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
@@ -496,6 +496,29 @@ pub(crate) fn deliver_telegram_event(
     }))
 }
 
+fn codex_log_context_from_result<'a>(
+    result: &'a Value,
+    thread_id: Option<&'a str>,
+    route_message_id: Option<i64>,
+) -> TelegramInboundLogContext<'a> {
+    TelegramInboundLogContext {
+        thread_id,
+        route_message_id,
+        result_action: result.get("action").and_then(Value::as_str),
+        codex_transport: result.pointer("/codex/transport").and_then(Value::as_str),
+        codex_app_server_pid: result
+            .pointer("/codex/appServerPid")
+            .and_then(Value::as_u64)
+            .and_then(|value| {
+                if value <= u32::MAX as u64 {
+                    Some(value as u32)
+                } else {
+                    None
+                }
+            }),
+    }
+}
+
 fn send_codex_reply_to_thread(
     conn: &Connection,
     thread_id: &str,
@@ -503,6 +526,7 @@ fn send_codex_reply_to_thread(
     now: u64,
 ) -> Result<Value> {
     let mut client = CodexAppServerClient::connect()?;
+    let transport = client.transport_info();
     let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
     let started = client.request(
         "turn/start",
@@ -541,6 +565,10 @@ fn send_codex_reply_to_thread(
         "action": "telegram_reply",
         "threadId": thread_id,
         "message": message,
+        "codex": {
+            "transport": transport.transport,
+            "appServerPid": transport.app_server_pid
+        },
         "follow": follow,
         "sentAt": now
     }))
@@ -557,6 +585,7 @@ fn send_codex_approval_to_thread(
         TelegramCallbackAction::Deny => "NO",
     };
     let mut client = CodexAppServerClient::connect()?;
+    let transport = client.transport_info();
     let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
     let started = client.request(
         "turn/start",
@@ -597,6 +626,10 @@ fn send_codex_approval_to_thread(
         "threadId": thread_id,
         "decision": action.as_str(),
         "sentText": sent_text,
+        "codex": {
+            "transport": transport.transport,
+            "appServerPid": transport.app_server_pid
+        },
         "follow": follow,
         "sentAt": now
     }))
@@ -630,7 +663,17 @@ fn start_new_thread_from_telegram(
     now: u64,
 ) -> Result<Value> {
     let mut client = CodexAppServerClient::connect()?;
-    let result = start_thread_in_cwd(&mut client, Some(&project.cwd), Some(message))?;
+    let transport = client.transport_info();
+    let mut result = start_thread_in_cwd(&mut client, Some(&project.cwd), Some(message))?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "codex".to_string(),
+            json!({
+                "transport": transport.transport,
+                "appServerPid": transport.app_server_pid
+            }),
+        );
+    }
     let thread_id = result
         .get("threadId")
         .and_then(Value::as_str)
@@ -1045,6 +1088,9 @@ pub(crate) fn process_telegram_updates(
             }
         }
         if let Some(message) = update.get("message") {
+            let route_message_id = message
+                .get("reply_to_message")
+                .and_then(telegram_message_id);
             if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
                 let result =
                     send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
@@ -1055,6 +1101,11 @@ pub(crate) fn process_telegram_updates(
                         update_id,
                         "telegram_reply",
                         &result,
+                        codex_log_context_from_result(
+                            &result,
+                            Some(&route.thread_id),
+                            route_message_id,
+                        ),
                         now,
                     )?;
                 }
@@ -1072,6 +1123,24 @@ pub(crate) fn process_telegram_updates(
                         update_id,
                         "telegram_command_prompt_reply",
                         &result,
+                        TelegramInboundLogContext {
+                            thread_id: result.pointer("/result/threadId").and_then(Value::as_str),
+                            route_message_id,
+                            result_action: result.get("action").and_then(Value::as_str),
+                            codex_transport: result
+                                .pointer("/result/codex/transport")
+                                .and_then(Value::as_str),
+                            codex_app_server_pid: result
+                                .pointer("/result/codex/appServerPid")
+                                .and_then(Value::as_u64)
+                                .and_then(|value| {
+                                    if value <= u32::MAX as u64 {
+                                        Some(value as u32)
+                                    } else {
+                                        None
+                                    }
+                                }),
+                        },
                         now,
                     )?;
                 }
@@ -1086,6 +1155,11 @@ pub(crate) fn process_telegram_updates(
                         update_id,
                         "telegram_command",
                         &result,
+                        TelegramInboundLogContext {
+                            route_message_id,
+                            result_action: result.get("action").and_then(Value::as_str),
+                            ..TelegramInboundLogContext::default()
+                        },
                         now,
                     )?;
                 }
@@ -1098,12 +1172,20 @@ pub(crate) fn process_telegram_updates(
                         update_id,
                         "message_ignored",
                         &json!({ "ignored": true }),
+                        TelegramInboundLogContext {
+                            route_message_id,
+                            ..TelegramInboundLogContext::default()
+                        },
                         now,
                     )?;
                 }
                 ignored += 1;
             }
         } else if let Some(callback_query) = update.get("callback_query") {
+            let route_message_id = callback_query
+                .get("message")
+                .and_then(|message| message.get("message_id"))
+                .and_then(Value::as_i64);
             match extract_telegram_callback_route(conn, callback_query, telegram)? {
                 Some(route) => {
                     let result =
@@ -1115,6 +1197,11 @@ pub(crate) fn process_telegram_updates(
                             update_id,
                             "callback_query",
                             &result,
+                            codex_log_context_from_result(
+                                &result,
+                                Some(&route.thread_id),
+                                route_message_id,
+                            ),
                             now,
                         )?;
                     }
@@ -1134,6 +1221,10 @@ pub(crate) fn process_telegram_updates(
                             update_id,
                             "callback_query_ignored",
                             &json!({ "ignored": true }),
+                            TelegramInboundLogContext {
+                                route_message_id,
+                                ..TelegramInboundLogContext::default()
+                            },
                             now,
                         )?;
                     }
