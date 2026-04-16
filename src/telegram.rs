@@ -192,6 +192,30 @@ pub(crate) fn telegram_status_result() -> Result<Value> {
     }))
 }
 
+#[cfg(not(test))]
+fn send_telegram_command_text(
+    telegram: &TelegramConfig,
+    text: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_send_text(telegram, text, timeout)
+}
+
+#[cfg(test)]
+fn send_telegram_command_text(
+    _telegram: &TelegramConfig,
+    text: &str,
+    _timeout: Duration,
+) -> Result<Value> {
+    Ok(json!({
+        "ok": true,
+        "result": {
+            "message_id": 1,
+            "text": text
+        }
+    }))
+}
+
 pub(crate) fn telegram_test_result(
     message: &str,
     timeout: Duration,
@@ -811,16 +835,26 @@ fn execute_telegram_command(
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
-        TelegramInboundCommand::LiveOn => Ok(json!({
-            "ok": false,
-            "action": "telegram_live_on_unavailable",
-            "message": "live mode commands are not implemented yet"
-        })),
-        TelegramInboundCommand::LiveReset => Ok(json!({
-            "ok": false,
-            "action": "telegram_live_reset_unavailable",
-            "message": "live mode commands are not implemented yet"
-        })),
+        TelegramInboundCommand::LiveOn => {
+            let message = "Shared live mode is not implemented yet.";
+            let sent = send_telegram_command_text(telegram, message, timeout)?;
+            Ok(json!({
+                "ok": false,
+                "action": "telegram_live_on_unavailable",
+                "message": message,
+                "sent": sent
+            }))
+        }
+        TelegramInboundCommand::LiveReset => {
+            let message = "Shared live reset is not implemented yet.";
+            let sent = send_telegram_command_text(telegram, message, timeout)?;
+            Ok(json!({
+                "ok": false,
+                "action": "telegram_live_reset_unavailable",
+                "message": message,
+                "sent": sent
+            }))
+        }
         TelegramInboundCommand::NewThread(Some(prompt)) => {
             let config = load_daemon_config()?;
             let current_project =
@@ -1500,6 +1534,14 @@ mod tests {
         .expect("live on result");
         assert_eq!(live_on["ok"], false);
         assert_eq!(live_on["action"], "telegram_live_on_unavailable");
+        assert_eq!(
+            live_on["message"],
+            "Shared live mode is not implemented yet."
+        );
+        assert_eq!(
+            live_on["sent"]["result"]["text"],
+            "Shared live mode is not implemented yet."
+        );
 
         let live_reset = execute_telegram_command(
             &conn,
@@ -1512,5 +1554,13 @@ mod tests {
         .expect("live reset result");
         assert_eq!(live_reset["ok"], false);
         assert_eq!(live_reset["action"], "telegram_live_reset_unavailable");
+        assert_eq!(
+            live_reset["message"],
+            "Shared live reset is not implemented yet."
+        );
+        assert_eq!(
+            live_reset["sent"]["result"]["text"],
+            "Shared live reset is not implemented yet."
+        );
     }
 }
