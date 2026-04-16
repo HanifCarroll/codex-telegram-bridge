@@ -24,8 +24,8 @@ use crate::state::{
 };
 use crate::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
-    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, DaemonConfig,
-    RegisteredProject, TelegramConfig, TelegramSetupOptions,
+    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, CodexConfig,
+    CodexLiveMode, DaemonConfig, RegisteredProject, TelegramConfig, TelegramSetupOptions,
 };
 
 use self::api::{
@@ -49,6 +49,8 @@ enum TelegramInboundCommand {
     AwayOn,
     AwayOff,
     Status,
+    LiveOn,
+    LiveReset,
     NewThread(Option<String>),
     Project(Option<String>),
     Projects,
@@ -83,11 +85,15 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
     let bot_token = resolve_telegram_bot_token(options.bot_token)?;
     let events = options.events.trim();
     let bridge_command = options.bridge_command.trim();
+    let websocket_url = options.websocket_url.trim();
     if events.is_empty() {
         bail!("telegram setup events cannot be empty");
     }
     if bridge_command.is_empty() {
         bail!("telegram setup bridge command cannot be empty");
+    }
+    if websocket_url.is_empty() {
+        bail!("telegram setup websocket url cannot be empty");
     }
     if !options.dry_run {
         telegram_delete_webhook(&bot_token, Duration::from_secs(10))
@@ -123,7 +129,16 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
     };
 
     let existing = read_daemon_config_raw()?;
-    let config = merged_daemon_config(existing.as_ref(), bridge_command, events, paired.clone());
+    let config = merged_daemon_config(
+        existing.as_ref(),
+        bridge_command,
+        events,
+        paired.clone(),
+        CodexConfig {
+            live_mode: CodexLiveMode::Shared,
+            websocket_url: websocket_url.to_string(),
+        },
+    );
     let commands = telegram_bot_commands();
     let commands_registration = if options.dry_run {
         json!({ "registered": false, "dryRun": true, "commands": commands })
@@ -297,6 +312,8 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
         "/away_on" => Some(TelegramInboundCommand::AwayOn),
         "/away_off" => Some(TelegramInboundCommand::AwayOff),
         "/status" => Some(TelegramInboundCommand::Status),
+        "/live_on" => Some(TelegramInboundCommand::LiveOn),
+        "/live_reset" => Some(TelegramInboundCommand::LiveReset),
         "/new_thread" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
         "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
         "/projects" => Some(TelegramInboundCommand::Projects),
@@ -793,6 +810,20 @@ fn execute_telegram_command(
         TelegramInboundCommand::Status => {
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
+        }
+        TelegramInboundCommand::LiveOn => {
+            Ok(json!({
+                "ok": false,
+                "action": "telegram_live_on_unavailable",
+                "message": "live mode commands are not implemented yet"
+            }))
+        }
+        TelegramInboundCommand::LiveReset => {
+            Ok(json!({
+                "ok": false,
+                "action": "telegram_live_reset_unavailable",
+                "message": "live mode commands are not implemented yet"
+            }))
         }
         TelegramInboundCommand::NewThread(Some(prompt)) => {
             let config = load_daemon_config()?;
@@ -1295,12 +1326,19 @@ mod tests {
 
     #[test]
     fn telegram_setup_dry_run_writes_redacted_daemon_shape() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _backup = ConfigBackup::capture().expect("capture config backup");
+        if let Ok(path) = daemon_config_path() {
+            let _ = fs::remove_file(path);
+        }
+
         let result = telegram_setup_result(TelegramSetupOptions {
             bot_token: Some("123:secret"),
             chat_id: Some("456"),
             allowed_user_id: Some("789"),
             events: crate::DEFAULT_NOTIFICATION_EVENTS,
             bridge_command: "codex-telegram-bridge",
+            websocket_url: "ws://127.0.0.1:4500",
             dry_run: true,
             pair_timeout_ms: 1000,
         })
@@ -1327,13 +1365,17 @@ mod tests {
         let _guard = config_test_lock().lock().expect("config lock");
         let _backup = ConfigBackup::capture().expect("capture config backup");
         let path = write_daemon_config(&DaemonConfig {
-            version: 3,
+            version: 4,
             bridge_command: "codex-telegram-bridge".to_string(),
             events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
             telegram: Some(TelegramConfig {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
+            }),
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
             }),
             projects: Vec::new(),
         })
@@ -1380,6 +1422,14 @@ mod tests {
         assert_eq!(
             parse_telegram_command_text("/projects"),
             Some(TelegramInboundCommand::Projects)
+        );
+        assert_eq!(
+            parse_telegram_command_text("/live_on"),
+            Some(TelegramInboundCommand::LiveOn)
+        );
+        assert_eq!(
+            parse_telegram_command_text("/live_reset"),
+            Some(TelegramInboundCommand::LiveReset)
         );
         assert_eq!(
             parse_telegram_command_text("/unknown"),

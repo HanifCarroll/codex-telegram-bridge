@@ -214,7 +214,6 @@ mod tests {
                 "missing required telegram bot command {required}"
             );
         }
-
         for command in commands {
             assert!(
                 command["command"].as_str().expect("command").len() <= 32,

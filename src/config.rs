@@ -16,7 +16,22 @@ pub(crate) struct DaemonConfig {
     #[serde(default)]
     pub(crate) telegram: Option<TelegramConfig>,
     #[serde(default)]
+    pub(crate) codex: Option<CodexConfig>,
+    #[serde(default)]
     pub(crate) projects: Vec<RegisteredProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CodexConfig {
+    pub(crate) live_mode: CodexLiveMode,
+    pub(crate) websocket_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CodexLiveMode {
+    Shared,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +60,7 @@ pub(crate) struct TelegramSetupOptions<'a> {
     pub(crate) allowed_user_id: Option<&'a str>,
     pub(crate) events: &'a str,
     pub(crate) bridge_command: &'a str,
+    pub(crate) websocket_url: &'a str,
     pub(crate) dry_run: bool,
     pub(crate) pair_timeout_ms: u64,
 }
@@ -56,6 +72,7 @@ pub(crate) struct SetupOptions<'a> {
     pub(crate) allowed_user_id: Option<&'a str>,
     pub(crate) events: &'a str,
     pub(crate) bridge_command: &'a str,
+    pub(crate) websocket_url: &'a str,
     pub(crate) daemon_label: &'a str,
     pub(crate) install_daemon: bool,
     pub(crate) start_daemon: bool,
@@ -75,12 +92,14 @@ pub(crate) fn merged_daemon_config(
     bridge_command: &str,
     events: &str,
     telegram: TelegramConfig,
+    codex: CodexConfig,
 ) -> DaemonConfig {
     DaemonConfig {
-        version: 3,
+        version: 4,
         bridge_command: bridge_command.to_string(),
         events: events.to_string(),
         telegram: Some(telegram),
+        codex: Some(codex),
         projects: existing
             .map(|config| config.projects.clone())
             .unwrap_or_default(),
@@ -123,6 +142,16 @@ pub(crate) fn load_daemon_config() -> Result<DaemonConfig> {
             "daemon config must include Telegram transport. Run `codex-telegram-bridge setup` or `codex-telegram-bridge telegram setup`."
         ),
     }
+    let codex = config
+        .codex
+        .as_ref()
+        .context("daemon config must include shared Codex live backend configuration")?;
+    if !matches!(codex.live_mode, CodexLiveMode::Shared) {
+        bail!("daemon config codex.liveMode must be shared");
+    }
+    if codex.websocket_url.trim().is_empty() {
+        bail!("daemon config codex.websocketUrl cannot be empty");
+    }
     for project in &config.projects {
         if project.id.trim().is_empty() {
             bail!("daemon config project id cannot be empty");
@@ -142,6 +171,10 @@ pub(crate) fn redacted_daemon_config(config: &DaemonConfig) -> Value {
         "version": config.version,
         "bridgeCommand": config.bridge_command,
         "events": config.events,
+        "codex": config.codex.as_ref().map(|codex| json!({
+            "liveMode": codex.live_mode,
+            "websocketUrl": codex.websocket_url
+        })),
         "telegram": config.telegram.as_ref().map(|telegram| json!({
             "botToken": "<redacted>",
             "chatId": telegram.chat_id,
@@ -187,18 +220,60 @@ pub(crate) fn resolve_telegram_bot_token(explicit: Option<&str>) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn config_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ConfigBackup {
+        path: std::path::PathBuf,
+        contents: Option<Vec<u8>>,
+    }
+
+    impl ConfigBackup {
+        fn capture() -> anyhow::Result<Self> {
+            let path = daemon_config_path()?;
+            let contents = fs::read(&path).ok();
+            Ok(Self { path, contents })
+        }
+    }
+
+    impl Drop for ConfigBackup {
+        fn drop(&mut self) {
+            match &self.contents {
+                Some(contents) => {
+                    if let Some(parent) = self.path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(&self.path, contents);
+                }
+                None => {
+                    if self.path.exists() {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn merged_daemon_config_preserves_existing_projects() {
         let merged = merged_daemon_config(
             Some(&DaemonConfig {
-                version: 2,
+                version: 3,
                 bridge_command: "old-bridge".to_string(),
                 events: "thread_waiting".to_string(),
                 telegram: Some(TelegramConfig {
                     bot_token: "old".to_string(),
                     chat_id: "old-chat".to_string(),
                     allowed_user_id: None,
+                }),
+                codex: Some(CodexConfig {
+                    live_mode: CodexLiveMode::Shared,
+                    websocket_url: "ws://127.0.0.1:4500".to_string(),
                 }),
                 projects: vec![RegisteredProject {
                     id: "bridge".to_string(),
@@ -214,11 +289,68 @@ mod tests {
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
             },
+            CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
+            },
         );
 
-        assert_eq!(merged.version, 3);
+        assert_eq!(merged.version, 4);
         assert_eq!(merged.projects.len(), 1);
         assert_eq!(merged.projects[0].id, "bridge");
         assert_eq!(merged.telegram.as_ref().unwrap().chat_id, "456");
+        let codex = merged.codex.as_ref().expect("codex config");
+        assert_eq!(codex.live_mode, CodexLiveMode::Shared);
+        assert_eq!(codex.websocket_url, "ws://127.0.0.1:4500");
+    }
+
+    #[test]
+    fn redacted_daemon_config_preserves_shared_live_backend() {
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
+            }),
+            projects: vec![],
+        };
+
+        let redacted = redacted_daemon_config(&config);
+
+        assert_eq!(redacted["codex"]["liveMode"], "shared");
+        assert_eq!(redacted["codex"]["websocketUrl"], "ws://127.0.0.1:4500");
+        assert_eq!(redacted["version"], 4);
+    }
+
+    #[test]
+    fn load_daemon_config_requires_shared_codex_config() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _backup = ConfigBackup::capture().expect("capture config backup");
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            codex: None,
+            projects: vec![],
+        })
+        .expect("write config");
+
+        let error = load_daemon_config().expect_err("load should require codex config");
+        assert!(
+            format!("{error:#}").contains("shared Codex live backend configuration"),
+            "unexpected error: {error:#}"
+        );
     }
 }

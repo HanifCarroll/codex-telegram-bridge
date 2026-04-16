@@ -54,8 +54,9 @@ use crate::telegram::{
 use clap::Parser;
 pub(crate) use config::{
     daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
-    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, DaemonConfig,
-    RegisteredProject, SetupOptions, TelegramConfig, TelegramSetupOptions,
+    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, CodexConfig,
+    CodexLiveMode, DaemonConfig, RegisteredProject, SetupOptions, TelegramConfig,
+    TelegramSetupOptions,
 };
 pub(crate) use state::state_dir_path;
 
@@ -148,6 +149,7 @@ fn run() -> Result<()> {
             allowed_user_id,
             events,
             bridge_command,
+            websocket_url,
             daemon_label,
             install_daemon,
             start_daemon,
@@ -163,6 +165,7 @@ fn run() -> Result<()> {
                 allowed_user_id: allowed_user_id.as_deref(),
                 events: &events,
                 bridge_command: &bridge_command,
+                websocket_url: &websocket_url,
                 daemon_label: &daemon_label,
                 install_daemon,
                 start_daemon,
@@ -418,6 +421,7 @@ fn run() -> Result<()> {
                 allowed_user_id,
                 events,
                 bridge_command,
+                websocket_url,
                 pair_timeout_ms,
                 dry_run,
             } => {
@@ -427,6 +431,7 @@ fn run() -> Result<()> {
                     allowed_user_id: allowed_user_id.as_deref(),
                     events: &events,
                     bridge_command: &bridge_command,
+                    websocket_url: &websocket_url,
                     dry_run,
                     pair_timeout_ms,
                 })?;
@@ -996,6 +1001,7 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
         allowed_user_id: options.allowed_user_id,
         events: options.events,
         bridge_command: options.bridge_command,
+        websocket_url: options.websocket_url,
         dry_run: options.dry_run,
         pair_timeout_ms: options.pair_timeout_ms,
     })?;
@@ -1135,6 +1141,7 @@ fn project_remove_result(id: &str, dry_run: bool) -> Result<Value> {
 }
 
 const DEFAULT_NOTIFICATION_EVENTS: &str = "thread_waiting,thread_completed";
+const DEFAULT_CODEX_WEBSOCKET_URL: &str = "ws://127.0.0.1:4500";
 
 #[derive(Debug, Clone, Copy)]
 struct HermesInstallOptions<'a> {

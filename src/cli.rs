@@ -11,7 +11,9 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
-    #[command(about = "Configure Telegram delivery, daemon service, and optional Hermes MCP")]
+    #[command(
+        about = "Configure Telegram delivery, shared live backend, daemon service, and optional Hermes MCP"
+    )]
     Setup {
         #[arg(long)]
         bot_token: Option<String>,
@@ -23,6 +25,8 @@ pub(crate) enum Commands {
         events: String,
         #[arg(long, default_value = "codex-telegram-bridge")]
         bridge_command: String,
+        #[arg(long, default_value = crate::DEFAULT_CODEX_WEBSOCKET_URL)]
+        websocket_url: String,
         #[arg(long, default_value = crate::DEFAULT_DAEMON_LABEL)]
         daemon_label: String,
         #[arg(long = "no-install-daemon", default_value_t = true, action = clap::ArgAction::SetFalse)]
@@ -104,7 +108,9 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
-    #[command(about = "Configure direct Telegram delivery and reply routing")]
+    #[command(
+        about = "Configure direct Telegram delivery, shared live backend, and reply routing"
+    )]
     Telegram {
         #[command(subcommand)]
         command: TelegramCommands,
@@ -305,7 +311,7 @@ pub(crate) enum DaemonCommands {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum TelegramCommands {
-    #[command(about = "Configure the bridge-owned Telegram bot transport")]
+    #[command(about = "Configure the bridge-owned Telegram bot transport and shared live backend")]
     Setup {
         #[arg(long)]
         bot_token: Option<String>,
@@ -317,6 +323,8 @@ pub(crate) enum TelegramCommands {
         events: String,
         #[arg(long, default_value = "codex-telegram-bridge")]
         bridge_command: String,
+        #[arg(long, default_value = crate::DEFAULT_CODEX_WEBSOCKET_URL)]
+        websocket_url: String,
         #[arg(long, default_value_t = 60_000)]
         pair_timeout_ms: u64,
         #[arg(long, default_value_t = false)]
@@ -507,6 +515,8 @@ mod tests {
                 "123:abc",
                 "--chat-id",
                 "456",
+                "--websocket-url",
+                "ws://127.0.0.1:4500",
                 "--dry-run",
             ],
             vec!["codex-telegram-bridge", "telegram", "status"],
@@ -524,6 +534,21 @@ mod tests {
             assert!(
                 parsed.is_ok(),
                 "telegram command should parse: {args:?}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_accepts_status_surface_commands() {
+        for args in [
+            vec!["codex-telegram-bridge", "doctor"],
+            vec!["codex-telegram-bridge", "daemon", "status"],
+            vec!["codex-telegram-bridge", "telegram", "status"],
+        ] {
+            let parsed = Cli::try_parse_from(args.clone());
+            assert!(
+                parsed.is_ok(),
+                "status command should parse: {args:?}: {parsed:?}"
             );
         }
     }
@@ -578,6 +603,8 @@ mod tests {
             "456",
             "--allowed-user-id",
             "789",
+            "--websocket-url",
+            "ws://127.0.0.1:4500",
             "--no-install-daemon",
             "--no-start-daemon",
             "--dry-run",
