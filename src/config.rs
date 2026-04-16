@@ -83,6 +83,13 @@ pub(crate) struct SetupOptions<'a> {
     pub(crate) pair_timeout_ms: u64,
 }
 
+pub(crate) fn default_codex_config() -> CodexConfig {
+    CodexConfig {
+        live_mode: CodexLiveMode::Shared,
+        websocket_url: crate::DEFAULT_CODEX_WEBSOCKET_URL.to_string(),
+    }
+}
+
 pub(crate) fn daemon_config_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("config.json"))
 }
@@ -124,8 +131,11 @@ pub(crate) fn load_daemon_config() -> Result<DaemonConfig> {
     let path = daemon_config_path()?;
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("daemon config not found at {}", path.display()))?;
-    let config: DaemonConfig = serde_json::from_str(&raw)
+    let mut config: DaemonConfig = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse daemon config at {}", path.display()))?;
+    if config.codex.is_none() && config.version < 4 {
+        config.codex = Some(default_codex_config());
+    }
     if config.events.trim().is_empty() {
         bail!("daemon config events cannot be empty");
     }
@@ -352,5 +362,28 @@ mod tests {
             format!("{error:#}").contains("shared Codex live backend configuration"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn load_daemon_config_backfills_shared_codex_config_for_legacy_versions() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _backup = ConfigBackup::capture().expect("capture config backup");
+        write_daemon_config(&DaemonConfig {
+            version: 3,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            codex: None,
+            projects: vec![],
+        })
+        .expect("write legacy config");
+
+        let loaded = load_daemon_config().expect("load legacy config");
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.codex, Some(default_codex_config()));
     }
 }

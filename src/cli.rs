@@ -506,19 +506,35 @@ mod tests {
 
     #[test]
     fn cli_accepts_telegram_setup_and_status_commands() {
+        let parsed = Cli::try_parse_from([
+            "codex-telegram-bridge",
+            "telegram",
+            "setup",
+            "--bot-token",
+            "123:abc",
+            "--chat-id",
+            "456",
+            "--websocket-url",
+            "ws://127.0.0.1:4500",
+            "--dry-run",
+        ])
+        .expect("telegram setup should parse");
+        match parsed.command {
+            Commands::Telegram {
+                command:
+                    TelegramCommands::Setup {
+                        websocket_url,
+                        dry_run,
+                        ..
+                    },
+            } => {
+                assert_eq!(websocket_url, "ws://127.0.0.1:4500");
+                assert!(dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
         for args in [
-            vec![
-                "codex-telegram-bridge",
-                "telegram",
-                "setup",
-                "--bot-token",
-                "123:abc",
-                "--chat-id",
-                "456",
-                "--websocket-url",
-                "ws://127.0.0.1:4500",
-                "--dry-run",
-            ],
             vec!["codex-telegram-bridge", "telegram", "status"],
             vec![
                 "codex-telegram-bridge",
@@ -608,8 +624,23 @@ mod tests {
             "--no-install-daemon",
             "--no-start-daemon",
             "--dry-run",
-        ]);
-        assert!(parsed.is_ok(), "setup command should parse: {parsed:?}");
+        ])
+        .expect("setup command should parse");
+        match parsed.command {
+            Commands::Setup {
+                websocket_url,
+                install_daemon,
+                start_daemon,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(websocket_url, "ws://127.0.0.1:4500");
+                assert!(!install_daemon);
+                assert!(!start_daemon);
+                assert!(dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
