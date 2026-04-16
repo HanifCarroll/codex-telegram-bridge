@@ -10,6 +10,7 @@ mod cli;
 mod codex;
 mod config;
 mod daemon;
+mod live;
 mod mcp;
 mod projects;
 mod state;
@@ -59,6 +60,8 @@ pub(crate) use config::{
     CodexLiveMode, DaemonConfig, RegisteredProject, SetupOptions, TelegramConfig,
     TelegramSetupOptions,
 };
+#[allow(unused_imports)]
+pub(crate) use live::{ensure_live_backend, reset_live_backend};
 pub(crate) use state::state_dir_path;
 
 #[derive(Serialize)]

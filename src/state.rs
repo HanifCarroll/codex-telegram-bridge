@@ -584,6 +584,11 @@ pub(crate) fn state_db_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("state.db"))
 }
 
+#[allow(dead_code)]
+pub(crate) fn live_backend_status_path() -> Result<PathBuf> {
+    Ok(state_dir_path()?.join("live-backend.json"))
+}
+
 pub(crate) fn get_setting_number(conn: &Connection, key: &str) -> Result<Option<u64>> {
     let raw: Option<String> = conn
         .query_row(
@@ -2064,5 +2069,26 @@ mod tests {
         assert_eq!(imported.len(), 2);
         assert_eq!(imported[0].id, "app");
         assert_eq!(imported[1].id, "app-2");
+    }
+
+    #[test]
+    fn live_backend_status_path_uses_bridge_state_directory() {
+        let home =
+            std::env::temp_dir().join(format!("codex-live-state-path-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+        let previous_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+
+        let path = live_backend_status_path().expect("live backend status path");
+
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("HOME", previous_home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert!(path.ends_with(".codex-telegram-bridge/live-backend.json"));
     }
 }
