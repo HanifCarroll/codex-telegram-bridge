@@ -93,6 +93,11 @@ struct DoctorBridge {
     telegram_configured: bool,
     daemon_service_path: String,
     daemon_service_exists: bool,
+    daemon_service_loaded: bool,
+    daemon_running: bool,
+    daemon_state: Option<String>,
+    daemon_healthy: bool,
+    next_step: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -950,6 +955,7 @@ fn doctor_bridge() -> Result<DoctorBridge> {
     let config_path = daemon_config_path()?;
     let config = read_daemon_config_raw()?;
     let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-telegram-bridge")?;
+    let status = daemon_service_status(DEFAULT_DAEMON_LABEL)?;
     Ok(DoctorBridge {
         config_path: config_path.display().to_string(),
         config_exists: config_path.exists(),
@@ -959,6 +965,26 @@ fn doctor_bridge() -> Result<DoctorBridge> {
             .is_some(),
         daemon_service_path: service.service_path.display().to_string(),
         daemon_service_exists: service.service_path.exists(),
+        daemon_service_loaded: status
+            .pointer("/serviceStatus/loaded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        daemon_running: status
+            .pointer("/serviceStatus/running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        daemon_state: status
+            .pointer("/serviceStatus/state")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        daemon_healthy: status
+            .get("healthy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        next_step: status
+            .get("nextStep")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 

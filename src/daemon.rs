@@ -405,6 +405,100 @@ fn run_shell_command(command: &str) -> Result<Value> {
     }))
 }
 
+fn macos_service_runtime(output: &Value) -> Value {
+    let stdout = output
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = output
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let success = output
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !success {
+        let not_loaded = stderr.contains("Could not find service")
+            || stderr.contains("could not find service")
+            || stderr.contains("service not found");
+        return json!({
+            "loaded": !not_loaded,
+            "running": false,
+            "state": Value::Null,
+            "raw": output
+        });
+    }
+
+    let state = stdout.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("state = ")
+            .map(|value| value.trim().to_string())
+    });
+    let running = matches!(state.as_deref(), Some("running"));
+    json!({
+        "loaded": true,
+        "running": running,
+        "state": state,
+        "raw": output
+    })
+}
+
+fn linux_service_runtime(unit_name: &str, status_output: &Value) -> Result<Value> {
+    let active_output = run_shell_command(&format!(
+        "systemctl --user is-active {}",
+        shell_quote(unit_name)
+    ))?;
+    let active = active_output
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let loaded = status_output
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || active != "inactive";
+    Ok(json!({
+        "loaded": loaded,
+        "running": active == "active",
+        "state": if active.is_empty() { Value::Null } else { json!(active) },
+        "raw": {
+            "status": status_output,
+            "isActive": active_output
+        }
+    }))
+}
+
+fn service_runtime_status(spec: &DaemonServiceSpec) -> Result<Value> {
+    if !spec.service_path.exists() {
+        return Ok(json!({
+            "loaded": false,
+            "running": false,
+            "state": Value::Null,
+            "raw": Value::Null
+        }));
+    }
+
+    if cfg!(target_os = "macos") {
+        let output = run_shell_command(&spec.status_command)?;
+        return Ok(macos_service_runtime(&output));
+    }
+
+    if cfg!(target_os = "linux") {
+        let output = run_shell_command(&spec.status_command)?;
+        return linux_service_runtime(&spec.unit_name, &output);
+    }
+
+    Ok(json!({
+        "loaded": false,
+        "running": false,
+        "state": Value::Null,
+        "raw": Value::Null
+    }))
+}
+
 pub(crate) fn start_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
     let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     let command = spec.start_command.clone();
@@ -444,14 +538,27 @@ pub(crate) fn stop_daemon_service(label: &str, dry_run: bool) -> Result<Value> {
 pub(crate) fn daemon_service_status(label: &str) -> Result<Value> {
     let spec = daemon_service_spec(label, "codex-telegram-bridge")?;
     let config_path = daemon_config_path()?;
+    let service_status = service_runtime_status(&spec)?;
+    let running = service_status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let healthy = config_path.exists() && spec.service_path.exists() && running;
     Ok(json!({
         "ok": true,
         "action": "daemon_status",
         "label": spec.unit_name,
+        "healthy": healthy,
         "configPath": config_path,
         "configExists": config_path.exists(),
         "servicePath": spec.service_path,
         "serviceExists": spec.service_path.exists(),
+        "serviceStatus": service_status,
+        "nextStep": if healthy {
+            Value::Null
+        } else {
+            json!("Run `codex-telegram-bridge daemon start` to restore background Telegram delivery.")
+        },
         "statusCommand": spec.status_command,
         "logs": {
             "stdout": spec.stdout_log,
@@ -594,5 +701,31 @@ mod tests {
         assert_eq!(disabled["away"], false);
         assert_eq!(disabled["clearedPendingNotifications"], 1);
         assert_eq!(pending_outbound_count(&conn).expect("pending"), 0);
+    }
+
+    #[test]
+    fn macos_service_runtime_marks_running_services_as_loaded() {
+        let runtime = macos_service_runtime(&json!({
+            "success": true,
+            "stdout": "gui/501/example = {\n\tstate = running\n}\n",
+            "stderr": ""
+        }));
+
+        assert_eq!(runtime["loaded"], true);
+        assert_eq!(runtime["running"], true);
+        assert_eq!(runtime["state"], "running");
+    }
+
+    #[test]
+    fn macos_service_runtime_marks_missing_services_as_not_loaded() {
+        let runtime = macos_service_runtime(&json!({
+            "success": false,
+            "stdout": "",
+            "stderr": "Bad request.\nCould not find service \"example\" in domain for user gui: 501"
+        }));
+
+        assert_eq!(runtime["loaded"], false);
+        assert_eq!(runtime["running"], false);
+        assert_eq!(runtime["state"], Value::Null);
     }
 }
