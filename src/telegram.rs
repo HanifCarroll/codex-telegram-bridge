@@ -811,20 +811,16 @@ fn execute_telegram_command(
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
-        TelegramInboundCommand::LiveOn => {
-            Ok(json!({
-                "ok": false,
-                "action": "telegram_live_on_unavailable",
-                "message": "live mode commands are not implemented yet"
-            }))
-        }
-        TelegramInboundCommand::LiveReset => {
-            Ok(json!({
-                "ok": false,
-                "action": "telegram_live_reset_unavailable",
-                "message": "live mode commands are not implemented yet"
-            }))
-        }
+        TelegramInboundCommand::LiveOn => Ok(json!({
+            "ok": false,
+            "action": "telegram_live_on_unavailable",
+            "message": "live mode commands are not implemented yet"
+        })),
+        TelegramInboundCommand::LiveReset => Ok(json!({
+            "ok": false,
+            "action": "telegram_live_reset_unavailable",
+            "message": "live mode commands are not implemented yet"
+        })),
         TelegramInboundCommand::NewThread(Some(prompt)) => {
             let config = load_daemon_config()?;
             let current_project =
