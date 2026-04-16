@@ -19,6 +19,7 @@ use crate::state::{
     get_setting_text, recent_actions_json, reconcile_thread_snapshots, set_setting,
     set_setting_text, upsert_thread_snapshot, BridgeThreadSnapshot, PendingPrompt,
 };
+use crate::ws::WsJsonRpcTransport;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedBinary {
@@ -1466,13 +1467,28 @@ pub(crate) fn start_codex_watch_receiver() -> Result<CodexWatchReceiver> {
     })
 }
 
+#[allow(dead_code)]
+pub(crate) enum CodexBackend {
+    SpawnedStdio,
+    SharedWebsocket { url: String },
+}
+
 pub(crate) struct CodexAppServerClient {
+    transport: CodexTransport,
+    next_id: u64,
+    notifications: Vec<Value>,
+}
+
+enum CodexTransport {
+    SpawnedStdio(SpawnedStdioTransport),
+    SharedWebsocket(WsJsonRpcTransport),
+}
+
+struct SpawnedStdioTransport {
     child: Child,
     stdin: ChildStdin,
     messages: Receiver<AppServerReaderMessage>,
     reader: Option<JoinHandle<()>>,
-    next_id: u64,
-    notifications: Vec<Value>,
     reader_error: Option<String>,
 }
 
@@ -1485,39 +1501,26 @@ enum AppServerReaderMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CodexAppServerTransportInfo {
     pub(crate) transport: &'static str,
-    pub(crate) app_server_pid: u32,
+    pub(crate) app_server_pid: Option<u32>,
 }
 
 impl CodexAppServerClient {
     pub(crate) fn connect() -> Result<Self> {
-        let resolved = resolve_codex_binary()?;
-        let mut child = Command::new(&resolved.path)
-            .arg("app-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to spawn {} app-server", resolved.path.display()))?;
+        Self::connect_with_backend(CodexBackend::SpawnedStdio)
+    }
 
-        let stdin = child
-            .stdin
-            .take()
-            .context("failed to open app-server stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("failed to open app-server stdout")?;
-
-        let (messages, reader) = spawn_app_server_reader(stdout);
+    pub(crate) fn connect_with_backend(backend: CodexBackend) -> Result<Self> {
+        let transport = match backend {
+            CodexBackend::SpawnedStdio => CodexTransport::SpawnedStdio(connect_spawned_stdio()?),
+            CodexBackend::SharedWebsocket { url } => {
+                CodexTransport::SharedWebsocket(WsJsonRpcTransport::connect(&url)?)
+            }
+        };
 
         let mut client = Self {
-            child,
-            stdin,
-            messages,
-            reader: Some(reader),
+            transport,
             next_id: 1,
             notifications: Vec::new(),
-            reader_error: None,
         };
 
         let _ = client.request("initialize", initialize_params())?;
@@ -1526,9 +1529,15 @@ impl CodexAppServerClient {
     }
 
     pub(crate) fn transport_info(&self) -> CodexAppServerTransportInfo {
-        CodexAppServerTransportInfo {
-            transport: "spawned_stdio",
-            app_server_pid: self.child.id(),
+        match &self.transport {
+            CodexTransport::SpawnedStdio(transport) => CodexAppServerTransportInfo {
+                transport: "spawned_stdio",
+                app_server_pid: Some(transport.child.id()),
+            },
+            CodexTransport::SharedWebsocket(_) => CodexAppServerTransportInfo {
+                transport: "shared_websocket",
+                app_server_pid: None,
+            },
         }
     }
 
@@ -1553,51 +1562,101 @@ impl CodexAppServerClient {
         self.write_message(&envelope)?;
 
         loop {
-            if let Some(error) = self.reader_error.take() {
-                bail!("{error}");
-            }
-            match self.messages.recv() {
-                Ok(AppServerReaderMessage::Json(parsed)) => {
-                    if let Some(result) =
-                        handle_app_server_message(&parsed, id, &mut self.notifications)?
-                    {
-                        return Ok(result);
-                    }
-                }
-                Ok(AppServerReaderMessage::Error(message)) => bail!("{message}"),
-                Ok(AppServerReaderMessage::Closed) | Err(_) => {
-                    bail!("codex app-server closed stdout while waiting for {method}")
-                }
+            let parsed = self.read_message_blocking(method)?;
+            if let Some(result) = handle_app_server_message(&parsed, id, &mut self.notifications)? {
+                return Ok(result);
             }
         }
     }
 
     pub(crate) fn drain_notifications(&mut self) -> Vec<Value> {
-        while let Ok(message) = self.messages.try_recv() {
-            match message {
-                AppServerReaderMessage::Json(parsed) => {
-                    if parsed.get("id").is_none()
-                        && parsed.get("method").and_then(Value::as_str).is_some()
-                    {
-                        self.notifications.push(parsed);
-                    }
-                }
-                AppServerReaderMessage::Error(message) => {
-                    if self.reader_error.is_none() {
-                        self.reader_error = Some(message);
-                    }
-                }
-                AppServerReaderMessage::Closed => {}
+        while let Some(parsed) = self.try_read_message() {
+            if parsed.get("id").is_none() && parsed.get("method").and_then(Value::as_str).is_some()
+            {
+                self.notifications.push(parsed);
             }
         }
         std::mem::take(&mut self.notifications)
     }
 
     fn write_message(&mut self, value: &Value) -> Result<()> {
-        writeln!(self.stdin, "{}", serde_json::to_string(value)?)?;
-        self.stdin.flush()?;
-        Ok(())
+        match &mut self.transport {
+            CodexTransport::SpawnedStdio(transport) => {
+                writeln!(transport.stdin, "{}", serde_json::to_string(value)?)?;
+                transport.stdin.flush()?;
+                Ok(())
+            }
+            CodexTransport::SharedWebsocket(transport) => transport.write_json(value),
+        }
     }
+
+    fn read_message_blocking(&mut self, method: &str) -> Result<Value> {
+        match &mut self.transport {
+            CodexTransport::SpawnedStdio(transport) => loop {
+                if let Some(error) = transport.reader_error.take() {
+                    bail!("{error}");
+                }
+                match transport.messages.recv() {
+                    Ok(AppServerReaderMessage::Json(parsed)) => return Ok(parsed),
+                    Ok(AppServerReaderMessage::Error(message)) => bail!("{message}"),
+                    Ok(AppServerReaderMessage::Closed) | Err(_) => {
+                        bail!("codex app-server closed stdout while waiting for {method}")
+                    }
+                }
+            },
+            CodexTransport::SharedWebsocket(transport) => transport.read_json(),
+        }
+    }
+
+    fn try_read_message(&mut self) -> Option<Value> {
+        match &mut self.transport {
+            CodexTransport::SpawnedStdio(transport) => {
+                while let Ok(message) = transport.messages.try_recv() {
+                    match message {
+                        AppServerReaderMessage::Json(parsed) => return Some(parsed),
+                        AppServerReaderMessage::Error(message) => {
+                            if transport.reader_error.is_none() {
+                                transport.reader_error = Some(message);
+                            }
+                        }
+                        AppServerReaderMessage::Closed => {}
+                    }
+                }
+                None
+            }
+            CodexTransport::SharedWebsocket(transport) => transport.try_read_json().unwrap_or(None),
+        }
+    }
+}
+
+fn connect_spawned_stdio() -> Result<SpawnedStdioTransport> {
+    let resolved = resolve_codex_binary()?;
+    let mut child = Command::new(&resolved.path)
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn {} app-server", resolved.path.display()))?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .context("failed to open app-server stdin")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to open app-server stdout")?;
+
+    let (messages, reader) = spawn_app_server_reader(stdout);
+
+    Ok(SpawnedStdioTransport {
+        child,
+        stdin,
+        messages,
+        reader: Some(reader),
+        reader_error: None,
+    })
 }
 
 fn spawn_app_server_reader(
@@ -1677,11 +1736,13 @@ fn handle_app_server_message(
 
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        if let CodexTransport::SpawnedStdio(transport) = &mut self.transport {
+            let _ = transport.stdin.flush();
+            let _ = transport.child.kill();
+            let _ = transport.child.wait();
+            if let Some(reader) = transport.reader.take() {
+                let _ = reader.join();
+            }
         }
     }
 }
@@ -1914,6 +1975,122 @@ raise SystemExit(1)
                     .and_then(Value::as_str)
                     == Some("thr_async")
         }));
+    }
+
+    struct FakeWsAppServer {
+        url: String,
+        done: Receiver<Vec<Value>>,
+        server: JoinHandle<()>,
+    }
+
+    impl FakeWsAppServer {
+        fn spawn(responses: Vec<Value>) -> Self {
+            use std::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ws app-server");
+            let address = listener.local_addr().expect("fake ws app-server addr");
+            let url = format!("ws://{address}");
+            let (done_tx, done_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept fake ws client");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                let mut requests = Vec::new();
+                for response in responses {
+                    let message = socket.read().expect("read websocket frame");
+                    let text = message.into_text().expect("websocket text frame");
+                    let parsed: Value = serde_json::from_str(&text).expect("parse websocket JSON");
+                    requests.push(parsed);
+                    socket
+                        .send(tungstenite::Message::Text(
+                            serde_json::to_string(&response)
+                                .expect("serialize websocket response")
+                                .into(),
+                        ))
+                        .expect("send websocket response");
+                }
+                done_tx.send(requests).expect("send fake ws requests");
+            });
+            Self {
+                url,
+                done: done_rx,
+                server,
+            }
+        }
+
+        fn url(&self) -> &str {
+            &self.url
+        }
+
+        fn finish(self) -> Vec<Value> {
+            let requests = self.done.recv().expect("fake ws requests");
+            self.server.join().expect("fake ws app-server thread");
+            requests
+        }
+    }
+
+    #[test]
+    fn websocket_app_server_client_initializes_and_sends_notifications() {
+        let server = FakeWsAppServer::spawn(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": 1,
+                    "serverInfo": { "name": "fake-codex", "version": "test" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thr_ws",
+                    "turnId": "turn_ws",
+                    "item": { "type": "assistantMessage" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "threads": []
+                }
+            }),
+        ]);
+
+        let mut client =
+            CodexAppServerClient::connect_with_backend(CodexBackend::SharedWebsocket {
+                url: server.url().to_string(),
+            })
+            .expect("connect websocket backend");
+
+        assert_eq!(
+            client.transport_info(),
+            CodexAppServerTransportInfo {
+                transport: "shared_websocket",
+                app_server_pid: None,
+            }
+        );
+
+        let response = client
+            .request("thread/list", json!({ "limit": 1 }))
+            .expect("thread/list");
+
+        assert_eq!(response["threads"], json!([]));
+
+        let notifications = client.drain_notifications();
+        assert!(notifications.iter().any(|notification| {
+            notification.get("method").and_then(Value::as_str) == Some("item/completed")
+                && notification
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    == Some("thr_ws")
+        }));
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(requests[1]["method"], "initialized");
+        assert_eq!(requests[2]["method"], "thread/list");
     }
 
     #[test]

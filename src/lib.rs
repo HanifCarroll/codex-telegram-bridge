@@ -14,6 +14,7 @@ mod mcp;
 mod projects;
 mod state;
 mod telegram;
+mod ws;
 
 use crate::cli::{
     AwayCommands, Cli, Commands, DaemonCommands, HermesCommands, ProjectCommands, TelegramCommands,
