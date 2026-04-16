@@ -17,6 +17,10 @@ impl WsJsonRpcTransport {
         if url.scheme() != "ws" {
             bail!("only ws:// shared websocket URLs are supported in this release");
         }
+        match url.host_str() {
+            Some("127.0.0.1") | Some("localhost") | Some("::1") => {}
+            _ => bail!("only loopback ws:// shared websocket URLs are supported in this release"),
+        }
         let (socket, _) = connect(url.as_str()).context("failed to connect websocket transport")?;
         Ok(Self { socket })
     }
@@ -164,6 +168,17 @@ mod tests {
         let error = WsJsonRpcTransport::connect("wss://127.0.0.1:4500").expect_err("reject wss");
         assert!(
             format!("{error:#}").contains("only ws:// shared websocket URLs are supported"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn websocket_transport_rejects_non_loopback_hosts() {
+        let error = WsJsonRpcTransport::connect("ws://example.com:4500")
+            .expect_err("reject non-loopback host");
+        assert!(
+            format!("{error:#}")
+                .contains("only loopback ws:// shared websocket URLs are supported"),
             "unexpected error: {error:#}"
         );
     }

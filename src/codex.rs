@@ -2120,6 +2120,105 @@ raise SystemExit(1)
     }
 
     #[test]
+    fn websocket_notification_polling_preserves_transport_error_for_next_request() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ws app-server");
+        let address = listener.local_addr().expect("fake ws app-server addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake ws client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket");
+
+            let initialize = socket.read().expect("read initialize");
+            let initialize = initialize.into_text().expect("initialize text");
+            let initialize: Value =
+                serde_json::from_str(&initialize).expect("parse initialize request");
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&json!({
+                        "jsonrpc": "2.0",
+                        "id": initialize["id"],
+                        "result": {
+                            "protocolVersion": 1,
+                            "serverInfo": { "name": "fake-codex", "version": "test" }
+                        }
+                    }))
+                    .expect("serialize initialize response")
+                    .into(),
+                ))
+                .expect("send initialize response");
+
+            let initialized = socket.read().expect("read initialized");
+            let initialized = initialized.into_text().expect("initialized text");
+            let initialized: Value =
+                serde_json::from_str(&initialized).expect("parse initialized notification");
+            assert_eq!(initialized["method"], "initialized");
+
+            let request = socket.read().expect("read thread/list");
+            let request = request.into_text().expect("thread/list text");
+            let request: Value = serde_json::from_str(&request).expect("parse thread/list request");
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thr_ws",
+                            "turnId": "turn_ws",
+                            "item": { "type": "assistantMessage" }
+                        }
+                    }))
+                    .expect("serialize notification")
+                    .into(),
+                ))
+                .expect("send notification");
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "threads": [] }
+                    }))
+                    .expect("serialize thread/list response")
+                    .into(),
+                ))
+                .expect("send thread/list response");
+            socket
+                .close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    reason: "done".into(),
+                }))
+                .expect("close websocket");
+        });
+
+        let mut client =
+            CodexAppServerClient::connect_with_backend(CodexBackend::SharedWebsocket {
+                url: format!("ws://{address}"),
+            })
+            .expect("connect websocket backend");
+
+        let response = client
+            .request("thread/list", json!({ "limit": 1 }))
+            .expect("thread/list");
+        assert_eq!(response["threads"], json!([]));
+
+        let notifications = client.drain_notifications();
+        assert!(notifications.iter().any(|notification| {
+            notification.get("method").and_then(Value::as_str) == Some("item/completed")
+        }));
+
+        let error = client
+            .request("thread/read", json!({ "threadId": "thr_ws" }))
+            .expect_err("next request should surface websocket close");
+        assert!(
+            format!("{error:#}").contains("websocket app-server closed connection"),
+            "unexpected error: {error:#}"
+        );
+
+        server.join().expect("fake ws app-server thread");
+    }
+
+    #[test]
     fn normalize_notification_matches_ts_event_contract() {
         let event = normalize_notification_event(&json!({
             "jsonrpc": "2.0",
