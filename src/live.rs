@@ -13,6 +13,8 @@ use crate::state::live_backend_status_path;
 const LIVE_BACKEND_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
 const LIVE_BACKEND_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[allow(dead_code)]
+const LIVE_BACKEND_TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,10 +52,20 @@ pub(crate) fn live_backend_status(config: &CodexConfig) -> Result<LiveBackendSta
         };
     }
 
+    let managed_pid_alive = match status.pid {
+        Some(pid) => backend_pid_is_alive(pid),
+        None => true,
+    };
     match verify_live_backend_health(&config.websocket_url) {
-        Ok(()) => {
+        Ok(()) if managed_pid_alive => {
             status.healthy = true;
             status.last_error = None;
+        }
+        Ok(()) => {
+            status.healthy = false;
+            status.last_error = status
+                .pid
+                .map(|pid| format!("managed live backend process {pid} is not running"));
         }
         Err(error) => {
             status.healthy = false;
@@ -116,6 +128,13 @@ fn wait_for_live_backend(config: &CodexConfig, pid: u32) -> Result<LiveBackendSt
     let mut last_error = None;
 
     while started.elapsed() < LIVE_BACKEND_HEALTH_TIMEOUT {
+        if !backend_pid_is_alive(pid) {
+            last_error = Some(format!(
+                "managed live backend process {pid} exited before becoming healthy"
+            ));
+            break;
+        }
+
         match verify_live_backend_health(&config.websocket_url) {
             Ok(()) => {
                 let status = LiveBackendStatus {
@@ -178,7 +197,18 @@ fn write_live_backend_status(status: &LiveBackendStatus) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, serde_json::to_vec_pretty(status)?)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("live backend status path missing file name")?;
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    fs::write(&tmp_path, serde_json::to_vec_pretty(status)?)?;
+    fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "failed to replace live backend status file {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -190,23 +220,70 @@ fn spawn_live_backend_process(config: &CodexConfig) -> Result<u32> {
     }
 
     let resolved = resolve_codex_binary()?;
-    let child = Command::new(&resolved.path)
-        .arg("app-server")
-        .arg("--listen")
-        .arg(&config.websocket_url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to spawn {} app-server", resolved.path.display()))?;
 
-    Ok(child.id())
+    #[cfg(unix)]
+    {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"
+binary=$1
+url=$2
+nohup "$binary" app-server --listen "$url" </dev/null >/dev/null 2>&1 &
+printf '%s\n' "$!"
+"#,
+            )
+            .arg("codex-live-backend")
+            .arg(&resolved.path)
+            .arg(&config.websocket_url)
+            .output()
+            .with_context(|| format!("failed to spawn {} app-server", resolved.path.display()))?;
+
+        if !output.status.success() {
+            bail!(
+                "failed to spawn {} app-server: {}",
+                resolved.path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .with_context(|| {
+                format!(
+                    "failed to parse spawned app-server pid from {}",
+                    String::from_utf8_lossy(&output.stdout).trim()
+                )
+            })?;
+        return Ok(pid);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let child = Command::new(&resolved.path)
+            .arg("app-server")
+            .arg("--listen")
+            .arg(&config.websocket_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to spawn {} app-server", resolved.path.display()))?;
+
+        Ok(child.id())
+    }
 }
 
 #[allow(dead_code)]
 fn terminate_backend_pid(pid: u32) {
     #[cfg(test)]
     if terminate_test_live_backend(pid) {
+        return;
+    }
+
+    #[cfg(test)]
+    if test_fake_spawn_enabled() {
         return;
     }
 
@@ -218,6 +295,16 @@ fn terminate_backend_pid(pid: u32) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
+        if backend_pid_is_alive(pid) {
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
+        }
     }
 
     #[cfg(windows)]
@@ -227,7 +314,58 @@ fn terminate_backend_pid(pid: u32) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
     }
+}
+
+#[allow(dead_code)]
+fn wait_for_backend_pid_exit(pid: u32, timeout: Duration) {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !backend_pid_is_alive(pid) {
+            return;
+        }
+        thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
+    }
+}
+
+#[allow(dead_code)]
+fn backend_pid_is_alive(pid: u32) -> bool {
+    #[cfg(test)]
+    if test_fake_spawn_enabled() {
+        return test_backend_registry()
+            .lock()
+            .expect("test backend registry lock")
+            .contains_key(&pid);
+    }
+
+    #[cfg(unix)]
+    {
+        return Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        return Command::new("tasklist")
+            .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+            .unwrap_or(false);
+    }
+
+    #[allow(unreachable_code)]
+    false
 }
 
 #[cfg(test)]
@@ -267,8 +405,13 @@ fn next_test_backend_pid() -> u32 {
 }
 
 #[cfg(test)]
+fn test_fake_spawn_enabled() -> bool {
+    std::env::var("CODEX_LIVE_TEST_FAKE_SPAWN").ok().as_deref() == Some("1")
+}
+
+#[cfg(test)]
 fn spawn_test_live_backend(websocket_url: &str) -> Result<Option<u32>> {
-    if std::env::var("CODEX_LIVE_TEST_FAKE_SPAWN").ok().as_deref() != Some("1") {
+    if !test_fake_spawn_enabled() {
         return Ok(None);
     }
 
@@ -513,5 +656,94 @@ mod tests {
         assert_eq!(persisted, result.status);
 
         terminate_backend_pid(result.status.pid.expect("pid"));
+    }
+
+    #[test]
+    fn wait_for_live_backend_rejects_dead_managed_pid_even_if_socket_is_healthy() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("dead-pid");
+        let websocket_url = random_websocket_url();
+        let _env = LiveTestEnv::fake_spawn();
+
+        let healthy_pid = spawn_test_live_backend(&websocket_url)
+            .expect("spawn test backend")
+            .expect("test backend pid");
+        wait_until_healthy(&websocket_url);
+        let dead_pid = healthy_pid + 1;
+
+        let error = wait_for_live_backend(&shared_codex_config(&websocket_url), dead_pid)
+            .expect_err("dead managed pid should fail");
+
+        assert!(format!("{error:#}").contains("exited before becoming healthy"));
+        terminate_backend_pid(healthy_pid);
+    }
+
+    #[test]
+    fn live_backend_status_marks_dead_managed_pid_unhealthy_even_if_socket_is_healthy() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("status-dead-pid");
+        let websocket_url = random_websocket_url();
+        let _env = LiveTestEnv::fake_spawn();
+
+        let healthy_pid = spawn_test_live_backend(&websocket_url)
+            .expect("spawn test backend")
+            .expect("test backend pid");
+        wait_until_healthy(&websocket_url);
+        let dead_pid = healthy_pid + 1;
+        write_live_backend_status(&LiveBackendStatus {
+            websocket_url: websocket_url.clone(),
+            pid: Some(dead_pid),
+            healthy: true,
+            last_error: None,
+        })
+        .expect("write stale status");
+
+        let status = live_backend_status(&shared_codex_config(&websocket_url)).expect("status");
+
+        assert!(!status.healthy);
+        assert_eq!(status.pid, Some(dead_pid));
+        let expected_error = format!("managed live backend process {dead_pid} is not running");
+        assert_eq!(status.last_error.as_deref(), Some(expected_error.as_str()));
+        terminate_backend_pid(healthy_pid);
+    }
+
+    #[test]
+    fn write_live_backend_status_replaces_existing_status_without_tmp_leftover() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("atomic-status");
+        let websocket_url = random_websocket_url();
+        let initial = LiveBackendStatus {
+            websocket_url: websocket_url.clone(),
+            pid: Some(1),
+            healthy: false,
+            last_error: Some("starting".to_string()),
+        };
+        let updated = LiveBackendStatus {
+            websocket_url,
+            pid: Some(2),
+            healthy: true,
+            last_error: None,
+        };
+
+        write_live_backend_status(&initial).expect("write initial");
+        write_live_backend_status(&updated).expect("write updated");
+
+        let persisted = read_live_backend_status()
+            .expect("read status")
+            .expect("persisted status");
+        let status_path = live_backend_status_path().expect("status path");
+        let tmp_leftovers = fs::read_dir(status_path.parent().expect("status parent"))
+            .expect("read status dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("live-backend.json.tmp")
+            })
+            .count();
+
+        assert_eq!(persisted, updated);
+        assert_eq!(tmp_leftovers, 0);
     }
 }
