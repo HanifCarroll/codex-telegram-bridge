@@ -1,27 +1,24 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::ErrorKind;
-use std::net::TcpStream;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Error as WsError, Message, WebSocket};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
+use tungstenite::{client, Error as WsError, Message, WebSocket};
 use url::Url;
+
+const WEBSOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(crate) struct WsJsonRpcTransport {
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    socket: WebSocket<TcpStream>,
 }
 
 impl WsJsonRpcTransport {
     pub(crate) fn connect(url: &str) -> Result<Self> {
-        let url = Url::parse(url).with_context(|| format!("invalid websocket URL: {url}"))?;
-        if url.scheme() != "ws" {
-            bail!("only ws:// shared websocket URLs are supported in this release");
-        }
-        match url.host_str() {
-            Some("127.0.0.1") | Some("localhost") | Some("::1") => {}
-            _ => bail!("only loopback ws:// shared websocket URLs are supported in this release"),
-        }
-        let (socket, _) = connect(url.as_str()).context("failed to connect websocket transport")?;
+        let url = validate_shared_websocket_url(url)?;
+        let stream = connect_loopback_tcp(&url, websocket_io_timeout())?;
+        let (socket, _) =
+            client(url.as_str(), stream).context("failed to connect websocket transport")?;
         Ok(Self { socket })
     }
 
@@ -33,12 +30,42 @@ impl WsJsonRpcTransport {
     }
 
     pub(crate) fn read_json(&mut self) -> Result<Value> {
+        self.read_json_with_timeout(websocket_io_timeout())
+    }
+
+    pub(crate) fn read_json_with_timeout(&mut self, timeout: Duration) -> Result<Value> {
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout).unwrap_or(started);
         loop {
-            match self
-                .socket
-                .read()
-                .context("failed to read websocket JSON-RPC message")?
-            {
+            let now = Instant::now();
+            if now >= deadline {
+                bail!(
+                    "timed out waiting for websocket JSON-RPC message after {}ms",
+                    timeout.as_millis()
+                );
+            }
+            self.socket
+                .get_mut()
+                .set_read_timeout(Some(deadline.saturating_duration_since(now)))
+                .context("failed to set websocket read timeout")?;
+
+            let message = match self.socket.read() {
+                Ok(message) => message,
+                Err(WsError::Io(error))
+                    if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+                        && Instant::now() >= deadline =>
+                {
+                    bail!(
+                        "timed out waiting for websocket JSON-RPC message after {}ms",
+                        timeout.as_millis()
+                    );
+                }
+                Err(error) => {
+                    return Err(error).context("failed to read websocket JSON-RPC message");
+                }
+            };
+
+            match message {
                 Message::Text(text) => {
                     return serde_json::from_str(&text).with_context(|| {
                         format!("invalid JSON from websocket app-server: {text}")
@@ -82,14 +109,93 @@ impl WsJsonRpcTransport {
     }
 
     fn set_nonblocking(&mut self, value: bool) -> Result<()> {
-        match self.socket.get_mut() {
-            MaybeTlsStream::Plain(stream) => stream
-                .set_nonblocking(value)
-                .with_context(|| format!("failed to set websocket nonblocking={value}")),
-            #[allow(unreachable_patterns)]
-            _ => bail!("unsupported websocket stream type"),
+        self.socket
+            .get_mut()
+            .set_nonblocking(value)
+            .with_context(|| format!("failed to set websocket nonblocking={value}"))
+    }
+}
+
+pub(crate) fn validate_shared_websocket_url(url: &str) -> Result<Url> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        bail!("shared Codex live backend websocket URL cannot be empty");
+    }
+    if trimmed != url {
+        bail!("shared Codex live backend websocket URL must not contain surrounding whitespace");
+    }
+
+    let parsed = Url::parse(url).with_context(|| format!("invalid websocket URL: {url}"))?;
+    if parsed.scheme() != "ws" {
+        bail!("only ws:// shared websocket URLs are supported in this release");
+    }
+    match parsed.host_str() {
+        Some("127.0.0.1") | Some("localhost") | Some("::1") => {}
+        _ => bail!("only loopback ws:// shared websocket URLs are supported in this release"),
+    }
+    Ok(parsed)
+}
+
+fn connect_loopback_tcp(url: &Url, timeout: Duration) -> Result<TcpStream> {
+    let host = url
+        .host_str()
+        .context("shared websocket URL missing host")?;
+    let port = url
+        .port_or_known_default()
+        .context("shared websocket URL missing port")?;
+    let mut saw_address = false;
+    let mut saw_loopback = false;
+    let mut last_error = None;
+
+    for address in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve shared websocket host {host}"))?
+    {
+        saw_address = true;
+        if !address.ip().is_loopback() {
+            continue;
+        }
+        saw_loopback = true;
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(timeout))
+                    .context("failed to set websocket read timeout")?;
+                stream
+                    .set_write_timeout(Some(timeout))
+                    .context("failed to set websocket write timeout")?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
         }
     }
+
+    if !saw_address {
+        bail!("shared websocket URL {url} did not resolve to a socket address");
+    }
+    if !saw_loopback {
+        bail!("shared websocket URL {url} did not resolve to a loopback socket address");
+    }
+    if let Some(error) = last_error {
+        return Err(error).with_context(|| {
+            format!(
+                "failed to connect websocket transport to {url} within {}ms",
+                timeout.as_millis()
+            )
+        });
+    }
+    bail!("failed to connect websocket transport to {url}")
+}
+
+fn websocket_io_timeout() -> Duration {
+    #[cfg(test)]
+    if let Ok(raw) = std::env::var("CODEX_TELEGRAM_BRIDGE_WS_TIMEOUT_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return Duration::from_millis(ms.max(1));
+        }
+    }
+
+    WEBSOCKET_IO_TIMEOUT
 }
 
 fn is_would_block(error: &anyhow::Error) -> bool {

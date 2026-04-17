@@ -23,6 +23,7 @@ use crate::state::{
     telegram_inbound_processed, update_telegram_callback_message_id, TelegramCallbackAction,
     TelegramCommandRouteKind, TelegramInboundLogContext,
 };
+use crate::ws::validate_shared_websocket_url;
 use crate::{
     daemon_config_path, ensure_live_backend, load_daemon_config, merged_daemon_config,
     read_daemon_config_raw, redacted_daemon_config, reset_live_backend, resolve_telegram_bot_token,
@@ -97,6 +98,8 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
     if websocket_url.is_empty() {
         bail!("telegram setup websocket url cannot be empty");
     }
+    validate_shared_websocket_url(websocket_url)
+        .context("telegram setup websocket url is invalid")?;
     if !options.dry_run {
         telegram_delete_webhook(&bot_token, Duration::from_secs(10))
             .context("failed to clear existing Telegram webhook before enabling long polling")?;

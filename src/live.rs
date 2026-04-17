@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::codex::{resolve_codex_binary, CodexAppServerClient, CodexBackend};
 use crate::config::CodexConfig;
 use crate::state::live_backend_status_path;
+use crate::ws::validate_shared_websocket_url;
 
 #[allow(dead_code)]
 const LIVE_BACKEND_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,12 +54,14 @@ impl Drop for LiveBackendLock {
 
 #[allow(dead_code)]
 pub(crate) fn live_backend_status(config: &CodexConfig) -> Result<LiveBackendStatus> {
+    validate_live_backend_config(config)?;
     let _lock = acquire_live_backend_lock()?;
     live_backend_status_unlocked(config)
 }
 
 #[allow(dead_code)]
 pub(crate) fn ensure_live_backend(config: &CodexConfig) -> Result<EnsureLiveBackendResult> {
+    validate_live_backend_config(config)?;
     let _lock = acquire_live_backend_lock()?;
     let status = live_backend_status_unlocked(config)?;
     if status.healthy {
@@ -81,6 +84,7 @@ pub(crate) fn ensure_live_backend(config: &CodexConfig) -> Result<EnsureLiveBack
 
 #[allow(dead_code)]
 pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBackendResult> {
+    validate_live_backend_config(config)?;
     let _lock = acquire_live_backend_lock()?;
     if let Some(mut status) = read_live_backend_status()? {
         backfill_process_start_key(&mut status);
@@ -187,6 +191,7 @@ fn backfill_process_start_key(status: &mut LiveBackendStatus) {
 
 #[allow(dead_code)]
 fn start_live_backend(config: &CodexConfig, action: &str) -> Result<EnsureLiveBackendResult> {
+    validate_live_backend_config(config)?;
     let pid = spawn_live_backend_process(config)?;
     let process_start_key = wait_for_backend_process_start_key(pid).with_context(|| {
         format!("managed live backend process {pid} did not expose a stable process start key")
@@ -203,6 +208,12 @@ fn start_live_backend(config: &CodexConfig, action: &str) -> Result<EnsureLiveBa
         action: action.to_string(),
         status,
     })
+}
+
+#[allow(dead_code)]
+fn validate_live_backend_config(config: &CodexConfig) -> Result<()> {
+    validate_shared_websocket_url(&config.websocket_url)?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1401,6 +1412,33 @@ mod tests {
         assert!(format!("{error:#}").contains("without bridge ownership metadata"));
         assert!(backend_pid_is_alive(old_pid));
         terminate_backend_pid(old_pid);
+    }
+
+    #[test]
+    fn ensure_live_backend_rejects_non_loopback_url_before_spawning() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("reject-non-loopback");
+        let _env = LiveTestEnv::fake_spawn();
+        let before_count = test_backend_registry()
+            .lock()
+            .expect("test backend registry lock")
+            .len();
+
+        let error = ensure_live_backend(&shared_codex_config("ws://example.com:4500"))
+            .expect_err("non-loopback URL should be rejected");
+
+        assert!(
+            format!("{error:#}")
+                .contains("only loopback ws:// shared websocket URLs are supported"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            test_backend_registry()
+                .lock()
+                .expect("test backend registry lock")
+                .len(),
+            before_count
+        );
     }
 
     #[test]

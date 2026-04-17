@@ -26,7 +26,7 @@ use crate::state::{
     get_setting_text, recent_actions_json, reconcile_thread_snapshots, set_setting,
     set_setting_text, upsert_thread_snapshot, BridgeThreadSnapshot, PendingPrompt,
 };
-use crate::ws::WsJsonRpcTransport;
+use crate::ws::{validate_shared_websocket_url, WsJsonRpcTransport};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedBinary {
@@ -1494,9 +1494,7 @@ pub(crate) fn codex_backend_from_config(config: &DaemonConfig) -> Result<CodexBa
 pub(crate) fn codex_backend_from_codex_config(codex: &CodexConfig) -> Result<CodexBackend> {
     match codex.live_mode {
         CodexLiveMode::Shared => {
-            if codex.websocket_url.trim().is_empty() {
-                bail!("shared Codex live backend websocket URL is empty");
-            }
+            validate_shared_websocket_url(&codex.websocket_url)?;
             Ok(CodexBackend::SharedWebsocket {
                 url: codex.websocket_url.clone(),
             })
@@ -1509,6 +1507,35 @@ pub(crate) struct CodexAppServerClient {
     next_id: u64,
     notifications: Vec<Value>,
     pending_transport_error: Option<String>,
+}
+
+const SHARED_WEBSOCKET_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+const SHARED_WEBSOCKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn shared_websocket_initialize_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = websocket_test_timeout() {
+        return timeout;
+    }
+
+    SHARED_WEBSOCKET_INITIALIZE_TIMEOUT
+}
+
+fn shared_websocket_request_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = websocket_test_timeout() {
+        return timeout;
+    }
+
+    SHARED_WEBSOCKET_REQUEST_TIMEOUT
+}
+
+#[cfg(test)]
+fn websocket_test_timeout() -> Option<Duration> {
+    std::env::var("CODEX_TELEGRAM_BRIDGE_WS_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(|ms| Duration::from_millis(ms.max(1)))
 }
 
 enum CodexTransport {
@@ -1565,7 +1592,11 @@ impl CodexAppServerClient {
             pending_transport_error: None,
         };
 
-        let _ = client.request("initialize", initialize_params())?;
+        let _ = client.request_with_timeout(
+            "initialize",
+            initialize_params(),
+            shared_websocket_initialize_timeout(),
+        )?;
         client.notify("initialized", json!({}))?;
         Ok(client)
     }
@@ -1594,6 +1625,15 @@ impl CodexAppServerClient {
     }
 
     pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, shared_websocket_request_timeout())
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        shared_websocket_timeout: Duration,
+    ) -> Result<Value> {
         self.take_pending_transport_error()?;
 
         let id = self.next_id;
@@ -1607,7 +1647,7 @@ impl CodexAppServerClient {
         self.write_message(&envelope)?;
 
         loop {
-            let parsed = self.read_message_blocking(method)?;
+            let parsed = self.read_message_blocking(method, shared_websocket_timeout)?;
             if let Some(result) = handle_app_server_message(&parsed, id, &mut self.notifications)? {
                 return Ok(result);
             }
@@ -1636,7 +1676,11 @@ impl CodexAppServerClient {
         }
     }
 
-    fn read_message_blocking(&mut self, _method: &str) -> Result<Value> {
+    fn read_message_blocking(
+        &mut self,
+        _method: &str,
+        shared_websocket_timeout: Duration,
+    ) -> Result<Value> {
         match &mut self.transport {
             #[cfg(test)]
             CodexTransport::SpawnedStdio(transport) => {
@@ -1651,7 +1695,9 @@ impl CodexAppServerClient {
                     }
                 }
             }
-            CodexTransport::SharedWebsocket(transport) => transport.read_json(),
+            CodexTransport::SharedWebsocket(transport) => {
+                transport.read_json_with_timeout(shared_websocket_timeout)
+            }
         }
     }
 
@@ -1826,7 +1872,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn app_server_initialize_params_use_stable_capabilities() {
@@ -2122,6 +2168,31 @@ raise SystemExit(1)
         }
     }
 
+    struct WsTimeoutEnv {
+        previous_timeout: Option<String>,
+    }
+
+    impl WsTimeoutEnv {
+        fn set(timeout_ms: u64) -> Self {
+            let previous_timeout = std::env::var("CODEX_TELEGRAM_BRIDGE_WS_TIMEOUT_MS").ok();
+            std::env::set_var(
+                "CODEX_TELEGRAM_BRIDGE_WS_TIMEOUT_MS",
+                timeout_ms.to_string(),
+            );
+            Self { previous_timeout }
+        }
+    }
+
+    impl Drop for WsTimeoutEnv {
+        fn drop(&mut self) {
+            if let Some(previous_timeout) = &self.previous_timeout {
+                std::env::set_var("CODEX_TELEGRAM_BRIDGE_WS_TIMEOUT_MS", previous_timeout);
+            } else {
+                std::env::remove_var("CODEX_TELEGRAM_BRIDGE_WS_TIMEOUT_MS");
+            }
+        }
+    }
+
     #[test]
     fn websocket_app_server_client_initializes_and_sends_notifications() {
         let server = FakeWsAppServer::spawn(vec![
@@ -2280,6 +2351,96 @@ raise SystemExit(1)
             "unexpected error: {error:#}"
         );
 
+        server.join().expect("fake ws app-server thread");
+    }
+
+    #[test]
+    fn websocket_app_server_client_times_out_when_initialize_never_returns() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        let _timeout = WsTimeoutEnv::set(100);
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ws app-server");
+        let address = listener.local_addr().expect("fake ws app-server addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake ws client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket");
+            let initialize = socket.read().expect("read initialize");
+            let initialize = initialize.into_text().expect("initialize text");
+            let initialize: Value =
+                serde_json::from_str(&initialize).expect("parse initialize request");
+            assert_eq!(initialize["method"], "initialize");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let started = Instant::now();
+        let error =
+            match CodexAppServerClient::connect_with_backend(CodexBackend::SharedWebsocket {
+                url: format!("ws://{address}"),
+            }) {
+                Ok(_) => panic!("stalled initialize should time out"),
+                Err(error) => error,
+            };
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "initialize timeout took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{error:#}").contains("timed out waiting for websocket JSON-RPC message"),
+            "unexpected error: {error:#}"
+        );
+        server.join().expect("fake ws app-server thread");
+    }
+
+    #[test]
+    fn websocket_app_server_client_times_out_when_initialize_only_gets_keepalives() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        let _timeout = WsTimeoutEnv::set(100);
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ws app-server");
+        let address = listener.local_addr().expect("fake ws app-server addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept fake ws client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket");
+            let initialize = socket.read().expect("read initialize");
+            let initialize = initialize.into_text().expect("initialize text");
+            let initialize: Value =
+                serde_json::from_str(&initialize).expect("parse initialize request");
+            assert_eq!(initialize["method"], "initialize");
+
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(500) {
+                if socket
+                    .send(tungstenite::Message::Ping(vec![1, 2, 3]))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        let started = Instant::now();
+        let error =
+            match CodexAppServerClient::connect_with_backend(CodexBackend::SharedWebsocket {
+                url: format!("ws://{address}"),
+            }) {
+                Ok(_) => panic!("keepalive-only initialize should time out"),
+                Err(error) => error,
+            };
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "initialize timeout took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{error:#}").contains("timed out waiting for websocket JSON-RPC message"),
+            "unexpected error: {error:#}"
+        );
         server.join().expect("fake ws app-server thread");
     }
 

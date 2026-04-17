@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::state_dir_path;
+use crate::ws::validate_shared_websocket_url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -163,9 +164,8 @@ pub(crate) fn load_daemon_config() -> Result<DaemonConfig> {
     if !matches!(codex.live_mode, CodexLiveMode::Shared) {
         bail!("daemon config codex.liveMode must be shared");
     }
-    if codex.websocket_url.trim().is_empty() {
-        bail!("daemon config codex.websocketUrl cannot be empty");
-    }
+    validate_shared_websocket_url(&codex.websocket_url)
+        .context("daemon config codex.websocketUrl is invalid")?;
     for project in &config.projects {
         if project.id.trim().is_empty() {
             bail!("daemon config project id cannot be empty");
@@ -365,6 +365,35 @@ mod tests {
         let error = load_daemon_config().expect_err("load should require codex config");
         assert!(
             format!("{error:#}").contains("shared Codex live backend configuration"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn load_daemon_config_rejects_non_loopback_shared_websocket_url() {
+        let _guard = config_test_lock().lock().expect("config lock");
+        let _backup = ConfigBackup::capture().expect("capture config backup");
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://example.com:4500".to_string(),
+            }),
+            projects: vec![],
+        })
+        .expect("write config");
+
+        let error = load_daemon_config().expect_err("load should reject non-loopback websocket");
+        assert!(
+            format!("{error:#}")
+                .contains("only loopback ws:// shared websocket URLs are supported"),
             "unexpected error: {error:#}"
         );
     }
