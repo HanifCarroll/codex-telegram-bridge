@@ -5,10 +5,16 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(test)]
+use std::process::{Child, ChildStdin, ChildStdout};
+use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::sync::mpsc::{self, Receiver};
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -1471,8 +1477,11 @@ pub(crate) fn start_codex_watch_receiver() -> Result<CodexWatchReceiver> {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexBackend {
+    #[cfg(test)]
     SpawnedStdio,
-    SharedWebsocket { url: String },
+    SharedWebsocket {
+        url: String,
+    },
 }
 
 pub(crate) fn codex_backend_from_config(config: &DaemonConfig) -> Result<CodexBackend> {
@@ -1503,10 +1512,12 @@ pub(crate) struct CodexAppServerClient {
 }
 
 enum CodexTransport {
+    #[cfg(test)]
     SpawnedStdio(SpawnedStdioTransport),
     SharedWebsocket(WsJsonRpcTransport),
 }
 
+#[cfg(test)]
 struct SpawnedStdioTransport {
     child: Child,
     stdin: ChildStdin,
@@ -1515,6 +1526,7 @@ struct SpawnedStdioTransport {
     reader_error: Option<String>,
 }
 
+#[cfg(test)]
 enum AppServerReaderMessage {
     Json(Value),
     Error(String),
@@ -1539,6 +1551,7 @@ impl CodexAppServerClient {
 
     pub(crate) fn connect_with_backend(backend: CodexBackend) -> Result<Self> {
         let transport = match backend {
+            #[cfg(test)]
             CodexBackend::SpawnedStdio => CodexTransport::SpawnedStdio(connect_spawned_stdio()?),
             CodexBackend::SharedWebsocket { url } => {
                 CodexTransport::SharedWebsocket(WsJsonRpcTransport::connect(&url)?)
@@ -1559,6 +1572,7 @@ impl CodexAppServerClient {
 
     pub(crate) fn transport_info(&self) -> CodexAppServerTransportInfo {
         match &self.transport {
+            #[cfg(test)]
             CodexTransport::SpawnedStdio(transport) => CodexAppServerTransportInfo {
                 transport: "spawned_stdio",
                 app_server_pid: Some(transport.child.id()),
@@ -1612,6 +1626,7 @@ impl CodexAppServerClient {
 
     fn write_message(&mut self, value: &Value) -> Result<()> {
         match &mut self.transport {
+            #[cfg(test)]
             CodexTransport::SpawnedStdio(transport) => {
                 writeln!(transport.stdin, "{}", serde_json::to_string(value)?)?;
                 transport.stdin.flush()?;
@@ -1621,8 +1636,9 @@ impl CodexAppServerClient {
         }
     }
 
-    fn read_message_blocking(&mut self, method: &str) -> Result<Value> {
+    fn read_message_blocking(&mut self, _method: &str) -> Result<Value> {
         match &mut self.transport {
+            #[cfg(test)]
             CodexTransport::SpawnedStdio(transport) => {
                 if let Some(error) = transport.reader_error.take() {
                     bail!("{error}");
@@ -1631,7 +1647,7 @@ impl CodexAppServerClient {
                     Ok(AppServerReaderMessage::Json(parsed)) => Ok(parsed),
                     Ok(AppServerReaderMessage::Error(message)) => bail!("{message}"),
                     Ok(AppServerReaderMessage::Closed) | Err(_) => {
-                        bail!("codex app-server closed stdout while waiting for {method}")
+                        bail!("codex app-server closed stdout while waiting for {_method}")
                     }
                 }
             }
@@ -1641,6 +1657,7 @@ impl CodexAppServerClient {
 
     fn try_read_message(&mut self) -> Option<Value> {
         match &mut self.transport {
+            #[cfg(test)]
             CodexTransport::SpawnedStdio(transport) => {
                 while let Ok(message) = transport.messages.try_recv() {
                     match message {
@@ -1675,6 +1692,7 @@ impl CodexAppServerClient {
     }
 }
 
+#[cfg(test)]
 fn connect_spawned_stdio() -> Result<SpawnedStdioTransport> {
     let resolved = resolve_codex_binary()?;
     let mut child = Command::new(&resolved.path)
@@ -1705,6 +1723,7 @@ fn connect_spawned_stdio() -> Result<SpawnedStdioTransport> {
     })
 }
 
+#[cfg(test)]
 fn spawn_app_server_reader(
     stdout: ChildStdout,
 ) -> (Receiver<AppServerReaderMessage>, JoinHandle<()>) {
@@ -1782,6 +1801,7 @@ fn handle_app_server_message(
 
 impl Drop for CodexAppServerClient {
     fn drop(&mut self) {
+        #[cfg(test)]
         if let CodexTransport::SpawnedStdio(transport) = &mut self.transport {
             let _ = transport.stdin.flush();
             let _ = transport.child.kill();
