@@ -373,14 +373,7 @@ fn spawn_live_backend_process(config: &CodexConfig) -> Result<u32> {
     {
         let output = Command::new("sh")
             .arg("-c")
-            .arg(
-                r#"
-binary=$1
-url=$2
-nohup "$binary" app-server --listen "$url" </dev/null >/dev/null 2>&1 &
-printf '%s\n' "$!"
-"#,
-            )
+            .arg(live_backend_spawn_shell_script())
             .arg("codex-live-backend")
             .arg(&resolved.path)
             .arg(&config.websocket_url)
@@ -421,6 +414,17 @@ printf '%s\n' "$!"
 
         Ok(child.id())
     }
+}
+
+#[cfg(unix)]
+fn live_backend_spawn_shell_script() -> &'static str {
+    r#"
+binary=$1
+url=$2
+# codex app-server exits when stdin is EOF. Keep stdin open without producing bytes.
+tail -f /dev/null | "$binary" app-server --listen "$url" >/dev/null 2>&1 &
+printf '%s\n' "$!"
+"#
 }
 
 #[allow(dead_code)]
@@ -1109,6 +1113,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         panic!("fake live backend did not become healthy at {websocket_url}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_backend_spawn_script_keeps_app_server_stdin_open() {
+        let script = live_backend_spawn_shell_script();
+
+        assert!(
+            script.contains(r#"tail -f /dev/null | "$binary" app-server --listen "$url""#),
+            "app-server stdin must stay open after the launcher shell exits"
+        );
+        assert!(
+            !script.contains("</dev/null"),
+            "redirecting app-server stdin from /dev/null makes it exit immediately"
+        );
     }
 
     #[test]
