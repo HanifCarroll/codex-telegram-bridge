@@ -421,9 +421,15 @@ fn live_backend_spawn_shell_script() -> &'static str {
     r#"
 binary=$1
 url=$2
-# codex app-server exits when stdin is EOF. Keep stdin open without producing bytes.
-tail -f /dev/null | "$binary" app-server --listen "$url" >/dev/null 2>&1 &
-printf '%s\n' "$!"
+# codex app-server exits when stdin is EOF and when its launcher disappears.
+# Keep stdin open and leave a tiny supervisor waiting while returning the app-server pid.
+(
+  tail -f /dev/null | "$binary" app-server --listen "$url" >/dev/null 2>&1 &
+  child=$!
+  printf '%s\n' "$child" >&3
+  exec 3>&-
+  wait "$child"
+) 3>&1 >/dev/null 2>&1 &
 "#
 }
 
@@ -1123,6 +1129,10 @@ mod tests {
         assert!(
             script.contains(r#"tail -f /dev/null | "$binary" app-server --listen "$url""#),
             "app-server stdin must stay open after the launcher shell exits"
+        );
+        assert!(
+            script.contains(r#"wait "$child""#),
+            "a supervisor must stay alive while app-server is running"
         );
         assert!(
             !script.contains("</dev/null"),
