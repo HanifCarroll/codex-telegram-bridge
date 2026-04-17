@@ -383,11 +383,11 @@ pub(crate) fn telegram_new_thread_confirmation_text(
     let cwd = result.get("cwd").and_then(Value::as_str);
     Ok(match cwd {
         Some(cwd) if !cwd.trim().is_empty() => format!(
-            "Started a new Codex thread in {}.\n{cwd}\n\nUse Telegram's Reply action on this message to continue it.",
+            "Started a new Codex thread in {}.\n{cwd}\n\nCodex is working on the first answer now. I will send the answer here when it finishes.\n\nUse Telegram's Reply action on this message to continue it.",
             project.label
         ),
         _ => format!(
-            "Started a new Codex thread in {} with no explicit working directory reported back.\n\nUse Telegram's Reply action on this message to continue it.",
+            "Started a new Codex thread in {} with no explicit working directory reported back.\n\nCodex is working on the first answer now. I will send the answer here when it finishes.\n\nUse Telegram's Reply action on this message to continue it.",
             project.label
         ),
     })
@@ -592,6 +592,8 @@ mod tests {
 
         assert!(message.contains("Started a new Codex thread in UI Experiment."));
         assert!(message.contains("/Users/hanifcarroll/projects/ui-experiment"));
+        assert!(message.contains("Codex is working on the first answer now."));
+        assert!(message.contains("I will send the answer here when it finishes."));
         assert!(message.contains("Use Telegram's Reply action on this message to continue it."));
     }
 
