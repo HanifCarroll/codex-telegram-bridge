@@ -13,6 +13,7 @@ use crate::codex::{
     wait_for_started_turn, CodexAppServerClient, TELEGRAM_TURN_SETTLE_POLL_MS,
     TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
 };
+use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
 use crate::state::{
     get_setting_number, get_telegram_current_project_id, insert_telegram_callback_route,
@@ -23,9 +24,10 @@ use crate::state::{
     TelegramCommandRouteKind, TelegramInboundLogContext,
 };
 use crate::{
-    daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
-    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, CodexConfig,
-    CodexLiveMode, DaemonConfig, RegisteredProject, TelegramConfig, TelegramSetupOptions,
+    daemon_config_path, ensure_live_backend, load_daemon_config, merged_daemon_config,
+    read_daemon_config_raw, redacted_daemon_config, reset_live_backend, resolve_telegram_bot_token,
+    write_daemon_config, CodexConfig, CodexLiveMode, DaemonConfig, RegisteredProject,
+    TelegramConfig, TelegramSetupOptions,
 };
 
 use self::api::{
@@ -797,6 +799,34 @@ fn send_new_thread_prompt_for_project(
     }))
 }
 
+fn telegram_live_backend_text(
+    title: &str,
+    backend: &EnsureLiveBackendResult,
+    away: &Value,
+) -> String {
+    let pid = backend
+        .status
+        .pid
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let health = if backend.status.healthy {
+        "healthy"
+    } else {
+        "unhealthy"
+    };
+    let away_state = if away.get("away").and_then(Value::as_bool) == Some(true) {
+        "on"
+    } else {
+        "off"
+    };
+
+    format!(
+        "{title}\nBackend: {action}, {health}, {url}, pid {pid}.\nAway mode: {away_state}.",
+        action = backend.action.as_str(),
+        url = backend.status.websocket_url.as_str()
+    )
+}
+
 fn execute_telegram_command(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -839,22 +869,39 @@ fn execute_telegram_command(
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
         TelegramInboundCommand::LiveOn => {
-            let message = "Shared live mode is not implemented yet.";
-            let sent = send_telegram_command_text(telegram, message, timeout)?;
+            let config = load_daemon_config()?;
+            let codex = config
+                .codex
+                .as_ref()
+                .context("shared Codex live backend is not configured; run setup first")?;
+            let backend = ensure_live_backend(codex)?;
+            let away = set_away_mode(conn, true, now)?;
+            let message = telegram_live_backend_text("Shared live mode is on.", &backend, &away);
+            let sent = send_telegram_command_text(telegram, &message, timeout)?;
             Ok(json!({
-                "ok": false,
-                "action": "telegram_live_on_unavailable",
-                "message": message,
+                "ok": true,
+                "action": "telegram_live_on",
+                "backend": backend,
+                "away": away,
                 "sent": sent
             }))
         }
         TelegramInboundCommand::LiveReset => {
-            let message = "Shared live reset is not implemented yet.";
-            let sent = send_telegram_command_text(telegram, message, timeout)?;
+            let config = load_daemon_config()?;
+            let codex = config
+                .codex
+                .as_ref()
+                .context("shared Codex live backend is not configured; run setup first")?;
+            let backend = reset_live_backend(codex)?;
+            let away = set_away_mode(conn, true, now)?;
+            let message =
+                telegram_live_backend_text("Shared live backend was reset.", &backend, &away);
+            let sent = send_telegram_command_text(telegram, &message, timeout)?;
             Ok(json!({
-                "ok": false,
-                "action": "telegram_live_reset_unavailable",
-                "message": message,
+                "ok": true,
+                "action": "telegram_live_reset",
+                "backend": backend,
+                "away": away,
                 "sent": sent
             }))
         }
@@ -1337,6 +1384,7 @@ pub(crate) fn process_telegram_updates(
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
@@ -1346,6 +1394,56 @@ mod tests {
     fn config_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct LiveCommandEnv {
+        root: PathBuf,
+        previous_state_dir: Option<String>,
+        previous_fake_spawn: Option<String>,
+    }
+
+    impl LiveCommandEnv {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "codex-telegram-live-command-{name}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create live command state dir");
+            let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+            let previous_fake_spawn = std::env::var("CODEX_LIVE_TEST_FAKE_SPAWN").ok();
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", &root);
+            std::env::set_var("CODEX_LIVE_TEST_FAKE_SPAWN", "1");
+            Self {
+                root,
+                previous_state_dir,
+                previous_fake_spawn,
+            }
+        }
+    }
+
+    impl Drop for LiveCommandEnv {
+        fn drop(&mut self) {
+            crate::live::terminate_all_test_live_backends();
+            if let Some(previous_state_dir) = &self.previous_state_dir {
+                std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+            } else {
+                std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
+            }
+            if let Some(previous_fake_spawn) = &self.previous_fake_spawn {
+                std::env::set_var("CODEX_LIVE_TEST_FAKE_SPAWN", previous_fake_spawn);
+            } else {
+                std::env::remove_var("CODEX_LIVE_TEST_FAKE_SPAWN");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn random_websocket_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind random port");
+        let address = listener.local_addr().expect("random port address");
+        drop(listener);
+        format!("ws://{address}")
     }
 
     struct FakeCodexWsServer {
@@ -1664,7 +1762,26 @@ mod tests {
     }
 
     #[test]
-    fn live_mode_commands_are_visible_but_not_reported_as_working() {
+    fn live_mode_commands_start_and_reset_shared_backend() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = LiveCommandEnv::new("start-reset");
+        let websocket_url = random_websocket_url();
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "codex-telegram-bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: Some(TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: Some("789".to_string()),
+            }),
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: websocket_url.clone(),
+            }),
+            projects: Vec::new(),
+        })
+        .expect("write daemon config");
         let conn = crate::state::create_state_db_in_memory().expect("db");
         let telegram = TelegramConfig {
             bot_token: "123:secret".to_string(),
@@ -1685,16 +1802,15 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("live on result");
-        assert_eq!(live_on["ok"], false);
-        assert_eq!(live_on["action"], "telegram_live_on_unavailable");
-        assert_eq!(
-            live_on["message"],
-            "Shared live mode is not implemented yet."
-        );
-        assert_eq!(
-            live_on["sent"]["result"]["text"],
-            "Shared live mode is not implemented yet."
-        );
+        assert_eq!(live_on["ok"], true);
+        assert_eq!(live_on["action"], "telegram_live_on");
+        assert_eq!(live_on["backend"]["action"], "started");
+        assert_eq!(live_on["backend"]["status"]["websocketUrl"], websocket_url);
+        assert_eq!(live_on["away"]["away"], true);
+        assert!(live_on["sent"]["result"]["text"]
+            .as_str()
+            .expect("live on text")
+            .contains("Shared live mode is on."));
 
         let live_reset = execute_telegram_command(
             &conn,
@@ -1705,15 +1821,13 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("live reset result");
-        assert_eq!(live_reset["ok"], false);
-        assert_eq!(live_reset["action"], "telegram_live_reset_unavailable");
-        assert_eq!(
-            live_reset["message"],
-            "Shared live reset is not implemented yet."
-        );
-        assert_eq!(
-            live_reset["sent"]["result"]["text"],
-            "Shared live reset is not implemented yet."
-        );
+        assert_eq!(live_reset["ok"], true);
+        assert_eq!(live_reset["action"], "telegram_live_reset");
+        assert_eq!(live_reset["backend"]["action"], "restarted");
+        assert_eq!(live_reset["away"]["away"], true);
+        assert!(live_reset["sent"]["result"]["text"]
+            .as_str()
+            .expect("live reset text")
+            .contains("Shared live backend was reset."));
     }
 }

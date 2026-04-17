@@ -996,6 +996,19 @@ fn terminate_test_live_backend(pid: u32) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn terminate_all_test_live_backends() {
+    let pids = test_backend_registry()
+        .lock()
+        .expect("test backend registry lock")
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for pid in pids {
+        let _ = terminate_test_live_backend(pid);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
