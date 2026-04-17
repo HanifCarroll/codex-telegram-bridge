@@ -121,7 +121,16 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         };
     }
 
-    if status.pid.is_none() {
+    let recorded_pid_matches = match status.pid {
+        Some(pid) => backend_pid_matches(
+            pid,
+            &config.websocket_url,
+            status.process_start_key.as_deref(),
+        ),
+        None => false,
+    };
+
+    if !recorded_pid_matches {
         if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
             status.pid = Some(pid);
             status.process_start_key = backend_process_start_key(pid);
@@ -461,11 +470,10 @@ fn discover_backend_pid_for_websocket_url(websocket_url: &str) -> Option<u32> {
                     .lines()
                     .find_map(|line| {
                         let trimmed = line.trim_start();
-                        let (pid, command) = trimmed.split_once(char::is_whitespace)?;
-                        if command.contains("app-server")
-                            && command.contains("--listen")
-                            && command.contains(websocket_url)
-                        {
+                        let mut parts = trimmed.splitn(2, char::is_whitespace);
+                        let pid = parts.next()?;
+                        let command = parts.next()?.trim_start();
+                        if command_line_matches_backend(command, websocket_url) {
                             pid.parse::<u32>().ok()
                         } else {
                             None
@@ -523,16 +531,17 @@ fn backend_pid_command_matches(pid: u32, websocket_url: &str) -> bool {
             .filter(|output| output.status.success())
             .map(|output| {
                 let command = String::from_utf8_lossy(&output.stdout);
-                command.contains("app-server")
-                    && command.contains("--listen")
-                    && command.contains(websocket_url)
+                command_line_matches_backend(&command, websocket_url)
             })
             .unwrap_or(false);
     }
 
     #[cfg(windows)]
     {
-        return true;
+        return windows_process_command_line(pid)
+            .as_deref()
+            .map(|command| command_line_matches_backend(command, websocket_url))
+            .unwrap_or(false);
     }
 
     #[allow(unreachable_code)]
@@ -566,11 +575,58 @@ fn backend_process_start_key(pid: u32) -> Option<String> {
 
     #[cfg(windows)]
     {
-        return None;
+        return windows_process_start_key(pid);
     }
 
     #[allow(unreachable_code)]
     None
+}
+
+#[allow(dead_code)]
+fn command_line_matches_backend(command: &str, websocket_url: &str) -> bool {
+    let args = command.split_whitespace().collect::<Vec<_>>();
+    let has_app_server = args.iter().any(|arg| *arg == "app-server");
+    if !has_app_server {
+        return false;
+    }
+
+    args.windows(2)
+        .any(|window| window[0] == "--listen" && window[1] == websocket_url)
+        || args.iter().any(|arg| {
+            arg.strip_prefix("--listen=")
+                .map(|value| value == websocket_url)
+                .unwrap_or(false)
+        })
+}
+
+#[cfg(windows)]
+fn windows_process_command_line(pid: u32) -> Option<String> {
+    let command =
+        format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine");
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &command])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command_line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command_line.is_empty()).then_some(command_line)
+}
+
+#[cfg(windows)]
+fn windows_process_start_key(pid: u32) -> Option<String> {
+    let command =
+        format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CreationDate");
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &command])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let started = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!started.is_empty()).then_some(started)
 }
 
 #[allow(dead_code)]
@@ -940,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn live_backend_status_marks_dead_managed_pid_unhealthy_even_if_socket_is_healthy() {
+    fn live_backend_status_replaces_stale_pid_with_discovered_backend() {
         let _guard = live_test_lock().lock().expect("live test lock");
         let _home = TempHome::new("status-dead-pid");
         let websocket_url = random_websocket_url();
@@ -962,12 +1018,13 @@ mod tests {
 
         let status = live_backend_status(&shared_codex_config(&websocket_url)).expect("status");
 
-        assert!(!status.healthy);
-        assert_eq!(status.pid, Some(dead_pid));
-        let expected_error = format!(
-            "managed live backend process {dead_pid} is not running with the configured websocket URL"
+        assert!(status.healthy);
+        assert_eq!(status.pid, Some(healthy_pid));
+        assert_eq!(
+            status.process_start_key,
+            backend_process_start_key(healthy_pid)
         );
-        assert_eq!(status.last_error.as_deref(), Some(expected_error.as_str()));
+        assert_eq!(status.last_error, None);
         terminate_backend_pid(healthy_pid);
     }
 
@@ -1007,6 +1064,28 @@ mod tests {
 
         assert!(backend_pid_matches(pid, &websocket_url, None));
         terminate_backend_pid(pid);
+    }
+
+    #[test]
+    fn command_line_matching_requires_exact_listen_url_argument() {
+        let websocket_url = "ws://127.0.0.1:4500";
+
+        assert!(command_line_matches_backend(
+            "/usr/local/bin/codex app-server --listen ws://127.0.0.1:4500",
+            websocket_url
+        ));
+        assert!(command_line_matches_backend(
+            "/usr/local/bin/codex app-server --listen=ws://127.0.0.1:4500",
+            websocket_url
+        ));
+        assert!(!command_line_matches_backend(
+            "/usr/local/bin/codex app-server --listen ws://127.0.0.1:45001",
+            websocket_url
+        ));
+        assert!(!command_line_matches_backend(
+            "/usr/local/bin/codex app-server --listen ws://127.0.0.1:4500-extra",
+            websocket_url
+        ));
     }
 
     #[test]
