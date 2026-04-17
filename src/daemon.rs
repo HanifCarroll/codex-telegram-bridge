@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -208,6 +208,77 @@ fn validate_daemon_label(label: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+fn push_path_entry(entries: &mut Vec<String>, path: impl Into<String>) {
+    let path = path.into();
+    if path.trim().is_empty() || entries.iter().any(|entry| entry == &path) {
+        return;
+    }
+    entries.push(path);
+}
+
+fn push_home_path(entries: &mut Vec<String>, home: &Path, suffix: &str) {
+    push_path_entry(entries, home.join(suffix).display().to_string());
+}
+
+fn push_node_version_bins(entries: &mut Vec<String>, versions_dir: PathBuf) {
+    let Ok(children) = fs::read_dir(versions_dir) else {
+        return;
+    };
+    let mut bins = children
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("bin"))
+        .filter(|path| path.is_dir())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    bins.sort();
+    for bin in bins {
+        push_path_entry(entries, bin);
+    }
+}
+
+fn daemon_runtime_path() -> String {
+    let mut entries = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        push_home_path(&mut entries, &home, ".bun/bin");
+        push_home_path(&mut entries, &home, ".cargo/bin");
+        push_home_path(&mut entries, &home, ".local/bin");
+        push_home_path(&mut entries, &home, ".deno/bin");
+        push_home_path(&mut entries, &home, ".pyenv/shims");
+        push_home_path(&mut entries, &home, ".asdf/shims");
+        push_home_path(&mut entries, &home, "Library/pnpm");
+        push_home_path(&mut entries, &home, "go/bin");
+        push_node_version_bins(&mut entries, home.join(".config/nvm/versions/node"));
+        push_node_version_bins(&mut entries, home.join(".nvm/versions/node"));
+    }
+
+    for path in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        push_path_entry(&mut entries, path);
+    }
+
+    if let Some(current) = env::var_os("PATH").and_then(|value| value.into_string().ok()) {
+        for path in current.split(':') {
+            push_path_entry(&mut entries, path);
+        }
+    }
+
+    entries.join(":")
+}
+
+fn systemd_escape_env(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+}
+
 pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<DaemonServiceSpec> {
     let label = validate_daemon_label(label)?;
     let bridge_command = bridge_command.trim();
@@ -218,6 +289,7 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
     let state_dir = state_dir_path()?;
     let stdout_log = state_dir.join("daemon.out.log");
     let stderr_log = state_dir.join("daemon.err.log");
+    let runtime_path = daemon_runtime_path();
     let run_args = [
         service_bridge_command.clone(),
         "daemon".to_string(),
@@ -245,6 +317,11 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
     <array>
 {}
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -258,6 +335,7 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
 "#,
             xml_escape(label),
             args_xml,
+            xml_escape(&runtime_path),
             xml_escape(&stdout_log.display().to_string()),
             xml_escape(&stderr_log.display().to_string())
         );
@@ -291,7 +369,8 @@ pub(crate) fn daemon_service_spec(label: &str, bridge_command: &str) -> Result<D
             .join("user")
             .join(&unit_name);
         let contents = format!(
-            "[Unit]\nDescription=Codex Telegram Bridge notification daemon\n\n[Service]\nType=simple\nExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Codex Telegram Bridge notification daemon\n\n[Service]\nType=simple\nEnvironment=\"PATH={}\"\nExecStart={} daemon run\nRestart=always\nRestartSec=2\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+            systemd_escape_env(&runtime_path),
             shell_quote(&service_bridge_command),
             stdout_log.display(),
             stderr_log.display()
@@ -612,6 +691,46 @@ mod tests {
             .as_str()
             .expect("service contents")
             .contains(&expected));
+    }
+
+    #[test]
+    fn daemon_service_exports_developer_tool_path() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let previous_home = std::env::var_os("HOME");
+        let previous_path = std::env::var_os("PATH");
+        let root =
+            std::env::temp_dir().join(format!("codex-bridge-daemon-path-{}", std::process::id()));
+        let home = root.join("home");
+        let nvm_bin = home.join(".config/nvm/versions/node/v24.11.1/bin");
+        std::fs::create_dir_all(&nvm_bin).expect("create nvm bin");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+
+        let spec =
+            daemon_service_spec(DEFAULT_DAEMON_LABEL, "bin/codex-telegram-bridge").expect("spec");
+
+        if let Some(previous) = previous_home {
+            std::env::set_var("HOME", previous);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(previous) = previous_path {
+            std::env::set_var("PATH", previous);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        if cfg!(target_os = "macos") {
+            assert!(spec.contents.contains("<key>EnvironmentVariables</key>"));
+            assert!(spec.contents.contains("<key>PATH</key>"));
+            assert!(spec.contents.contains(&nvm_bin.display().to_string()));
+            assert!(spec.contents.contains("/opt/homebrew/bin"));
+        } else if cfg!(target_os = "linux") {
+            assert!(spec.contents.contains("Environment=\"PATH="));
+            assert!(spec.contents.contains(&nvm_bin.display().to_string()));
+            assert!(spec.contents.contains("/opt/homebrew/bin"));
+        }
     }
 
     #[test]
