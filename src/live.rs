@@ -740,7 +740,10 @@ fn unix_process_name(pid: u32) -> Option<String> {
 
 #[cfg(unix)]
 fn is_unix_shell_wrapper_process(process_name: &str) -> bool {
-    matches!(process_name, "sh" | "bash" | "zsh" | "fish" | "nohup")
+    matches!(
+        process_name,
+        "sh" | "bash" | "zsh" | "fish" | "nohup" | "SCREEN" | "screen" | "login"
+    )
 }
 
 #[allow(dead_code)]
@@ -1461,6 +1464,8 @@ mod tests {
     fn unix_shell_wrapper_processes_are_not_backend_processes() {
         assert!(is_unix_shell_wrapper_process("sh"));
         assert!(is_unix_shell_wrapper_process("nohup"));
+        assert!(is_unix_shell_wrapper_process("SCREEN"));
+        assert!(is_unix_shell_wrapper_process("login"));
         assert!(!is_unix_shell_wrapper_process("codex"));
     }
 
