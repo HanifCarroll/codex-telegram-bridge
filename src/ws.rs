@@ -27,7 +27,7 @@ impl WsJsonRpcTransport {
 
     pub(crate) fn write_json(&mut self, value: &Value) -> Result<()> {
         self.socket
-            .send(Message::Text(serde_json::to_string(value)?.into()))
+            .send(Message::Text(serde_json::to_string(value)?))
             .context("failed to write websocket JSON-RPC message")?;
         Ok(())
     }
@@ -127,8 +127,7 @@ mod tests {
                         "id": 1,
                         "result": { "ok": true }
                     }))
-                    .expect("serialize websocket response")
-                    .into(),
+                    .expect("serialize websocket response"),
                 ))
                 .expect("write websocket response");
         });

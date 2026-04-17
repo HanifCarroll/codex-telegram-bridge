@@ -1596,18 +1596,18 @@ impl CodexAppServerClient {
 
     fn read_message_blocking(&mut self, method: &str) -> Result<Value> {
         match &mut self.transport {
-            CodexTransport::SpawnedStdio(transport) => loop {
+            CodexTransport::SpawnedStdio(transport) => {
                 if let Some(error) = transport.reader_error.take() {
                     bail!("{error}");
                 }
                 match transport.messages.recv() {
-                    Ok(AppServerReaderMessage::Json(parsed)) => return Ok(parsed),
+                    Ok(AppServerReaderMessage::Json(parsed)) => Ok(parsed),
                     Ok(AppServerReaderMessage::Error(message)) => bail!("{message}"),
                     Ok(AppServerReaderMessage::Closed) | Err(_) => {
                         bail!("codex app-server closed stdout while waiting for {method}")
                     }
                 }
-            },
+            }
             CodexTransport::SharedWebsocket(transport) => transport.read_json(),
         }
     }
@@ -2023,9 +2023,7 @@ raise SystemExit(1)
                     requests.push(parsed);
                     socket
                         .send(tungstenite::Message::Text(
-                            serde_json::to_string(&response)
-                                .expect("serialize websocket response")
-                                .into(),
+                            serde_json::to_string(&response).expect("serialize websocket response"),
                         ))
                         .expect("send websocket response");
                 }
@@ -2133,13 +2131,12 @@ raise SystemExit(1)
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "id": initialize["id"],
-                        "result": {
-                            "protocolVersion": 1,
+                    "result": {
+                        "protocolVersion": 1,
                             "serverInfo": { "name": "fake-codex", "version": "test" }
                         }
                     }))
-                    .expect("serialize initialize response")
-                    .into(),
+                    .expect("serialize initialize response"),
                 ))
                 .expect("send initialize response");
 
@@ -2157,14 +2154,13 @@ raise SystemExit(1)
                     serde_json::to_string(&json!({
                         "jsonrpc": "2.0",
                         "method": "item/completed",
-                        "params": {
-                            "threadId": "thr_ws",
-                            "turnId": "turn_ws",
-                            "item": { "type": "assistantMessage" }
+                    "params": {
+                        "threadId": "thr_ws",
+                        "turnId": "turn_ws",
+                        "item": { "type": "assistantMessage" }
                         }
                     }))
-                    .expect("serialize notification")
-                    .into(),
+                    .expect("serialize notification"),
                 ))
                 .expect("send notification");
             socket
@@ -2174,8 +2170,7 @@ raise SystemExit(1)
                         "id": request["id"],
                         "result": { "threads": [] }
                     }))
-                    .expect("serialize thread/list response")
-                    .into(),
+                    .expect("serialize thread/list response"),
                 ))
                 .expect("send thread/list response");
             socket

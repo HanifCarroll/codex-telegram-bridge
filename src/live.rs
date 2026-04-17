@@ -47,7 +47,7 @@ struct LiveBackendLock {
 
 impl Drop for LiveBackendLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -82,7 +82,8 @@ pub(crate) fn ensure_live_backend(config: &CodexConfig) -> Result<EnsureLiveBack
 #[allow(dead_code)]
 pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBackendResult> {
     let _lock = acquire_live_backend_lock()?;
-    if let Some(status) = read_live_backend_status()? {
+    if let Some(mut status) = read_live_backend_status()? {
+        backfill_process_start_key(&mut status);
         if let Some(pid) = status.pid {
             terminate_managed_backend_pid(
                 pid,
@@ -119,13 +120,7 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         };
     }
 
-    if let Some(pid) = status.pid {
-        if status.process_start_key.is_none()
-            && backend_pid_command_matches(pid, &config.websocket_url)
-        {
-            status.process_start_key = backend_process_start_key(pid);
-        }
-    }
+    backfill_process_start_key(&mut status);
 
     let recorded_pid_matches = match status.pid {
         Some(pid) => backend_pid_matches(
@@ -176,6 +171,16 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
 
     write_live_backend_status(&status)?;
     Ok(status)
+}
+
+fn backfill_process_start_key(status: &mut LiveBackendStatus) {
+    if let Some(pid) = status.pid {
+        if status.process_start_key.is_none()
+            && backend_pid_command_matches(pid, &status.websocket_url)
+        {
+            status.process_start_key = backend_process_start_key(pid);
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -274,6 +279,7 @@ fn acquire_live_backend_lock() -> Result<LiveBackendLock> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .with_context(|| format!("failed to open live backend lock at {}", path.display()))?;
     let started = Instant::now();
@@ -385,7 +391,7 @@ printf '%s\n' "$!"
                     String::from_utf8_lossy(&output.stdout).trim()
                 )
             })?;
-        return Ok(pid);
+        Ok(pid)
     }
 
     #[cfg(not(unix))]
@@ -406,15 +412,19 @@ printf '%s\n' "$!"
 
 #[allow(dead_code)]
 fn terminate_managed_backend_pid(pid: u32, websocket_url: &str, process_start_key: Option<&str>) {
+    let Some(process_start_key) = process_start_key else {
+        return;
+    };
+
     #[cfg(test)]
     if test_fake_spawn_enabled() {
-        if backend_pid_matches(pid, websocket_url, process_start_key) {
+        if backend_pid_matches(pid, websocket_url, Some(process_start_key)) {
             let _ = terminate_test_live_backend(pid);
         }
         return;
     }
 
-    if !backend_pid_matches(pid, websocket_url, process_start_key) {
+    if !backend_pid_matches(pid, websocket_url, Some(process_start_key)) {
         return;
     }
 
@@ -422,16 +432,16 @@ fn terminate_managed_backend_pid(pid: u32, websocket_url: &str, process_start_ke
     wait_for_managed_backend_pid_exit(
         pid,
         websocket_url,
-        process_start_key,
+        Some(process_start_key),
         LIVE_BACKEND_TERMINATE_TIMEOUT,
     );
 
-    if backend_pid_matches(pid, websocket_url, process_start_key) {
+    if backend_pid_matches(pid, websocket_url, Some(process_start_key)) {
         send_backend_termination_signal(pid, true);
         wait_for_managed_backend_pid_exit(
             pid,
             websocket_url,
-            process_start_key,
+            Some(process_start_key),
             LIVE_BACKEND_TERMINATE_TIMEOUT,
         );
     }
@@ -703,8 +713,10 @@ fn wait_for_backend_process_start_key(pid: u32) -> Result<String> {
 #[allow(dead_code)]
 fn command_line_matches_backend(command: &str, websocket_url: &str) -> bool {
     let args = command.split_whitespace().collect::<Vec<_>>();
-    let has_app_server = args.iter().any(|arg| *arg == "app-server");
-    if !has_app_server {
+    let Some(app_server_index) = args.iter().position(|arg| *arg == "app-server") else {
+        return false;
+    };
+    if !command_line_has_codex_executable(&args[..app_server_index]) {
         return false;
     }
 
@@ -715,6 +727,13 @@ fn command_line_matches_backend(command: &str, websocket_url: &str) -> bool {
                 .map(|value| value == websocket_url)
                 .unwrap_or(false)
         })
+}
+
+fn command_line_has_codex_executable(args_before_app_server: &[&str]) -> bool {
+    args_before_app_server.iter().any(|arg| {
+        let executable = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+        executable == "codex" || executable.starts_with("codex-")
+    })
 }
 
 #[cfg(windows)]
@@ -899,51 +918,47 @@ fn spawn_test_live_backend(websocket_url: &str) -> Result<Option<u32>> {
         .with_context(|| format!("bind fake live backend at {address}"))?;
 
     let (stop_tx, stop_rx) = mpsc::channel();
-    let join = std::thread::spawn(move || loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                match stop_rx.try_recv() {
-                    Ok(()) | Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => {}
-                }
-
-                let mut socket = match tungstenite::accept(stream) {
-                    Ok(socket) => socket,
-                    Err(_) => continue,
-                };
-
-                let initialize = match socket.read() {
-                    Ok(message) => message,
-                    Err(_) => continue,
-                };
-                let initialize = match initialize.into_text() {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                let initialize: serde_json::Value = match serde_json::from_str(&initialize) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-
-                let _ = socket.send(Message::Text(
-                    serde_json::to_string(&serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": initialize["id"],
-                        "result": {
-                            "protocolVersion": 1,
-                            "serverInfo": { "name": "fake-codex", "version": "test" }
-                        }
-                    }))
-                    .expect("serialize initialize response")
-                    .into(),
-                ));
-
-                let _ = socket
-                    .get_mut()
-                    .set_read_timeout(Some(Duration::from_millis(200)));
-                let _ = socket.read();
+    let join = std::thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            match stop_rx.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
             }
-            Err(_) => break,
+
+            let mut socket = match tungstenite::accept(stream) {
+                Ok(socket) => socket,
+                Err(_) => continue,
+            };
+
+            let initialize = match socket.read() {
+                Ok(message) => message,
+                Err(_) => continue,
+            };
+            let initialize = match initialize.into_text() {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            let initialize: serde_json::Value = match serde_json::from_str(&initialize) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let _ = socket.send(Message::Text(
+                serde_json::to_string(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": {
+                        "protocolVersion": 1,
+                        "serverInfo": { "name": "fake-codex", "version": "test" }
+                    }
+                }))
+                .expect("serialize initialize response"),
+            ));
+
+            let _ = socket
+                .get_mut()
+                .set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = socket.read();
         }
     });
 
@@ -1225,9 +1240,42 @@ mod tests {
         wait_until_healthy(&websocket_url);
 
         terminate_managed_backend_pid(pid, &websocket_url, Some("wrong-start-key"));
+        assert!(backend_pid_matches(pid, &websocket_url, None));
 
+        terminate_managed_backend_pid(pid, &websocket_url, None);
         assert!(backend_pid_matches(pid, &websocket_url, None));
         terminate_backend_pid(pid);
+    }
+
+    #[test]
+    fn reset_live_backend_backfills_legacy_status_before_terminating() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("reset-legacy-start-key");
+        let websocket_url = random_websocket_url();
+        let _env = LiveTestEnv::fake_spawn();
+
+        let old_pid = spawn_test_live_backend(&websocket_url)
+            .expect("spawn test backend")
+            .expect("test backend pid");
+        wait_until_healthy(&websocket_url);
+        write_live_backend_status(&LiveBackendStatus {
+            websocket_url: websocket_url.clone(),
+            pid: Some(old_pid),
+            process_start_key: None,
+            healthy: true,
+            last_error: None,
+        })
+        .expect("write legacy status");
+
+        let result = reset_live_backend(&shared_codex_config(&websocket_url)).expect("reset");
+
+        assert_eq!(result.action, "restarted");
+        assert_ne!(result.status.pid, Some(old_pid));
+        assert!(!backend_pid_is_alive(old_pid));
+        assert!(result.status.process_start_key.is_some());
+        if let Some(pid) = result.status.pid {
+            terminate_backend_pid(pid);
+        }
     }
 
     #[test]
@@ -1265,6 +1313,10 @@ mod tests {
         ));
         assert!(command_line_matches_backend(
             "/usr/local/bin/codex app-server --listen=ws://127.0.0.1:4500",
+            websocket_url
+        ));
+        assert!(!command_line_matches_backend(
+            "/usr/local/bin/not-codex app-server --listen ws://127.0.0.1:4500",
             websocket_url
         ));
         assert!(!command_line_matches_backend(
