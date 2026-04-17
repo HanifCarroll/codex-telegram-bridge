@@ -1,11 +1,11 @@
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::codex::{resolve_codex_binary, CodexAppServerClient, CodexBackend};
 use crate::config::CodexConfig;
@@ -19,8 +19,6 @@ const LIVE_BACKEND_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_BACKEND_TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
 #[allow(dead_code)]
 const LIVE_BACKEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-#[allow(dead_code)]
-const LIVE_BACKEND_LOCK_STALE_AFTER: Duration = Duration::from_secs(120);
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,16 +42,12 @@ pub(crate) struct EnsureLiveBackendResult {
 
 #[allow(dead_code)]
 struct LiveBackendLock {
-    path: PathBuf,
-    token: String,
+    file: File,
 }
 
 impl Drop for LiveBackendLock {
     fn drop(&mut self) {
-        let current_token = fs::read_to_string(&self.path).unwrap_or_default();
-        if current_token.trim() == self.token {
-            let _ = fs::remove_file(&self.path);
-        }
+        let _ = self.file.unlock();
     }
 }
 
@@ -268,32 +262,20 @@ fn acquire_live_backend_lock() -> Result<LiveBackendLock> {
         fs::create_dir_all(parent)?;
     }
 
-    let token = format!(
-        "{}:{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("failed to open live backend lock at {}", path.display()))?;
     let started = Instant::now();
     loop {
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                writeln!(file, "{token}")?;
-                return Ok(LiveBackendLock {
-                    path,
-                    token: token.clone(),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if live_backend_lock_is_stale(&path) {
-                    let _ = fs::remove_file(&path);
-                    continue;
-                }
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(LiveBackendLock { file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if started.elapsed() >= LIVE_BACKEND_LOCK_TIMEOUT {
                     bail!(
-                        "live backend state is locked at {}; try again shortly or remove stale lock if no bridge process is active",
+                        "live backend state is locked at {}; try again shortly",
                         path.display()
                     );
                 }
@@ -306,16 +288,6 @@ fn acquire_live_backend_lock() -> Result<LiveBackendLock> {
             }
         }
     }
-}
-
-#[allow(dead_code)]
-fn live_backend_lock_is_stale(path: &PathBuf) -> bool {
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .map(|elapsed| elapsed > LIVE_BACKEND_LOCK_STALE_AFTER)
-        .unwrap_or(false)
 }
 
 #[allow(dead_code)]
@@ -800,8 +772,19 @@ fn wait_for_managed_backend_pid_exit(
 ) {
     let started = Instant::now();
     while started.elapsed() < timeout {
-        if !backend_pid_matches(pid, websocket_url, process_start_key) {
+        if !backend_pid_is_alive(pid) {
             return;
+        }
+        if let Some(expected) = process_start_key {
+            match backend_process_start_key(pid) {
+                Some(current) if current != expected => return,
+                None => {}
+                _ => {}
+            }
+        }
+        if !backend_pid_command_matches(pid, websocket_url) {
+            thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
+            continue;
         }
         thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
     }
@@ -1352,25 +1335,7 @@ mod tests {
 
         drop(lock);
 
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn live_backend_lock_drop_preserves_newer_lock_token() {
-        let _guard = live_test_lock().lock().expect("live test lock");
-        let _home = TempHome::new("lock-token");
-
-        let lock = acquire_live_backend_lock().expect("acquire lock");
-        let path = live_backend_lock_path().expect("lock path");
-        fs::write(&path, "new-owner-token\n").expect("replace lock token");
-
-        drop(lock);
-
-        assert_eq!(
-            fs::read_to_string(&path).expect("read replacement lock"),
-            "new-owner-token\n"
-        );
-        let _ = fs::remove_file(path);
+        let _second_lock = acquire_live_backend_lock().expect("reacquire lock");
     }
 
     #[test]
