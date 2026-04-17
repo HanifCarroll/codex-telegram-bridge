@@ -9,9 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::codex::{
-    normalized_message, set_away_mode, start_thread_in_cwd, text_input_value,
-    wait_for_started_turn, CodexAppServerClient, TELEGRAM_TURN_SETTLE_POLL_MS,
-    TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
+    normalized_message, set_away_mode, start_thread_in_cwd, text_input_value, CodexAppServerClient,
 };
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
@@ -573,14 +571,11 @@ fn send_codex_reply_to_thread(
         .pointer("/turn/id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let follow = wait_for_started_turn(
-        &mut client,
-        conn,
-        thread_id,
-        started_turn_id.as_deref(),
-        TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
-        TELEGRAM_TURN_SETTLE_POLL_MS,
-    )?;
+    let delivery = json!({
+        "mode": "daemon_sync",
+        "status": "turn_started",
+        "startedTurnId": started_turn_id.as_deref()
+    });
     record_action(
         conn,
         thread_id,
@@ -589,7 +584,7 @@ fn send_codex_reply_to_thread(
             "message": message,
             "resumed": resumed,
             "started": started,
-            "follow": follow.clone(),
+            "delivery": delivery.clone(),
             "sentAt": now
         }),
         now,
@@ -603,7 +598,7 @@ fn send_codex_reply_to_thread(
             "transport": transport.transport,
             "appServerPid": transport.app_server_pid
         },
-        "follow": follow,
+        "delivery": delivery,
         "sentAt": now
     }))
 }
@@ -633,14 +628,11 @@ fn send_codex_approval_to_thread(
         .pointer("/turn/id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let follow = wait_for_started_turn(
-        &mut client,
-        conn,
-        thread_id,
-        started_turn_id.as_deref(),
-        TELEGRAM_TURN_SETTLE_TIMEOUT_MS,
-        TELEGRAM_TURN_SETTLE_POLL_MS,
-    )?;
+    let delivery = json!({
+        "mode": "daemon_sync",
+        "status": "turn_started",
+        "startedTurnId": started_turn_id.as_deref()
+    });
     record_action(
         conn,
         thread_id,
@@ -650,7 +642,7 @@ fn send_codex_approval_to_thread(
             "sentText": sent_text,
             "resumed": resumed,
             "started": started,
-            "follow": follow.clone(),
+            "delivery": delivery.clone(),
             "sentAt": now
         }),
         now,
@@ -665,7 +657,7 @@ fn send_codex_approval_to_thread(
             "transport": transport.transport,
             "appServerPid": transport.app_server_pid
         },
-        "follow": follow,
+        "delivery": delivery,
         "sentAt": now
     }))
 }
@@ -1458,7 +1450,7 @@ mod tests {
     }
 
     impl FakeCodexWsServer {
-        fn spawn() -> Self {
+        fn spawn_turn_start_only() -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake codex ws");
             let address = listener.local_addr().expect("fake codex ws address");
             let url = format!("ws://{address}");
@@ -1481,28 +1473,19 @@ mod tests {
                     let Some(id) = id else {
                         continue;
                     };
+                    let mut should_finish = false;
                     let result = match method.as_str() {
                         "initialize" => json!({
                             "protocolVersion": 1,
                             "serverInfo": { "name": "fake-codex", "version": "test" }
                         }),
                         "thread/resume" => json!({ "threadId": "thr_1" }),
-                        "turn/start" => json!({ "turn": { "id": "turn_1" } }),
+                        "turn/start" => {
+                            should_finish = true;
+                            json!({ "turn": { "id": "turn_1" } })
+                        }
                         "thread/read" => {
-                            let _ = socket.send(tungstenite::Message::Text(
-                                serde_json::to_string(&json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {
-                                        "thread": {
-                                            "id": "thr_1",
-                                            "turns": [{ "id": "turn_1", "status": "completed", "items": [] }]
-                                        }
-                                    }
-                                }))
-                                .expect("serialize thread/read response"),
-                            ));
-                            break;
+                            panic!("non-blocking Telegram sends must not call thread/read");
                         }
                         other => panic!("unexpected fake Codex method {other}"),
                     };
@@ -1516,6 +1499,9 @@ mod tests {
                             .expect("serialize response"),
                         ))
                         .expect("send response");
+                    if should_finish {
+                        break;
+                    }
                 }
                 requests_tx.send(requests).expect("send requests");
             });
@@ -1731,9 +1717,9 @@ mod tests {
     }
 
     #[test]
-    fn telegram_reply_uses_shared_backend_metadata() {
+    fn telegram_reply_starts_turn_without_waiting_for_completion() {
         let conn = crate::state::create_state_db_in_memory().expect("db");
-        let server = FakeCodexWsServer::spawn();
+        let server = FakeCodexWsServer::spawn_turn_start_only();
         let config = DaemonConfig {
             version: 4,
             bridge_command: "bridge".to_string(),
@@ -1754,6 +1740,15 @@ mod tests {
             Some("shared_websocket")
         );
         assert_eq!(result.pointer("/codex/appServerPid"), Some(&Value::Null));
+        assert_eq!(
+            result.pointer("/delivery/mode").and_then(Value::as_str),
+            Some("daemon_sync")
+        );
+        assert_eq!(
+            result.pointer("/delivery/status").and_then(Value::as_str),
+            Some("turn_started")
+        );
+        assert!(result.get("follow").is_none());
         let methods = server
             .finish()
             .into_iter()
@@ -1766,13 +1761,59 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             methods,
-            vec![
-                "initialize",
-                "initialized",
-                "thread/resume",
-                "turn/start",
-                "thread/read"
-            ]
+            vec!["initialize", "initialized", "thread/resume", "turn/start"]
+        );
+    }
+
+    #[test]
+    fn telegram_approval_starts_turn_without_waiting_for_completion() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let server = FakeCodexWsServer::spawn_turn_start_only();
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: server.url.clone(),
+            }),
+            projects: Vec::new(),
+        };
+
+        let result = send_codex_approval_to_thread(
+            &conn,
+            &config,
+            "thr_1",
+            TelegramCallbackAction::Approve,
+            1000,
+        )
+        .expect("approval");
+
+        assert_eq!(result["action"], "telegram_approval");
+        assert_eq!(result["sentText"], "YES");
+        assert_eq!(
+            result.pointer("/delivery/mode").and_then(Value::as_str),
+            Some("daemon_sync")
+        );
+        assert_eq!(
+            result.pointer("/delivery/status").and_then(Value::as_str),
+            Some("turn_started")
+        );
+        assert!(result.get("follow").is_none());
+        let methods = server
+            .finish()
+            .into_iter()
+            .filter_map(|request| {
+                request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec!["initialize", "initialized", "thread/resume", "turn/start"]
         );
     }
 

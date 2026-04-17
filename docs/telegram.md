@@ -101,11 +101,11 @@ codex-telegram-bridge daemon run
 
 `/back` clears pending outbound notifications so delayed retries do not notify you after you return.
 
-Inbound Telegram replies and button callbacks are processed whenever the daemon is running. The away state only controls outbound notifications.
+Inbound Telegram replies and button callbacks are processed whenever the daemon is running. They start the Codex turn and return immediately; the daemon's next sync observes the completed turn and delivers the answer through the normal outbound notification path. The away state only controls outbound notifications.
 
 ## Reply Flow
 
-When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, and sends the reply through the shared live Codex backend.
+When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, sends the reply through the shared live Codex backend, and lets the next sync cycle deliver Codex's answer when the turn finishes.
 
 For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
 

@@ -1091,75 +1091,6 @@ fn thread_snapshot_is_terminal(thread: &Value) -> bool {
     active_flags_are_waiting(thread)
 }
 
-fn event_turn_id(event: &Value) -> Option<&str> {
-    event
-        .get("turnId")
-        .and_then(Value::as_str)
-        .or_else(|| event.pointer("/turn/id").and_then(Value::as_str))
-        .or_else(|| event.pointer("/raw/params/turnId").and_then(Value::as_str))
-        .or_else(|| event.pointer("/raw/params/turn/id").and_then(Value::as_str))
-}
-
-fn turn_id_matches(event_turn_id: Option<&str>, expected_turn_id: Option<&str>) -> bool {
-    match expected_turn_id {
-        Some(expected) => event_turn_id == Some(expected),
-        None => true,
-    }
-}
-
-fn event_is_agent_item_completed_for_turn(event: &Value, expected_turn_id: Option<&str>) -> bool {
-    if event.get("type").and_then(Value::as_str) != Some("item_completed") {
-        return false;
-    }
-    if !turn_id_matches(event_turn_id(event), expected_turn_id) {
-        return false;
-    }
-    matches!(
-        event.pointer("/item/type").and_then(Value::as_str),
-        Some("agentMessage") | Some("assistantMessage")
-    )
-}
-
-fn event_is_terminal_for_started_turn(event: &Value, expected_turn_id: Option<&str>) -> bool {
-    if event_is_agent_item_completed_for_turn(event, expected_turn_id) {
-        return true;
-    }
-
-    match event.get("type").and_then(Value::as_str) {
-        Some("turn_completed") | Some("task_complete") | Some("turn.completed") => {
-            turn_id_matches(event_turn_id(event), expected_turn_id)
-        }
-        Some("thread_status_changed") => active_flags_are_waiting(event),
-        Some("approval_request") | Some("turn.waiting") => true,
-        _ => false,
-    }
-}
-
-fn thread_snapshot_started_turn_status<'a>(
-    thread: &'a Value,
-    expected_turn_id: Option<&str>,
-) -> Option<&'a str> {
-    let turns = thread.get("turns").and_then(Value::as_array)?;
-    let turn = match expected_turn_id {
-        Some(expected) => turns
-            .iter()
-            .rev()
-            .find(|turn| turn.get("id").and_then(Value::as_str) == Some(expected))?,
-        None => turns.last()?,
-    };
-    turn.get("status").and_then(Value::as_str)
-}
-
-fn thread_snapshot_started_turn_is_terminal(
-    thread: &Value,
-    expected_turn_id: Option<&str>,
-) -> bool {
-    matches!(
-        thread_snapshot_started_turn_status(thread, expected_turn_id),
-        Some("completed") | Some("failed") | Some("interrupted")
-    ) || active_flags_are_waiting(thread)
-}
-
 fn settle_composed_follow_events(
     client: &mut CodexAppServerClient,
     thread_id: &str,
@@ -1235,61 +1166,6 @@ pub(crate) fn attach_follow_result(
     persist_follow_events(conn, follow.thread_id, &events, now_millis()?)?;
     let follow_summary = follow_result_summary(follow.thread_id, follow.duration_ms, &events, true);
     Ok(attach_follow_payload(result, follow_summary, false))
-}
-
-pub(crate) const TELEGRAM_TURN_SETTLE_TIMEOUT_MS: u64 = 120_000;
-pub(crate) const TELEGRAM_TURN_SETTLE_POLL_MS: u64 = 1_000;
-
-pub(crate) fn wait_for_started_turn(
-    client: &mut CodexAppServerClient,
-    conn: &Connection,
-    thread_id: &str,
-    started_turn_id: Option<&str>,
-    timeout_ms: u64,
-    poll_interval_ms: u64,
-) -> Result<Value> {
-    let mut events = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-
-    loop {
-        let mut terminal_event_seen = false;
-        for notification in client.drain_notifications() {
-            let event = normalize_notification_event(&notification);
-            terminal_event_seen =
-                terminal_event_seen || event_is_terminal_for_started_turn(&event, started_turn_id);
-            push_follow_event(&mut events, None, event);
-        }
-
-        let read = read_thread_with_turns_fallback(client, thread_id)?;
-        let thread = read.get("thread").cloned().unwrap_or(Value::Null);
-        let terminal = terminal_event_seen
-            || thread_snapshot_started_turn_is_terminal(&thread, started_turn_id);
-        push_follow_event(
-            &mut events,
-            None,
-            json!({
-                "type": "follow_snapshot",
-                "threadId": thread_id,
-                "thread": thread
-            }),
-        );
-        if terminal || std::time::Instant::now() >= deadline {
-            break;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(poll_interval_ms));
-    }
-
-    for notification in client.drain_notifications() {
-        push_follow_event(
-            &mut events,
-            None,
-            normalize_notification_event(&notification),
-        );
-    }
-
-    persist_follow_events(conn, thread_id, &events, now_millis()?)?;
-    Ok(follow_result_summary(thread_id, timeout_ms, &events, true))
 }
 
 #[cfg(test)]
@@ -2465,67 +2341,6 @@ raise SystemExit(1)
         }));
         assert_eq!(unknown["type"], "notification");
         assert_eq!(unknown["raw"]["method"], "codex/custom");
-    }
-
-    #[test]
-    fn telegram_turn_wait_ignores_completed_user_item() {
-        let user_item = normalize_notification_event(&json!({
-            "method": "item/completed",
-            "params": {
-                "threadId": "thr_1",
-                "turnId": "turn_1",
-                "item": { "type": "userMessage" }
-            }
-        }));
-        let agent_item = normalize_notification_event(&json!({
-            "method": "item/completed",
-            "params": {
-                "threadId": "thr_1",
-                "turnId": "turn_1",
-                "item": { "type": "agentMessage" }
-            }
-        }));
-        let other_turn_agent_item = normalize_notification_event(&json!({
-            "method": "item/completed",
-            "params": {
-                "threadId": "thr_1",
-                "turnId": "turn_2",
-                "item": { "type": "agentMessage" }
-            }
-        }));
-
-        assert!(!event_is_terminal_for_started_turn(
-            &user_item,
-            Some("turn_1")
-        ));
-        assert!(event_is_terminal_for_started_turn(
-            &agent_item,
-            Some("turn_1")
-        ));
-        assert!(!event_is_terminal_for_started_turn(
-            &other_turn_agent_item,
-            Some("turn_1")
-        ));
-    }
-
-    #[test]
-    fn telegram_turn_wait_uses_started_turn_status() {
-        let thread = json!({
-            "turns": [
-                { "id": "turn_1", "status": "completed" },
-                { "id": "turn_2", "status": "inProgress" }
-            ],
-            "status": { "type": "active", "activeFlags": [] }
-        });
-
-        assert!(!thread_snapshot_started_turn_is_terminal(
-            &thread,
-            Some("turn_2")
-        ));
-        assert!(thread_snapshot_started_turn_is_terminal(
-            &thread,
-            Some("turn_1")
-        ));
     }
 
     #[test]
