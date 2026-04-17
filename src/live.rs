@@ -207,10 +207,17 @@ fn wait_for_live_backend(
 
     while started.elapsed() < LIVE_BACKEND_HEALTH_TIMEOUT {
         if !backend_pid_matches(pid, &config.websocket_url, Some(process_start_key)) {
+            if !backend_pid_is_alive(pid) {
+                last_error = Some(format!(
+                    "managed live backend process {pid} exited before becoming healthy with the configured websocket URL"
+                ));
+                break;
+            }
             last_error = Some(format!(
-                "managed live backend process {pid} exited before becoming healthy with the configured websocket URL"
+                "managed live backend process {pid} is still starting and has not exposed the configured websocket command yet"
             ));
-            break;
+            thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
+            continue;
         }
 
         match verify_live_backend_health(&config.websocket_url) {
@@ -760,6 +767,19 @@ fn windows_process_start_key(pid: u32) -> Option<String> {
     (!started.is_empty()).then_some(started)
 }
 
+#[cfg(windows)]
+fn windows_tasklist_contains_pid(stdout: &[u8], pid: u32) -> bool {
+    let pid = pid.to_string();
+    String::from_utf8_lossy(stdout).lines().any(|line| {
+        let fields = line
+            .trim()
+            .trim_matches('"')
+            .split("\",\"")
+            .collect::<Vec<_>>();
+        fields.get(1).copied() == Some(pid.as_str())
+    })
+}
+
 #[allow(dead_code)]
 fn wait_for_backend_pid_exit(pid: u32, timeout: Duration) {
     let started = Instant::now();
@@ -816,8 +836,7 @@ fn backend_pid_is_alive(pid: u32) -> bool {
             .args(["/FI", &filter, "/FO", "CSV", "/NH"])
             .output()
             .map(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+                output.status.success() && windows_tasklist_contains_pid(&output.stdout, pid)
             })
             .unwrap_or(false);
     }
