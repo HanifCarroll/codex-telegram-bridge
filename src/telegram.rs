@@ -562,11 +562,12 @@ fn codex_log_context_from_result<'a>(
 
 fn send_codex_reply_to_thread(
     conn: &Connection,
+    config: &DaemonConfig,
     thread_id: &str,
     message: &str,
     now: u64,
 ) -> Result<Value> {
-    let mut client = CodexAppServerClient::connect()?;
+    let mut client = CodexAppServerClient::connect_configured(config)?;
     let transport = client.transport_info();
     let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
     let started = client.request(
@@ -617,6 +618,7 @@ fn send_codex_reply_to_thread(
 
 fn send_codex_approval_to_thread(
     conn: &Connection,
+    config: &DaemonConfig,
     thread_id: &str,
     action: TelegramCallbackAction,
     now: u64,
@@ -625,7 +627,7 @@ fn send_codex_approval_to_thread(
         TelegramCallbackAction::Approve => "YES",
         TelegramCallbackAction::Deny => "NO",
     };
-    let mut client = CodexAppServerClient::connect()?;
+    let mut client = CodexAppServerClient::connect_configured(config)?;
     let transport = client.transport_info();
     let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
     let started = client.request(
@@ -699,11 +701,12 @@ fn current_project_for_identity<'a>(
 
 fn start_new_thread_from_telegram(
     conn: &Connection,
+    config: &DaemonConfig,
     project: &RegisteredProject,
     message: &str,
     now: u64,
 ) -> Result<Value> {
-    let mut client = CodexAppServerClient::connect()?;
+    let mut client = CodexAppServerClient::connect_configured(config)?;
     let transport = client.transport_info();
     let mut result = start_thread_in_cwd(&mut client, Some(&project.cwd), Some(message))?;
     if let Some(object) = result.as_object_mut() {
@@ -862,8 +865,13 @@ fn execute_telegram_command(
             match resolve_new_thread_request(&config.projects, current_project, Some(&prompt)) {
                 Ok(request) => {
                     if let Some(prompt) = request.prompt.as_deref() {
-                        let result =
-                            start_new_thread_from_telegram(conn, request.project, prompt, now)?;
+                        let result = start_new_thread_from_telegram(
+                            conn,
+                            &config,
+                            request.project,
+                            prompt,
+                            now,
+                        )?;
                         let confirmation = send_new_thread_confirmation(
                             conn,
                             telegram,
@@ -1103,7 +1111,8 @@ fn execute_telegram_command_prompt_reply(
                     "sent": sent
                 }));
             };
-            let result = start_new_thread_from_telegram(conn, project, &route.message, now)?;
+            let result =
+                start_new_thread_from_telegram(conn, &config, project, &route.message, now)?;
             mark_telegram_command_route_used(conn, &chat_id, reply_message_id, now)?;
             let confirmation =
                 send_new_thread_confirmation(conn, telegram, project, &result, timeout, now)?;
@@ -1120,10 +1129,14 @@ fn execute_telegram_command_prompt_reply(
 
 pub(crate) fn process_telegram_updates(
     conn: &Connection,
-    telegram: &TelegramConfig,
+    config: &DaemonConfig,
     now: u64,
     timeout: Duration,
 ) -> Result<Value> {
+    let telegram = config
+        .telegram
+        .as_ref()
+        .context("Telegram is not configured. Run setup first.")?;
     let bot_id = telegram_bot_id(&telegram.bot_token);
     let key = format!("telegram_offset:{bot_id}");
     let offset = get_setting_number(conn, &key)?.map(|value| value as i64 + 1);
@@ -1153,8 +1166,13 @@ pub(crate) fn process_telegram_updates(
                 .get("reply_to_message")
                 .and_then(telegram_message_id);
             if let Some(route) = extract_telegram_reply_route(conn, message, telegram)? {
-                let result =
-                    send_codex_reply_to_thread(conn, &route.thread_id, &route.message, now)?;
+                let result = send_codex_reply_to_thread(
+                    conn,
+                    config,
+                    &route.thread_id,
+                    &route.message,
+                    now,
+                )?;
                 if let Some(update_id) = update_id {
                     record_telegram_inbound_processed(
                         conn,
@@ -1249,8 +1267,13 @@ pub(crate) fn process_telegram_updates(
                 .and_then(Value::as_i64);
             match extract_telegram_callback_route(conn, callback_query, telegram)? {
                 Some(route) => {
-                    let result =
-                        send_codex_approval_to_thread(conn, &route.thread_id, route.action, now)?;
+                    let result = send_codex_approval_to_thread(
+                        conn,
+                        config,
+                        &route.thread_id,
+                        route.action,
+                        now,
+                    )?;
                     if let Some(update_id) = update_id {
                         record_telegram_inbound_processed(
                             conn,
@@ -1314,13 +1337,97 @@ pub(crate) fn process_telegram_updates(
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::mpsc::{self, Receiver};
     use std::sync::{Mutex, OnceLock};
+    use std::thread::{self, JoinHandle};
 
     use crate::{daemon_config_path, write_daemon_config, DaemonConfig, TelegramConfig};
 
     fn config_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct FakeCodexWsServer {
+        url: String,
+        requests: Receiver<Vec<Value>>,
+        join: JoinHandle<()>,
+    }
+
+    impl FakeCodexWsServer {
+        fn spawn() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake codex ws");
+            let address = listener.local_addr().expect("fake codex ws address");
+            let url = format!("ws://{address}");
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let join = thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("accept fake codex ws");
+                let mut socket = tungstenite::accept(stream).expect("accept websocket");
+                let mut requests = Vec::new();
+                loop {
+                    let message = socket.read().expect("read websocket request");
+                    let text = message.into_text().expect("websocket text");
+                    let request: Value = serde_json::from_str(&text).expect("parse request");
+                    let method = request
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let id = request.get("id").cloned();
+                    requests.push(request);
+                    let Some(id) = id else {
+                        continue;
+                    };
+                    let result = match method.as_str() {
+                        "initialize" => json!({
+                            "protocolVersion": 1,
+                            "serverInfo": { "name": "fake-codex", "version": "test" }
+                        }),
+                        "thread/resume" => json!({ "threadId": "thr_1" }),
+                        "turn/start" => json!({ "turn": { "id": "turn_1" } }),
+                        "thread/read" => {
+                            let _ = socket.send(tungstenite::Message::Text(
+                                serde_json::to_string(&json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "thread": {
+                                            "id": "thr_1",
+                                            "turns": [{ "id": "turn_1", "status": "completed", "items": [] }]
+                                        }
+                                    }
+                                }))
+                                .expect("serialize thread/read response"),
+                            ));
+                            break;
+                        }
+                        other => panic!("unexpected fake Codex method {other}"),
+                    };
+                    socket
+                        .send(tungstenite::Message::Text(
+                            serde_json::to_string(&json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": result
+                            }))
+                            .expect("serialize response"),
+                        ))
+                        .expect("send response");
+                }
+                requests_tx.send(requests).expect("send requests");
+            });
+            Self {
+                url,
+                requests: requests_rx,
+                join,
+            }
+        }
+
+        fn finish(self) -> Vec<Value> {
+            let requests = self.requests.recv().expect("fake codex requests");
+            self.join.join().expect("fake codex thread");
+            requests
+        }
     }
 
     struct ConfigBackup {
@@ -1508,6 +1615,52 @@ mod tests {
         )
         .expect("extract unauthorized command");
         assert_eq!(unauthorized, None);
+    }
+
+    #[test]
+    fn telegram_reply_uses_shared_backend_metadata() {
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let server = FakeCodexWsServer::spawn();
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
+            telegram: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: server.url.clone(),
+            }),
+            projects: Vec::new(),
+        };
+
+        let result =
+            send_codex_reply_to_thread(&conn, &config, "thr_1", "continue", 1000).expect("reply");
+
+        assert_eq!(
+            result.pointer("/codex/transport").and_then(Value::as_str),
+            Some("shared_websocket")
+        );
+        assert_eq!(result.pointer("/codex/appServerPid"), Some(&Value::Null));
+        let methods = server
+            .finish()
+            .into_iter()
+            .filter_map(|request| {
+                request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "initialized",
+                "thread/resume",
+                "turn/start",
+                "thread/read"
+            ]
+        );
     }
 
     #[test]

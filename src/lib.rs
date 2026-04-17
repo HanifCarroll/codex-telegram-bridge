@@ -221,7 +221,7 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
             println!(
                 "{}",
@@ -238,7 +238,7 @@ fn run() -> Result<()> {
             events,
         } => {
             let event_filter = parse_event_filter(events.as_deref());
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             let events = collect_follow_events(
                 &mut client,
                 &thread_id,
@@ -264,7 +264,7 @@ fn run() -> Result<()> {
             let live_result = if dry_run {
                 None
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 Some(client.request("thread/unarchive", json!({ "threadId": thread_id }))?)
             };
             println!(
@@ -282,7 +282,7 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
             let result = list_waiting_from_db(&conn, project.as_deref(), limit)?;
             println!("{}", serde_json::to_string(&result)?);
@@ -297,7 +297,7 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
             let result = list_inbox_from_db(
                 &conn,
@@ -316,7 +316,7 @@ fn run() -> Result<()> {
             let conn = create_state_db(&db_path)?;
             if once {
                 let now = now_millis()?;
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let sync_result = match sync_state_from_live(&mut client, &conn, now, 50, true) {
                     Ok(sync_result) => sync_result,
                     Err(error) => {
@@ -351,7 +351,7 @@ fn run() -> Result<()> {
                 let watch_rx = start_codex_watch_receiver().ok();
                 loop {
                     let now = now_millis()?;
-                    let mut client = CodexAppServerClient::connect()?;
+                    let mut client = configured_codex_client()?;
                     let filtered = match sync_state_from_live(&mut client, &conn, now, 50, true) {
                         Ok(sync_result) => watch_events_from_sync_result(
                             &sync_result,
@@ -488,7 +488,7 @@ fn run() -> Result<()> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
             println!("{}", serde_json::to_string(&result)?);
         }
@@ -516,7 +516,7 @@ fn run() -> Result<()> {
                     ))?
                 );
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let result = start_thread_in_cwd(&mut client, cwd.as_deref(), message.as_deref())?;
                 let result = if follow {
                     let db_path = state_db_path()?;
@@ -565,7 +565,7 @@ fn run() -> Result<()> {
                     serde_json::to_string(&fork_thread_dry_run(&thread_id, message.as_deref()))?
                 );
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let forked = client.request("thread/fork", json!({ "threadId": thread_id }))?;
                 let new_thread_id = thread_id_from_response(&forked);
                 let forked_cwd = thread_cwd_from_response(&forked, None);
@@ -636,7 +636,7 @@ fn run() -> Result<()> {
             let mut client = if dry_run {
                 None
             } else {
-                Some(CodexAppServerClient::connect()?)
+                Some(configured_codex_client()?)
             };
             if !dry_run && targets.is_empty() {
                 if let Some(client) = client.as_mut() {
@@ -691,7 +691,7 @@ fn run() -> Result<()> {
         Commands::Show { thread_id } => {
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             let result = client.request(
                 "thread/read",
                 json!({
@@ -740,7 +740,7 @@ fn run() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -830,7 +830,7 @@ fn run() -> Result<()> {
                 };
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -995,6 +995,11 @@ fn doctor_bridge() -> Result<DoctorBridge> {
             .and_then(Value::as_str)
             .map(str::to_string),
     })
+}
+
+fn configured_codex_client() -> Result<CodexAppServerClient> {
+    let config = load_daemon_config()?;
+    CodexAppServerClient::connect_configured(&config)
 }
 
 fn setup_result(options: SetupOptions<'_>) -> Result<Value> {

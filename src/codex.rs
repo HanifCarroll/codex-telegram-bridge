@@ -12,6 +12,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::config::{CodexConfig, CodexLiveMode, DaemonConfig};
 use crate::now_millis;
 use crate::projects::derive_project_label;
 use crate::state::{
@@ -1468,9 +1469,30 @@ pub(crate) fn start_codex_watch_receiver() -> Result<CodexWatchReceiver> {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexBackend {
     SpawnedStdio,
     SharedWebsocket { url: String },
+}
+
+pub(crate) fn codex_backend_from_config(config: &DaemonConfig) -> Result<CodexBackend> {
+    let codex = config.codex.as_ref().context(
+        "shared Codex live backend is not configured; run setup to configure codex.websocketUrl",
+    )?;
+    codex_backend_from_codex_config(codex)
+}
+
+pub(crate) fn codex_backend_from_codex_config(codex: &CodexConfig) -> Result<CodexBackend> {
+    match codex.live_mode {
+        CodexLiveMode::Shared => {
+            if codex.websocket_url.trim().is_empty() {
+                bail!("shared Codex live backend websocket URL is empty");
+            }
+            Ok(CodexBackend::SharedWebsocket {
+                url: codex.websocket_url.clone(),
+            })
+        }
+    }
 }
 
 pub(crate) struct CodexAppServerClient {
@@ -1506,8 +1528,13 @@ pub(crate) struct CodexAppServerTransportInfo {
 }
 
 impl CodexAppServerClient {
+    #[cfg(test)]
     pub(crate) fn connect() -> Result<Self> {
         Self::connect_with_backend(CodexBackend::SpawnedStdio)
+    }
+
+    pub(crate) fn connect_configured(config: &DaemonConfig) -> Result<Self> {
+        Self::connect_with_backend(codex_backend_from_config(config)?)
     }
 
     pub(crate) fn connect_with_backend(backend: CodexBackend) -> Result<Self> {
@@ -1786,6 +1813,34 @@ mod tests {
         let params = initialize_params();
         assert_eq!(params["capabilities"], json!({}));
         assert_eq!(params["clientInfo"]["name"], "codex-telegram-bridge");
+    }
+
+    #[test]
+    fn codex_backend_from_config_requires_shared_backend_config() {
+        let missing = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: "final_answer".to_string(),
+            telegram: None,
+            codex: None,
+            projects: Vec::new(),
+        };
+        let error = codex_backend_from_config(&missing).expect_err("missing codex config");
+        assert!(format!("{error:#}").contains("shared Codex live backend is not configured"));
+
+        let configured = DaemonConfig {
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:4500".to_string(),
+            }),
+            ..missing
+        };
+        assert_eq!(
+            codex_backend_from_config(&configured).expect("configured backend"),
+            CodexBackend::SharedWebsocket {
+                url: "ws://127.0.0.1:4500".to_string()
+            }
+        );
     }
 
     #[cfg(unix)]

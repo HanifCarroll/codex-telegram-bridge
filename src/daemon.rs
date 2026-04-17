@@ -115,7 +115,7 @@ fn daemon_cycle(
     timeout: Duration,
 ) -> Result<Value> {
     let filter = parse_event_filter(Some(&config.events));
-    let events = match CodexAppServerClient::connect().and_then(|mut client| {
+    let events = match CodexAppServerClient::connect_configured(config).and_then(|mut client| {
         let sync_result = sync_state_from_live(&mut client, conn, now, 50, true)?;
         Ok(watch_events_from_sync_result(
             &sync_result,
@@ -133,7 +133,7 @@ fn daemon_cycle(
         OutboxDeliverySummary::default()
     };
     let telegram_updates = match config.telegram.as_ref() {
-        Some(telegram) => match process_telegram_updates(conn, telegram, now, timeout) {
+        Some(_) => match process_telegram_updates(conn, config, now, timeout) {
             Ok(result) => result,
             Err(error) => json!({
                 "ok": false,
@@ -635,6 +635,27 @@ mod tests {
         let on_count =
             enqueue_daemon_notification_events(&conn, &[event], 2000).expect("away on enqueue");
         assert_eq!(on_count, 1, "daemon should notify while user is away");
+    }
+
+    #[test]
+    fn daemon_cycle_reports_backend_error_when_shared_backend_is_unreachable() {
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: "thread_error".to_string(),
+            telegram: None,
+            codex: Some(crate::CodexConfig {
+                live_mode: crate::CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:9".to_string(),
+            }),
+            projects: Vec::new(),
+        };
+
+        let result = daemon_cycle(&conn, &config, 1000, Duration::from_millis(10)).expect("cycle");
+
+        assert_eq!(result["action"], "daemon_cycle");
+        assert_eq!(result["observed"], 1);
     }
 
     #[test]

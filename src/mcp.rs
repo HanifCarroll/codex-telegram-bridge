@@ -254,7 +254,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             let result = sync_state_from_live(&mut client, &conn, now, limit, false)?;
             Ok(json!({ "threads": result["threads"].clone() }))
         }
@@ -264,7 +264,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
             serde_json::to_value(list_waiting_from_db(&conn, project.as_deref(), limit)?)
                 .map_err(Into::into)
@@ -278,7 +278,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
             let now = now_millis()?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             sync_state_from_live(&mut client, &conn, now, limit.max(25), false)?;
             serde_json::to_value(list_inbox_from_db(
                 &conn,
@@ -295,7 +295,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
             let thread_id = mcp_required_string(arguments, &["threadId", "thread_id"])?;
             let db_path = state_db_path()?;
             let conn = create_state_db(&db_path)?;
-            let mut client = CodexAppServerClient::connect()?;
+            let mut client = configured_codex_client()?;
             let result = client.request(
                 "thread/read",
                 json!({
@@ -326,7 +326,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
                 })
                 .map_err(Into::into)
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -397,7 +397,7 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
                 })
                 .map_err(Into::into)
             } else {
-                let mut client = CodexAppServerClient::connect()?;
+                let mut client = configured_codex_client()?;
                 let resumed = client.request("thread/resume", json!({ "threadId": thread_id }))?;
                 let started = client.request(
                     "turn/start",
@@ -444,6 +444,11 @@ fn execute_mcp_tool(name: &str, arguments: &Value) -> Result<Value> {
         }
         _ => bail!("Unknown MCP tool: {name}"),
     }
+}
+
+fn configured_codex_client() -> Result<CodexAppServerClient> {
+    let config = crate::load_daemon_config()?;
+    CodexAppServerClient::connect_configured(&config)
 }
 
 fn attach_mcp_follow_if_requested(
