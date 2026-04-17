@@ -93,6 +93,10 @@ pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBacke
             );
         }
     }
+    if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
+        let process_start_key = backend_process_start_key(pid);
+        terminate_managed_backend_pid(pid, &config.websocket_url, process_start_key.as_deref());
+    }
 
     start_live_backend(config, "restarted")
 }
@@ -1033,6 +1037,26 @@ mod tests {
         assert!(result.status.healthy);
         assert_ne!(result.status.pid, Some(current_pid));
         terminate_backend_pid(current_pid);
+        terminate_backend_pid(result.status.pid.expect("reset pid"));
+    }
+
+    #[test]
+    fn reset_live_backend_discovers_running_backend_when_status_file_is_missing() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("reset-discover");
+        let websocket_url = random_websocket_url();
+        let _env = LiveTestEnv::fake_spawn();
+
+        let old_pid = spawn_test_live_backend(&websocket_url)
+            .expect("spawn test backend")
+            .expect("test backend pid");
+        wait_until_healthy(&websocket_url);
+
+        let result = reset_live_backend(&shared_codex_config(&websocket_url)).expect("reset");
+
+        assert!(!backend_pid_is_alive(old_pid));
+        assert!(result.status.healthy);
+        assert_ne!(result.status.pid, Some(old_pid));
         terminate_backend_pid(result.status.pid.expect("reset pid"));
     }
 
