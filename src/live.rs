@@ -98,7 +98,7 @@ pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBacke
     }
     if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
         bail!(
-            "found codex app-server process {pid} on {} without bridge ownership metadata; refusing to reset it. Use /live_on to reuse it or stop it locally first.",
+            "found codex app-server process {pid} on {} without bridge ownership metadata; refusing to repair it. Use /away to reuse it or stop it locally first.",
             config.websocket_url
         );
     }

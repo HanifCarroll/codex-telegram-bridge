@@ -38,9 +38,8 @@ use self::api::{
     telegram_updates_array,
 };
 use self::render::{
-    prepare_telegram_delivery, telegram_help_text, telegram_inbox_text,
-    telegram_new_thread_confirmation_text, telegram_project_text, telegram_projects_text,
-    telegram_recent_text, telegram_settings_text, telegram_status_text, telegram_waiting_text,
+    prepare_telegram_delivery, telegram_help_text, telegram_new_thread_confirmation_text,
+    telegram_project_text, telegram_projects_text, telegram_status_text,
 };
 
 pub(crate) use self::api::{telegram_bot_id, telegram_set_my_commands};
@@ -49,18 +48,12 @@ pub(crate) use self::api::{telegram_bot_id, telegram_set_my_commands};
 enum TelegramInboundCommand {
     Start,
     Help,
-    AwayOn,
-    AwayOff,
+    Away,
+    Back,
+    Repair,
     Status,
-    LiveOn,
-    LiveReset,
     NewThread(Option<String>),
     Project(Option<String>),
-    Projects,
-    Inbox,
-    Waiting,
-    Recent,
-    Settings,
     Unknown(String),
 }
 
@@ -182,7 +175,7 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
             crate::shell_quote(bridge_command),
             crate::shell_quote(bridge_command)
         ),
-        "nextStep": "Install and start the daemon. Send /live_on to the Telegram bot before leaving; replies, approvals, and new threads will use the shared Codex live backend."
+        "nextStep": "Install and start the daemon. Send /away to the Telegram bot before leaving; replies, approvals, and new threads will use the shared Codex live backend."
     }))
 }
 
@@ -338,18 +331,12 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
     match command.as_str() {
         "/start" => Some(TelegramInboundCommand::Start),
         "/help" => Some(TelegramInboundCommand::Help),
-        "/away_on" => Some(TelegramInboundCommand::AwayOn),
-        "/away_off" => Some(TelegramInboundCommand::AwayOff),
+        "/away" => Some(TelegramInboundCommand::Away),
+        "/back" => Some(TelegramInboundCommand::Back),
+        "/repair" => Some(TelegramInboundCommand::Repair),
         "/status" => Some(TelegramInboundCommand::Status),
-        "/live_on" => Some(TelegramInboundCommand::LiveOn),
-        "/live_reset" => Some(TelegramInboundCommand::LiveReset),
-        "/new_thread" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
+        "/new" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
         "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
-        "/projects" => Some(TelegramInboundCommand::Projects),
-        "/inbox" => Some(TelegramInboundCommand::Inbox),
-        "/waiting" => Some(TelegramInboundCommand::Waiting),
-        "/recent" => Some(TelegramInboundCommand::Recent),
-        "/settings" => Some(TelegramInboundCommand::Settings),
         _ => Some(TelegramInboundCommand::Unknown(raw_command.to_string())),
     }
 }
@@ -831,7 +818,7 @@ fn telegram_live_backend_text(
 }
 
 fn telegram_live_failure_text(title: &str, error: &anyhow::Error) -> String {
-    format!("{title}\nError: {error:#}\nTry /live_reset. If that keeps failing, check `codex-telegram-bridge doctor` locally.")
+    format!("{title}\nError: {error:#}\nTry /repair. If that keeps failing, check `codex-telegram-bridge doctor` locally.")
 }
 
 fn telegram_live_failure_result(
@@ -851,7 +838,7 @@ fn telegram_live_failure_result(
     }))
 }
 
-fn execute_live_on_command(
+fn execute_away_command(
     conn: &Connection,
     telegram: &TelegramConfig,
     now: u64,
@@ -864,18 +851,18 @@ fn execute_live_on_command(
         .context("shared Codex live backend is not configured; run setup first")?;
     let backend = ensure_live_backend(codex)?;
     let away = set_away_mode(conn, true, now)?;
-    let message = telegram_live_backend_text("Shared live mode is on.", &backend, &away);
+    let message = telegram_live_backend_text("Remote Codex mode is on.", &backend, &away);
     let sent = send_telegram_command_text(telegram, &message, timeout)?;
     Ok(json!({
         "ok": true,
-        "action": "telegram_live_on",
+        "action": "telegram_away",
         "backend": backend,
         "away": away,
         "sent": sent
     }))
 }
 
-fn execute_live_reset_command(
+fn execute_repair_command(
     conn: &Connection,
     telegram: &TelegramConfig,
     now: u64,
@@ -888,11 +875,11 @@ fn execute_live_reset_command(
         .context("shared Codex live backend is not configured; run setup first")?;
     let backend = reset_live_backend(codex)?;
     let away = set_away_mode(conn, true, now)?;
-    let message = telegram_live_backend_text("Shared live backend was reset.", &backend, &away);
+    let message = telegram_live_backend_text("Remote Codex mode was repaired.", &backend, &away);
     let sent = send_telegram_command_text(telegram, &message, timeout)?;
     Ok(json!({
         "ok": true,
-        "action": "telegram_live_reset",
+        "action": "telegram_repair",
         "backend": backend,
         "away": away,
         "sent": sent
@@ -914,53 +901,44 @@ fn execute_telegram_command(
             let sent = telegram_send_text(telegram, &telegram_help_text(), timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_help", "sent": sent }))
         }
-        TelegramInboundCommand::AwayOn => {
-            let state = set_away_mode(conn, true, now)?;
-            let sent = telegram_send_text(
-                telegram,
-                "Away mode is on. Codex final answers will be forwarded here.",
-                timeout,
-            )?;
-            Ok(json!({ "ok": true, "action": "telegram_away_on", "state": state, "sent": sent }))
-        }
-        TelegramInboundCommand::AwayOff => {
+        TelegramInboundCommand::Back => {
             let state = set_away_mode(conn, false, now)?;
             let cleared = state
                 .get("clearedPendingNotifications")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let sent = telegram_send_text(
+            let sent = send_telegram_command_text(
                 telegram,
-                &format!("Away mode is off. Cleared {cleared} pending notification(s)."),
+                &format!("Remote Codex mode is off. Cleared {cleared} pending notification(s)."),
                 timeout,
             )?;
-            Ok(json!({ "ok": true, "action": "telegram_away_off", "state": state, "sent": sent }))
+            Ok(json!({ "ok": true, "action": "telegram_back", "state": state, "sent": sent }))
         }
         TelegramInboundCommand::Status => {
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
-        TelegramInboundCommand::LiveOn => execute_live_on_command(conn, telegram, now, timeout)
-            .or_else(|error| {
+        TelegramInboundCommand::Away => {
+            execute_away_command(conn, telegram, now, timeout).or_else(|error| {
                 telegram_live_failure_result(
                     telegram,
-                    "telegram_live_on_failed",
-                    "Shared live mode could not start.",
-                    error,
-                    timeout,
-                )
-            }),
-        TelegramInboundCommand::LiveReset => {
-            execute_live_reset_command(conn, telegram, now, timeout).or_else(|error| {
-                telegram_live_failure_result(
-                    telegram,
-                    "telegram_live_reset_failed",
-                    "Shared live backend could not reset.",
+                    "telegram_away_failed",
+                    "Remote Codex mode could not start.",
                     error,
                     timeout,
                 )
             })
         }
+        TelegramInboundCommand::Repair => execute_repair_command(conn, telegram, now, timeout)
+            .or_else(|error| {
+                telegram_live_failure_result(
+                    telegram,
+                    "telegram_repair_failed",
+                    "Remote Codex mode could not repair.",
+                    error,
+                    timeout,
+                )
+            }),
         TelegramInboundCommand::NewThread(Some(prompt)) => {
             let config = load_daemon_config()?;
             let current_project =
@@ -1097,42 +1075,13 @@ fn execute_telegram_command(
             let config = load_daemon_config()?;
             let current_project =
                 current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
-            let sent =
-                telegram_send_text(telegram, &telegram_project_text(current_project), timeout)?;
-            Ok(json!({ "ok": true, "action": "telegram_project", "sent": sent }))
-        }
-        TelegramInboundCommand::Projects => {
-            let config = load_daemon_config()?;
-            let current_project =
-                current_project_for_identity(&config, conn, &chat_id, user_id.as_deref())?;
             let observed = observed_workspaces_from_db(conn, 5).unwrap_or_default();
             let sent = telegram_send_text(
                 telegram,
                 &telegram_projects_text(&config, current_project, &observed),
                 timeout,
             )?;
-            Ok(json!({ "ok": true, "action": "telegram_projects", "sent": sent }))
-        }
-        TelegramInboundCommand::Inbox => {
-            let sent = telegram_send_text(telegram, &telegram_inbox_text(conn, now)?, timeout)?;
-            Ok(json!({ "ok": true, "action": "telegram_inbox", "sent": sent }))
-        }
-        TelegramInboundCommand::Waiting => {
-            let sent = telegram_send_text(telegram, &telegram_waiting_text(conn)?, timeout)?;
-            Ok(json!({ "ok": true, "action": "telegram_waiting", "sent": sent }))
-        }
-        TelegramInboundCommand::Recent => {
-            let sent = telegram_send_text(telegram, &telegram_recent_text(conn)?, timeout)?;
-            Ok(json!({ "ok": true, "action": "telegram_recent", "sent": sent }))
-        }
-        TelegramInboundCommand::Settings => {
-            let config = load_daemon_config()?;
-            let sent = telegram_send_text(
-                telegram,
-                &telegram_settings_text(telegram, conn, &config)?,
-                timeout,
-            )?;
-            Ok(json!({ "ok": true, "action": "telegram_settings", "sent": sent }))
+            Ok(json!({ "ok": true, "action": "telegram_project", "sent": sent }))
         }
         TelegramInboundCommand::Unknown(command) => {
             let sent = telegram_send_text(
@@ -1202,7 +1151,7 @@ fn execute_telegram_command_prompt_reply(
                 let sent = telegram_send_text(
                     telegram,
                     &format!(
-                        "No project is selected for that prompt. Use /project <id> first, then try /new_thread again.\n\n{}",
+                        "No project is selected for that prompt. Use /project <id> first, then try /new again.\n\n{}",
                         telegram_projects_text(&config, current_project, &observed)
                     ),
                     timeout,
@@ -1685,21 +1634,25 @@ mod tests {
     #[test]
     fn telegram_command_parser_supports_core_commands() {
         assert_eq!(
-            parse_telegram_command_text("/away_on"),
-            Some(TelegramInboundCommand::AwayOn)
+            parse_telegram_command_text("/away"),
+            Some(TelegramInboundCommand::Away)
         );
         assert_eq!(
-            parse_telegram_command_text("/away_off@codex_bridge_bot"),
-            Some(TelegramInboundCommand::AwayOff)
+            parse_telegram_command_text("/back@codex_bridge_bot"),
+            Some(TelegramInboundCommand::Back)
         );
         assert_eq!(
-            parse_telegram_command_text("/new_thread Fix the formatter"),
+            parse_telegram_command_text("/repair"),
+            Some(TelegramInboundCommand::Repair)
+        );
+        assert_eq!(
+            parse_telegram_command_text("/new Fix the formatter"),
             Some(TelegramInboundCommand::NewThread(Some(
                 "Fix the formatter".to_string()
             )))
         );
         assert_eq!(
-            parse_telegram_command_text("/new_thread"),
+            parse_telegram_command_text("/new"),
             Some(TelegramInboundCommand::NewThread(None))
         );
         assert_eq!(
@@ -1710,18 +1663,24 @@ mod tests {
             parse_telegram_command_text("/project"),
             Some(TelegramInboundCommand::Project(None))
         );
-        assert_eq!(
-            parse_telegram_command_text("/projects"),
-            Some(TelegramInboundCommand::Projects)
-        );
-        assert_eq!(
-            parse_telegram_command_text("/live_on"),
-            Some(TelegramInboundCommand::LiveOn)
-        );
-        assert_eq!(
-            parse_telegram_command_text("/live_reset"),
-            Some(TelegramInboundCommand::LiveReset)
-        );
+        for removed in [
+            "/away_on",
+            "/away_off",
+            "/live_on",
+            "/live_reset",
+            "/new_thread",
+            "/projects",
+            "/inbox",
+            "/waiting",
+            "/recent",
+            "/settings",
+        ] {
+            assert_eq!(
+                parse_telegram_command_text(removed),
+                Some(TelegramInboundCommand::Unknown(removed.to_string())),
+                "removed command should not parse as a supported command: {removed}"
+            );
+        }
         assert_eq!(
             parse_telegram_command_text("/unknown"),
             Some(TelegramInboundCommand::Unknown("/unknown".to_string()))
@@ -1818,7 +1777,7 @@ mod tests {
     }
 
     #[test]
-    fn live_mode_commands_start_and_reset_shared_backend() {
+    fn remote_commands_start_stop_and_repair_shared_backend() {
         let _guard = crate::state::test_env_lock().lock().expect("env lock");
         let _env = LiveCommandEnv::new("start-reset");
         let websocket_url = random_websocket_url();
@@ -1849,42 +1808,59 @@ mod tests {
             "from": { "id": "789" }
         });
 
-        let live_on = execute_telegram_command(
+        let away = execute_telegram_command(
             &conn,
             &telegram,
             &message,
-            TelegramInboundCommand::LiveOn,
+            TelegramInboundCommand::Away,
             0,
             Duration::from_secs(1),
         )
-        .expect("live on result");
-        assert_eq!(live_on["ok"], true);
-        assert_eq!(live_on["action"], "telegram_live_on");
-        assert_eq!(live_on["backend"]["action"], "started");
-        assert_eq!(live_on["backend"]["status"]["websocketUrl"], websocket_url);
-        assert_eq!(live_on["away"]["away"], true);
-        assert!(live_on["sent"]["result"]["text"]
+        .expect("away result");
+        assert_eq!(away["ok"], true);
+        assert_eq!(away["action"], "telegram_away");
+        assert_eq!(away["backend"]["action"], "started");
+        assert_eq!(away["backend"]["status"]["websocketUrl"], websocket_url);
+        assert_eq!(away["away"]["away"], true);
+        assert!(away["sent"]["result"]["text"]
             .as_str()
-            .expect("live on text")
-            .contains("Shared live mode is on."));
+            .expect("away text")
+            .contains("Remote Codex mode is on."));
 
-        let live_reset = execute_telegram_command(
+        let repair = execute_telegram_command(
             &conn,
             &telegram,
             &message,
-            TelegramInboundCommand::LiveReset,
+            TelegramInboundCommand::Repair,
             0,
             Duration::from_secs(1),
         )
-        .expect("live reset result");
-        assert_eq!(live_reset["ok"], true);
-        assert_eq!(live_reset["action"], "telegram_live_reset");
-        assert_eq!(live_reset["backend"]["action"], "restarted");
-        assert_eq!(live_reset["away"]["away"], true);
-        assert!(live_reset["sent"]["result"]["text"]
+        .expect("repair result");
+        assert_eq!(repair["ok"], true);
+        assert_eq!(repair["action"], "telegram_repair");
+        assert_eq!(repair["backend"]["action"], "restarted");
+        assert_eq!(repair["away"]["away"], true);
+        assert!(repair["sent"]["result"]["text"]
             .as_str()
-            .expect("live reset text")
-            .contains("Shared live backend was reset."));
+            .expect("repair text")
+            .contains("Remote Codex mode was repaired."));
+
+        let back = execute_telegram_command(
+            &conn,
+            &telegram,
+            &message,
+            TelegramInboundCommand::Back,
+            0,
+            Duration::from_secs(1),
+        )
+        .expect("back result");
+        assert_eq!(back["ok"], true);
+        assert_eq!(back["action"], "telegram_back");
+        assert_eq!(back["state"]["away"], false);
+        assert!(back["sent"]["result"]["text"]
+            .as_str()
+            .expect("back text")
+            .contains("Remote Codex mode is off."));
     }
 
     #[test]
@@ -1902,21 +1878,21 @@ mod tests {
             "from": { "id": "789" }
         });
 
-        let live_on = execute_telegram_command(
+        let away = execute_telegram_command(
             &conn,
             &telegram,
             &message,
-            TelegramInboundCommand::LiveOn,
+            TelegramInboundCommand::Away,
             0,
             Duration::from_secs(1),
         )
-        .expect("live on failure response");
+        .expect("away failure response");
 
-        assert_eq!(live_on["ok"], false);
-        assert_eq!(live_on["action"], "telegram_live_on_failed");
-        assert!(live_on["sent"]["result"]["text"]
+        assert_eq!(away["ok"], false);
+        assert_eq!(away["action"], "telegram_away_failed");
+        assert!(away["sent"]["result"]["text"]
             .as_str()
             .expect("failure text")
-            .contains("Try /live_reset"));
+            .contains("Try /repair"));
     }
 }

@@ -100,18 +100,12 @@ pub(crate) fn telegram_bot_commands() -> Vec<Value> {
     vec![
         json!({ "command": "start", "description": "Pair and show remote control help" }),
         json!({ "command": "help", "description": "Show Telegram remote control commands" }),
-        json!({ "command": "away_on", "description": "Enable away mode notifications" }),
-        json!({ "command": "away_off", "description": "Disable away mode notifications" }),
-        json!({ "command": "status", "description": "Show away mode and pending delivery status" }),
-        json!({ "command": "live_on", "description": "Enable shared live mode" }),
-        json!({ "command": "live_reset", "description": "Reset the shared live backend" }),
-        json!({ "command": "new_thread", "description": "Start a new Codex thread from Telegram" }),
+        json!({ "command": "away", "description": "Start remote Codex mode" }),
+        json!({ "command": "back", "description": "Stop remote Codex mode" }),
+        json!({ "command": "repair", "description": "Fix remote Codex mode" }),
+        json!({ "command": "status", "description": "Show remote Codex status" }),
+        json!({ "command": "new", "description": "Start a new Codex thread" }),
         json!({ "command": "project", "description": "Show or switch the current project" }),
-        json!({ "command": "projects", "description": "List configured projects and suggestions" }),
-        json!({ "command": "inbox", "description": "Show actionable Codex inbox rows" }),
-        json!({ "command": "waiting", "description": "Show threads waiting for you" }),
-        json!({ "command": "recent", "description": "Show recent Codex threads" }),
-        json!({ "command": "settings", "description": "Show current Telegram bridge settings" }),
     ]
 }
 
@@ -197,21 +191,29 @@ mod tests {
             .filter_map(|command| command.get("command").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        for required in [
-            "start",
-            "help",
+        assert_eq!(
+            names,
+            vec!["start", "help", "away", "back", "repair", "status", "new", "project",]
+        );
+        for removed in [
             "away_on",
             "away_off",
-            "status",
             "live_on",
             "live_reset",
             "new_thread",
-            "project",
             "projects",
             "inbox",
             "waiting",
             "recent",
             "settings",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "removed telegram bot command is still advertised: {removed}"
+            );
+        }
+        for required in [
+            "start", "help", "away", "back", "repair", "status", "new", "project",
         ] {
             assert!(
                 names.contains(&required),

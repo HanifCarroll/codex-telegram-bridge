@@ -4,13 +4,12 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use crate::codex::get_away_mode;
-use crate::config::{DaemonConfig, RegisteredProject, TelegramConfig};
+use crate::config::{DaemonConfig, RegisteredProject};
 use crate::live::live_backend_status;
 use crate::load_daemon_config;
-use crate::projects::derive_project_label;
 use crate::state::{
-    derive_thread_display_name, list_inbox_from_db, list_waiting_from_db, pending_outbound_count,
-    ObservedWorkspace, TelegramCallbackAction, TelegramCallbackRoute,
+    list_waiting_from_db, pending_outbound_count, ObservedWorkspace, TelegramCallbackAction,
+    TelegramCallbackRoute,
 };
 
 const TELEGRAM_CONTINUE_THREAD_HINT: &str =
@@ -287,7 +286,7 @@ pub(crate) fn telegram_project_text(project: Option<&RegisteredProject>) -> Stri
             "Current project\n\n{} ({})\n{}\n\nNew Telegram threads will start here until you switch again.",
             project.id, project.label, project.cwd
         ),
-        None => "No current project is selected.\n\nUse /projects to inspect the registry, then /project <id> to choose one."
+        None => "No current project is selected.\n\nUse /project to inspect the registry, then /project <id> to choose one."
             .to_string(),
     }
 }
@@ -298,19 +297,14 @@ pub(crate) fn telegram_help_text() -> String {
         "",
         "Use Telegram's Reply action on a Codex notification to continue that exact thread.",
         "",
-        "/away_on - turn on away notifications",
-        "/away_off - turn off away notifications",
-        "/status - show bridge status",
-        "/live_on - start shared live backend and turn away mode on",
-        "/live_reset - restart the shared live backend",
-        "/new_thread <prompt> - start a new Codex thread",
-        "/new_thread - ask for a prompt in a reply",
+        "/away - start remote Codex mode",
+        "/back - stop remote Codex mode",
+        "/repair - fix remote Codex mode",
+        "/status - show remote status",
+        "/new <prompt> - start a new Codex thread",
+        "/new - ask for a prompt in a reply",
+        "/project - list projects",
         "/project <id> - switch the current project",
-        "/projects - list configured projects",
-        "/inbox - show actionable threads",
-        "/waiting - show threads waiting for you",
-        "/recent - show recent threads",
-        "/settings - show Telegram bridge settings",
     ]
     .join("\n")
 }
@@ -340,9 +334,9 @@ fn telegram_live_backend_status_line() -> String {
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "none".to_string());
             let recovery = if status.healthy {
-                "Use /live_on before you leave."
+                "Use /away before you leave."
             } else {
-                "Use /live_reset to recover."
+                "Use /repair to recover."
             };
             format!(
                 "Shared live backend: {health}, {}, pid {pid}. {recovery}",
@@ -350,21 +344,9 @@ fn telegram_live_backend_status_line() -> String {
             )
         }
         Err(error) => format!(
-            "Shared live backend: unhealthy, {} ({error:#}). Use /live_reset to recover.",
+            "Shared live backend: unhealthy, {} ({error:#}). Use /repair to recover.",
             codex.websocket_url
         ),
-    }
-}
-
-fn telegram_format_item_line(index: usize, title: &str, detail: Option<&str>) -> String {
-    match detail.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(detail) => format!(
-            "{}. {} - {}",
-            index + 1,
-            title,
-            trim_for_telegram_line(detail, 120)
-        ),
-        None => format!("{}. {}", index + 1, title),
     }
 }
 
@@ -388,129 +370,10 @@ pub(crate) fn telegram_status_text(conn: &Connection) -> Result<String> {
         "off"
     };
     Ok(format!(
-        "Codex remote status\n\nAway mode: {away_label}\n{}\nPending Telegram notifications: {pending}\nThreads waiting for you: {}\n\nUse /live_on before you leave. Use /live_reset if the backend is unhealthy.",
+        "Codex remote status\n\nRemote mode: {away_label}\n{}\nPending Telegram notifications: {pending}\nThreads waiting for you: {}\n\nUse /away before you leave. Use /repair if the backend is unhealthy. Use /back when you return.",
         telegram_live_backend_status_line(),
         waiting.summary.count
     ))
-}
-
-pub(crate) fn telegram_settings_text(
-    telegram: &TelegramConfig,
-    conn: &Connection,
-    config: &DaemonConfig,
-) -> Result<String> {
-    let away = get_away_mode(conn)?;
-    let allowed_user = telegram
-        .allowed_user_id
-        .as_deref()
-        .unwrap_or("any user in this chat");
-    let away_label = if away["away"].as_bool() == Some(true) {
-        "on"
-    } else {
-        "off"
-    };
-    let configured_projects = config.projects.len();
-    let codex_url = config
-        .codex
-        .as_ref()
-        .map(|codex| codex.websocket_url.as_str())
-        .unwrap_or("not configured");
-    Ok(format!(
-        "Telegram bridge settings\n\nChat: connected\nAllowed user: {allowed_user}\nAway mode: {away_label}\nShared live backend: {codex_url}\nConfigured projects: {configured_projects}\n\nReplies and approvals use the shared live backend. Use /live_on before you leave and /live_reset if it becomes unhealthy."
-    ))
-}
-
-pub(crate) fn telegram_waiting_text(conn: &Connection) -> Result<String> {
-    let waiting = list_waiting_from_db(conn, None, 5)?;
-    if waiting.threads.is_empty() {
-        return Ok("No Codex threads are waiting for you.".to_string());
-    }
-    let mut lines = vec!["Threads waiting for you:".to_string(), String::new()];
-    for (index, thread) in waiting.threads.iter().enumerate() {
-        lines.push(telegram_format_item_line(
-            index,
-            &thread.display_name,
-            thread
-                .prompt
-                .question
-                .as_deref()
-                .or(thread.last_preview.as_deref()),
-        ));
-    }
-    lines.push(String::new());
-    lines.push(
-        "Use Telegram's Reply action on the matching Codex notification to answer that thread."
-            .to_string(),
-    );
-    Ok(lines.join("\n"))
-}
-
-pub(crate) fn telegram_inbox_text(conn: &Connection, now: u64) -> Result<String> {
-    let inbox = list_inbox_from_db(conn, now, None, None, None, None, 5)?;
-    if inbox.items.is_empty() {
-        return Ok("Your Codex inbox is empty.".to_string());
-    }
-    let mut lines = vec![
-        format!(
-            "Codex inbox: {} item{} need attention.",
-            inbox.summary.needs_attention,
-            if inbox.summary.needs_attention == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ),
-        String::new(),
-    ];
-    for (index, item) in inbox.items.iter().enumerate() {
-        let detail = format!("{} - {}", item.waiting_on, item.suggested_action);
-        lines.push(telegram_format_item_line(
-            index,
-            &item.display_name,
-            Some(&detail),
-        ));
-    }
-    lines.push(String::new());
-    lines.push("Use /waiting for reply-only items, or reply to a Codex notification to continue that thread.".to_string());
-    Ok(lines.join("\n"))
-}
-
-pub(crate) fn telegram_recent_text(conn: &Connection) -> Result<String> {
-    let mut stmt = conn.prepare(
-        "SELECT thread_id, name, cwd, updated_at, last_preview
-         FROM threads_cache
-         ORDER BY COALESCE(updated_at, 0) DESC
-         LIMIT 5",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-        ))
-    })?;
-    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.is_empty() {
-        return Ok("No recent Codex threads are cached yet.".to_string());
-    }
-    let mut lines = vec!["Recent Codex threads:".to_string(), String::new()];
-    for (index, (thread_id, name, cwd, _, last_preview)) in rows.iter().enumerate() {
-        let project = derive_project_label(cwd.as_deref());
-        let display_name = derive_thread_display_name(
-            name.as_deref(),
-            project.as_deref(),
-            last_preview.as_deref(),
-            thread_id,
-        );
-        lines.push(telegram_format_item_line(
-            index,
-            &display_name,
-            last_preview.as_deref(),
-        ));
-    }
-    Ok(lines.join("\n"))
 }
 
 pub(crate) fn telegram_new_thread_confirmation_text(
@@ -730,5 +593,40 @@ mod tests {
         assert!(message.contains("Started a new Codex thread in UI Experiment."));
         assert!(message.contains("/Users/hanifcarroll/projects/ui-experiment"));
         assert!(message.contains("Use Telegram's Reply action on this message to continue it."));
+    }
+
+    #[test]
+    fn telegram_help_text_uses_reduced_remote_command_set() {
+        let text = telegram_help_text();
+        for expected in [
+            "/away - start remote Codex mode",
+            "/back - stop remote Codex mode",
+            "/repair - fix remote Codex mode",
+            "/status - show remote status",
+            "/new <prompt> - start a new Codex thread",
+            "/project <id> - switch the current project",
+        ] {
+            assert!(
+                text.contains(expected),
+                "help text missing expected command: {expected}"
+            );
+        }
+        for removed in [
+            "/away_on",
+            "/away_off",
+            "/live_on",
+            "/live_reset",
+            "/new_thread",
+            "/projects",
+            "/inbox",
+            "/waiting",
+            "/recent",
+            "/settings",
+        ] {
+            assert!(
+                !text.contains(removed),
+                "help text still contains removed command: {removed}"
+            );
+        }
     }
 }

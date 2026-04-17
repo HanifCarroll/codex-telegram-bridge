@@ -5,9 +5,9 @@
 The product rule is simple:
 
 - when you are present at your computer, Codex does not send Telegram notifications
-- when you send `/live_on` in Telegram, the bridge starts the shared local Codex backend and turns away mode on
+- when you send `/away` in Telegram, the bridge starts the shared local Codex backend and turns remote mode on
 - replying directly to a bridge-sent Telegram message sends that reply back to the originating Codex thread
-- `/away_off` stops outbound Telegram notifications again
+- `/back` stops outbound Telegram notifications again
 
 Hermes is optional. It uses the local MCP server when you ask an agent to inspect, reply to, or approve Codex work. Hermes and MCP do not own Telegram notification delivery.
 
@@ -18,7 +18,7 @@ You do not need Hermes for the default product flow. A normal install is Codex p
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
 - Direct Telegram transport: `telegram setup/status/test/disable`
-- Telegram remote controls: `/live_on`, `/live_reset`, `/away_on`, `/away_off`, `/status`, `/project`, `/projects`, `/new_thread`, `/inbox`, `/waiting`, `/recent`, `/settings`
+- Telegram remote controls: `/away`, `/back`, `/repair`, `/status`, `/help`, `/new`, `/project`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
 - Project registry: `projects list/add/import/remove`
 - Thread inspection: `threads`, `show`, `waiting`, `inbox`
@@ -98,7 +98,7 @@ codex-telegram-bridge telegram test --message "Codex bridge is ready"
 Turn on remote notifications when you leave your computer:
 
 ```text
-/live_on
+/away
 ```
 
 Send that command to your Telegram bot. It starts or reuses the shared local `codex app-server`, turns away mode on, and makes Telegram replies use the same live backend.
@@ -106,7 +106,7 @@ Send that command to your Telegram bot. It starts or reuses the shared local `co
 Turn them off when you are back:
 
 ```text
-/away_off
+/back
 ```
 
 Optional: if you want Hermes to control Codex when you ask it directly:
@@ -134,9 +134,9 @@ Inbound Telegram replies are processed whenever the daemon is running and the sh
 
 Telegram notifications use a compact header, keep Codex's answer body verbatim, and omit internal thread ids. To continue the conversation remotely, use Telegram's Reply action on the specific Codex notification.
 
-If replies stop reaching Codex, send `/live_reset` in Telegram. It restarts the shared local backend on the configured websocket URL and keeps away mode on.
+If replies stop reaching Codex, send `/repair` in Telegram. It restarts the shared local backend on the configured websocket URL and keeps remote mode on.
 
-Telegram-created threads run in an explicit registered project working directory. Set the current project from Telegram with `/project <id>`, inspect choices with `/projects`, or manage the registry locally with `codex-telegram-bridge projects ...`.
+Telegram-created threads run in an explicit registered project working directory. Set the current project from Telegram with `/project <id>`, inspect choices with `/project`, or manage the registry locally with `codex-telegram-bridge projects ...`.
 
 Use a Telegram bot token dedicated to this bridge. Telegram update delivery should have one owner.
 

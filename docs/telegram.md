@@ -5,8 +5,8 @@ Telegram is the bridge-owned remote control surface for Codex.
 The intended behavior:
 
 - no Telegram notifications while you are at your computer
-- `/live_on` starts or reuses the shared local Codex backend and enables outbound Telegram notifications
-- `/away_off` disables outbound Telegram notifications
+- `/away` starts or reuses the shared local Codex backend and enables outbound Telegram notifications
+- `/back` disables outbound Telegram notifications
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - approval messages include `Approve` and `Deny` buttons
 - slash commands can toggle away mode, inspect state, pick a project, and start new Codex threads from Telegram
@@ -89,17 +89,17 @@ codex-telegram-bridge daemon run
 ## Presence Gate
 
 ```text
-/live_on
-/live_reset
-/away_off
+/away
+/repair
+/back
 /status
 ```
 
-`/live_on` is the normal pre-departure command. It starts a new away session, ensures the shared local `codex app-server` is running, and makes replies, approvals, and new Telegram-created threads use that same backend. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave.
+`/away` is the normal pre-departure command. It starts a new away session, ensures the shared local `codex app-server` is running, and makes replies, approvals, and new Telegram-created threads use that same backend. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave.
 
-`/live_reset` is the recovery command. Use it if `/status` reports an unhealthy backend or replies stop reaching Codex. It restarts the shared backend and keeps away mode on.
+`/repair` is the recovery command. Use it if `/status` reports an unhealthy backend or replies stop reaching Codex. It restarts the shared backend and keeps remote mode on.
 
-`/away_off` clears pending outbound notifications so delayed retries do not notify you after you return.
+`/back` clears pending outbound notifications so delayed retries do not notify you after you return.
 
 Inbound Telegram replies and button callbacks are processed whenever the daemon is running. The away state only controls outbound notifications.
 
@@ -154,7 +154,7 @@ codex-telegram-bridge projects remove bridge
 
 `projects import` bootstraps the registry from observed `cwd` values already cached in the bridge's local `threads_cache` table. Imported ids are derived from the directory name and made unique automatically.
 
-Each Telegram chat/user also keeps a current project selection in the local bridge state. `/new_thread` uses that selected project unless there is only one configured project.
+Each Telegram chat/user also keeps a current project selection in the local bridge state. `/new` uses that selected project unless there is only one configured project.
 
 ## Slash Commands
 
@@ -162,23 +162,19 @@ The bridge accepts these standalone Telegram commands from the paired chat and a
 
 - `/start`: pair during setup, or show help after setup
 - `/help`: show command help
-- `/away_on`: enable away mode notifications
-- `/away_off`: disable away mode notifications and clear pending outbound notifications
+- `/away`: start remote Codex mode
+- `/back`: stop remote Codex mode and clear pending outbound notifications
+- `/repair`: restart the shared Codex backend and keep remote mode on
 - `/status`: show away mode, pending delivery count, and waiting thread count
-- `/project <id>`: set the current project for future Telegram-created threads
-- `/project`: show the current project selection
-- `/projects`: list configured projects and recent observed workspaces
-- `/new_thread <prompt>`: create a new Codex thread in the current project and send the prompt immediately
-- `/new_thread <project>: <prompt>`: override the current project once for that thread
-- `/new_thread`: ask for a prompt; use Telegram's Reply action on the prompt message to create the thread in the selected project
-- `/inbox`: show actionable cached Codex inbox rows
-- `/waiting`: show cached threads waiting for user input or approval
-- `/recent`: show recent cached Codex threads
-- `/settings`: show current Telegram bridge settings
+- `/project`: list configured projects and recent observed workspaces
+- `/project <id>`: switch the current project for future Telegram-created threads
+- `/new <prompt>`: create a new Codex thread in the current project and send the prompt immediately
+- `/new <project>: <prompt>`: override the current project once for that thread
+- `/new`: ask for a prompt; use Telegram's Reply action on the prompt message to create the thread in the selected project
 
 Commands only run as standalone messages. If a message is a Telegram reply to a Codex notification, the text is sent back to that Codex thread verbatim, even if it starts with `/`.
 
-When `/new_thread` succeeds, the bridge sends the selected project `cwd` into `thread/start` and `turn/start`, then includes the confirmed working directory in the Telegram confirmation message.
+When `/new` succeeds, the bridge sends the selected project `cwd` into `thread/start` and `turn/start`, then includes the confirmed working directory in the Telegram confirmation message.
 
 ## Token Ownership
 
