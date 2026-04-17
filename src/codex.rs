@@ -1772,7 +1772,7 @@ mod tests {
     use crate::state::{
         archive_from_db, classify_inbox_item, create_state_db_in_memory, get_thread_history,
         list_inbox_from_db, reconcile_thread_snapshots, record_action, resolve_archive_targets,
-        unarchive_thread_result, upsert_thread_snapshot, watch_once_from_db,
+        test_env_lock, unarchive_thread_result, upsert_thread_snapshot, watch_once_from_db,
     };
     use crate::{get_away_mode, set_away_mode};
     use serde_json::json;
@@ -1788,17 +1788,12 @@ mod tests {
         assert_eq!(params["clientInfo"]["name"], "codex-telegram-bridge");
     }
 
-    fn env_test_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[cfg(unix)]
     #[test]
     fn resolve_codex_binary_prefers_platform_binary_before_path() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = env_test_lock().lock().expect("env lock");
+        let _guard = test_env_lock().lock().expect("env lock");
         let root = std::env::temp_dir().join(format!("codex-resolve-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
@@ -1922,7 +1917,7 @@ mod tests {
     fn app_server_client_collects_notifications_between_requests() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = env_test_lock().lock().expect("env lock");
+        let _guard = test_env_lock().lock().expect("env lock");
         let root = std::env::temp_dir().join(format!(
             "codex-async-notification-test-{}",
             std::process::id()

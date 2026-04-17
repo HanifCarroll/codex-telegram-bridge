@@ -119,6 +119,14 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         };
     }
 
+    if let Some(pid) = status.pid {
+        if status.process_start_key.is_none()
+            && backend_pid_command_matches(pid, &config.websocket_url)
+        {
+            status.process_start_key = backend_process_start_key(pid);
+        }
+    }
+
     let recorded_pid_matches = match status.pid {
         Some(pid) => backend_pid_matches(
             pid,
@@ -1076,7 +1084,7 @@ mod tests {
         let initial = LiveBackendStatus {
             websocket_url: websocket_url.clone(),
             pid: Some(pid),
-            process_start_key: backend_process_start_key(pid),
+            process_start_key: None,
             healthy: true,
             last_error: None,
         };
@@ -1086,6 +1094,10 @@ mod tests {
 
         assert_eq!(result.action, "reused");
         assert_eq!(result.status.pid, Some(pid));
+        assert_eq!(
+            result.status.process_start_key,
+            backend_process_start_key(pid)
+        );
         assert!(result.status.healthy);
 
         terminate_backend_pid(pid);
