@@ -96,6 +96,12 @@ struct DoctorBridge {
     config_path: String,
     config_exists: bool,
     telegram_configured: bool,
+    codex_configured: bool,
+    codex_live_mode: Option<String>,
+    codex_websocket_url: Option<String>,
+    live_backend_healthy: Option<bool>,
+    live_backend_pid: Option<u32>,
+    live_backend_error: Option<String>,
     daemon_service_path: String,
     daemon_service_exists: bool,
     daemon_service_loaded: bool,
@@ -963,6 +969,18 @@ fn daemon_run_command(bridge_command: &str) -> String {
 fn doctor_bridge() -> Result<DoctorBridge> {
     let config_path = daemon_config_path()?;
     let config = read_daemon_config_raw()?;
+    let codex = config.as_ref().and_then(|config| config.codex.as_ref());
+    let (live_backend_healthy, live_backend_pid, live_backend_error) = match codex {
+        Some(codex) => match live::live_backend_status(codex) {
+            Ok(status) => (Some(status.healthy), status.pid, status.last_error),
+            Err(error) => (Some(false), None, Some(format!("{error:#}"))),
+        },
+        None => (
+            None,
+            None,
+            Some("shared Codex live backend is not configured".to_string()),
+        ),
+    };
     let service = daemon_service_spec(DEFAULT_DAEMON_LABEL, "codex-telegram-bridge")?;
     let status = daemon_service_status(DEFAULT_DAEMON_LABEL)?;
     Ok(DoctorBridge {
@@ -972,6 +990,14 @@ fn doctor_bridge() -> Result<DoctorBridge> {
             .as_ref()
             .and_then(|config| config.telegram.as_ref())
             .is_some(),
+        codex_configured: codex.is_some(),
+        codex_live_mode: codex.map(|codex| match codex.live_mode {
+            CodexLiveMode::Shared => "shared".to_string(),
+        }),
+        codex_websocket_url: codex.map(|codex| codex.websocket_url.clone()),
+        live_backend_healthy,
+        live_backend_pid,
+        live_backend_error,
         daemon_service_path: service.service_path.display().to_string(),
         daemon_service_exists: service.service_path.exists(),
         daemon_service_loaded: status

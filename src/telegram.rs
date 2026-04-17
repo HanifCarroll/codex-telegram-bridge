@@ -1073,7 +1073,7 @@ fn execute_telegram_command(
             let config = load_daemon_config()?;
             let sent = telegram_send_text(
                 telegram,
-                &telegram_settings_text(telegram, conn, config.projects.len())?,
+                &telegram_settings_text(telegram, conn, &config)?,
                 timeout,
             )?;
             Ok(json!({ "ok": true, "action": "telegram_settings", "sent": sent }))

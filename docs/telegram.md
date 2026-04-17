@@ -5,8 +5,8 @@ Telegram is the bridge-owned remote control surface for Codex.
 The intended behavior:
 
 - no Telegram notifications while you are at your computer
-- `away on` enables outbound Telegram notifications for new Codex updates
-- `away off` disables outbound Telegram notifications
+- `/live_on` starts or reuses the shared local Codex backend and enables outbound Telegram notifications
+- `/away_off` disables outbound Telegram notifications
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - approval messages include `Approve` and `Deny` buttons
 - slash commands can toggle away mode, inspect state, pick a project, and start new Codex threads from Telegram
@@ -39,7 +39,7 @@ codex-telegram-bridge setup \
   --allowed-user-id <telegram-user-id>
 ```
 
-The token can also come from `TELEGRAM_BOT_TOKEN`.
+The token can also come from `TELEGRAM_BOT_TOKEN`. Setup stores the shared Codex backend URL as `codex.websocketUrl`; by default it is `ws://127.0.0.1:4500`.
 
 For manual recovery or first-run audits, sample files live at:
 
@@ -88,19 +88,24 @@ codex-telegram-bridge daemon run
 
 ## Presence Gate
 
-```bash
-codex-telegram-bridge away status
-codex-telegram-bridge away on
-codex-telegram-bridge away off
+```text
+/live_on
+/live_reset
+/away_off
+/status
 ```
 
-`away on` starts a new away session. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave. `away off` clears pending outbound notifications so delayed retries do not notify you after you return.
+`/live_on` is the normal pre-departure command. It starts a new away session, ensures the shared local `codex app-server` is running, and makes replies, approvals, and new Telegram-created threads use that same backend. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave.
+
+`/live_reset` is the recovery command. Use it if `/status` reports an unhealthy backend or replies stop reaching Codex. It restarts the shared backend and keeps away mode on.
+
+`/away_off` clears pending outbound notifications so delayed retries do not notify you after you return.
 
 Inbound Telegram replies and button callbacks are processed whenever the daemon is running. The away state only controls outbound notifications.
 
 ## Reply Flow
 
-When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, and calls the local Codex thread reply flow.
+When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, and sends the reply through the shared live Codex backend.
 
 For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
 

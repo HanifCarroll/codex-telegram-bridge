@@ -5,6 +5,8 @@ use std::path::Path;
 
 use crate::codex::get_away_mode;
 use crate::config::{DaemonConfig, RegisteredProject, TelegramConfig};
+use crate::live::live_backend_status;
+use crate::load_daemon_config;
 use crate::projects::derive_project_label;
 use crate::state::{
     derive_thread_display_name, list_inbox_from_db, list_waiting_from_db, pending_outbound_count,
@@ -299,6 +301,8 @@ pub(crate) fn telegram_help_text() -> String {
         "/away_on - turn on away notifications",
         "/away_off - turn off away notifications",
         "/status - show bridge status",
+        "/live_on - start shared live backend and turn away mode on",
+        "/live_reset - restart the shared live backend",
         "/new_thread <prompt> - start a new Codex thread",
         "/new_thread - ask for a prompt in a reply",
         "/project <id> - switch the current project",
@@ -309,6 +313,47 @@ pub(crate) fn telegram_help_text() -> String {
         "/settings - show Telegram bridge settings",
     ]
     .join("\n")
+}
+
+fn telegram_live_backend_status_line() -> String {
+    let config = match load_daemon_config() {
+        Ok(config) => config,
+        Err(error) => {
+            return format!(
+                "Shared live backend: config unavailable ({error:#}). Run setup locally."
+            );
+        }
+    };
+    let Some(codex) = config.codex.as_ref() else {
+        return "Shared live backend: not configured. Run setup locally.".to_string();
+    };
+
+    match live_backend_status(codex) {
+        Ok(status) => {
+            let health = if status.healthy {
+                "healthy"
+            } else {
+                "unhealthy"
+            };
+            let pid = status
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let recovery = if status.healthy {
+                "Use /live_on before you leave."
+            } else {
+                "Use /live_reset to recover."
+            };
+            format!(
+                "Shared live backend: {health}, {}, pid {pid}. {recovery}",
+                status.websocket_url
+            )
+        }
+        Err(error) => format!(
+            "Shared live backend: unhealthy, {} ({error:#}). Use /live_reset to recover.",
+            codex.websocket_url
+        ),
+    }
 }
 
 fn telegram_format_item_line(index: usize, title: &str, detail: Option<&str>) -> String {
@@ -343,7 +388,8 @@ pub(crate) fn telegram_status_text(conn: &Connection) -> Result<String> {
         "off"
     };
     Ok(format!(
-        "Codex remote status\n\nAway mode: {away_label}\nPending Telegram notifications: {pending}\nThreads waiting for you: {}\n\nUse /away_on or /away_off to change away mode.",
+        "Codex remote status\n\nAway mode: {away_label}\n{}\nPending Telegram notifications: {pending}\nThreads waiting for you: {}\n\nUse /live_on before you leave. Use /live_reset if the backend is unhealthy.",
+        telegram_live_backend_status_line(),
         waiting.summary.count
     ))
 }
@@ -351,7 +397,7 @@ pub(crate) fn telegram_status_text(conn: &Connection) -> Result<String> {
 pub(crate) fn telegram_settings_text(
     telegram: &TelegramConfig,
     conn: &Connection,
-    configured_projects: usize,
+    config: &DaemonConfig,
 ) -> Result<String> {
     let away = get_away_mode(conn)?;
     let allowed_user = telegram
@@ -363,8 +409,14 @@ pub(crate) fn telegram_settings_text(
     } else {
         "off"
     };
+    let configured_projects = config.projects.len();
+    let codex_url = config
+        .codex
+        .as_ref()
+        .map(|codex| codex.websocket_url.as_str())
+        .unwrap_or("not configured");
     Ok(format!(
-        "Telegram bridge settings\n\nChat: connected\nAllowed user: {allowed_user}\nAway mode: {away_label}\nConfigured projects: {configured_projects}\n\nNotifications keep Codex's final answer verbatim. To continue a thread, use Telegram's Reply action on that specific notification."
+        "Telegram bridge settings\n\nChat: connected\nAllowed user: {allowed_user}\nAway mode: {away_label}\nShared live backend: {codex_url}\nConfigured projects: {configured_projects}\n\nReplies and approvals use the shared live backend. Use /live_on before you leave and /live_reset if it becomes unhealthy."
     ))
 }
 

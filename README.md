@@ -5,9 +5,9 @@
 The product rule is simple:
 
 - when you are present at your computer, Codex does not send Telegram notifications
-- when you run `away on`, Codex updates go to Telegram
+- when you send `/live_on` in Telegram, the bridge starts the shared local Codex backend and turns away mode on
 - replying directly to a bridge-sent Telegram message sends that reply back to the originating Codex thread
-- `away off` stops outbound Telegram notifications again
+- `/away_off` stops outbound Telegram notifications again
 
 Hermes is optional. It uses the local MCP server when you ask an agent to inspect, reply to, or approve Codex work. Hermes and MCP do not own Telegram notification delivery.
 
@@ -18,7 +18,7 @@ You do not need Hermes for the default product flow. A normal install is Codex p
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
 - Direct Telegram transport: `telegram setup/status/test/disable`
-- Telegram remote controls: `/away_on`, `/away_off`, `/status`, `/project`, `/projects`, `/new_thread`, `/inbox`, `/waiting`, `/recent`, `/settings`
+- Telegram remote controls: `/live_on`, `/live_reset`, `/away_on`, `/away_off`, `/status`, `/project`, `/projects`, `/new_thread`, `/inbox`, `/waiting`, `/recent`, `/settings`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
 - Project registry: `projects list/add/import/remove`
 - Thread inspection: `threads`, `show`, `waiting`, `inbox`
@@ -97,14 +97,16 @@ codex-telegram-bridge telegram test --message "Codex bridge is ready"
 
 Turn on remote notifications when you leave your computer:
 
-```bash
-codex-telegram-bridge away on
+```text
+/live_on
 ```
+
+Send that command to your Telegram bot. It starts or reuses the shared local `codex app-server`, turns away mode on, and makes Telegram replies use the same live backend.
 
 Turn them off when you are back:
 
-```bash
-codex-telegram-bridge away off
+```text
+/away_off
 ```
 
 Optional: if you want Hermes to control Codex when you ask it directly:
@@ -122,15 +124,17 @@ Restart Hermes after registration so it reconnects to MCP servers and discovers 
 
 The daemon runs locally. Each cycle:
 
-1. syncs Codex thread state
+1. syncs Codex thread state through the configured shared websocket backend
 2. checks the local away state
 3. enqueues new notification events only when away is on
 4. sends queued events to Telegram
 5. processes Telegram replies and approval button callbacks
 
-Inbound Telegram replies are processed whenever the daemon is running. The away gate only controls outbound notifications.
+Inbound Telegram replies are processed whenever the daemon is running and the shared live backend is reachable. The away gate only controls outbound notifications.
 
 Telegram notifications use a compact header, keep Codex's answer body verbatim, and omit internal thread ids. To continue the conversation remotely, use Telegram's Reply action on the specific Codex notification.
+
+If replies stop reaching Codex, send `/live_reset` in Telegram. It restarts the shared local backend on the configured websocket URL and keeps away mode on.
 
 Telegram-created threads run in an explicit registered project working directory. Set the current project from Telegram with `/project <id>`, inspect choices with `/projects`, or manage the registry locally with `codex-telegram-bridge projects ...`.
 
@@ -150,6 +154,7 @@ Useful setup flags:
 
 - `--chat-id <id>`: skip `/start` pairing
 - `--allowed-user-id <id>`: restrict inbound replies/buttons to one Telegram user
+- `--websocket-url <url>`: set the loopback shared Codex backend URL, default `ws://127.0.0.1:4500`
 - `--no-install-daemon`: write config without installing a service
 - `--no-start-daemon`: install without starting the service
 - `--register-hermes`: also run `hermes mcp add`
