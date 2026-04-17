@@ -175,8 +175,11 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
 #[allow(dead_code)]
 fn start_live_backend(config: &CodexConfig, action: &str) -> Result<EnsureLiveBackendResult> {
     let pid = spawn_live_backend_process(config)?;
+    let process_start_key = wait_for_backend_process_start_key(pid).with_context(|| {
+        format!("managed live backend process {pid} did not expose a stable process start key")
+    })?;
 
-    let status = wait_for_live_backend(config, pid).with_context(|| {
+    let status = wait_for_live_backend(config, pid, &process_start_key).with_context(|| {
         format!(
             "managed live backend failed to become healthy at {}",
             config.websocket_url
@@ -190,12 +193,16 @@ fn start_live_backend(config: &CodexConfig, action: &str) -> Result<EnsureLiveBa
 }
 
 #[allow(dead_code)]
-fn wait_for_live_backend(config: &CodexConfig, pid: u32) -> Result<LiveBackendStatus> {
+fn wait_for_live_backend(
+    config: &CodexConfig,
+    pid: u32,
+    process_start_key: &str,
+) -> Result<LiveBackendStatus> {
     let started = Instant::now();
     let mut last_error = None;
 
     while started.elapsed() < LIVE_BACKEND_HEALTH_TIMEOUT {
-        if !backend_pid_matches(pid, &config.websocket_url, None) {
+        if !backend_pid_matches(pid, &config.websocket_url, Some(process_start_key)) {
             last_error = Some(format!(
                 "managed live backend process {pid} exited before becoming healthy with the configured websocket URL"
             ));
@@ -207,7 +214,7 @@ fn wait_for_live_backend(config: &CodexConfig, pid: u32) -> Result<LiveBackendSt
                 let status = LiveBackendStatus {
                     websocket_url: config.websocket_url.clone(),
                     pid: Some(pid),
-                    process_start_key: backend_process_start_key(pid),
+                    process_start_key: Some(process_start_key.to_string()),
                     healthy: true,
                     last_error: None,
                 };
@@ -221,12 +228,11 @@ fn wait_for_live_backend(config: &CodexConfig, pid: u32) -> Result<LiveBackendSt
         }
     }
 
-    let process_start_key = backend_process_start_key(pid);
-    terminate_managed_backend_pid(pid, &config.websocket_url, process_start_key.as_deref());
+    terminate_managed_backend_pid(pid, &config.websocket_url, Some(process_start_key));
     let status = LiveBackendStatus {
         websocket_url: config.websocket_url.clone(),
         pid: Some(pid),
-        process_start_key: backend_process_start_key(pid),
+        process_start_key: Some(process_start_key.to_string()),
         healthy: false,
         last_error,
     };
@@ -398,8 +404,34 @@ printf '%s\n' "$!"
 
 #[allow(dead_code)]
 fn terminate_managed_backend_pid(pid: u32, websocket_url: &str, process_start_key: Option<&str>) {
+    #[cfg(test)]
+    if test_fake_spawn_enabled() {
+        if backend_pid_matches(pid, websocket_url, process_start_key) {
+            let _ = terminate_test_live_backend(pid);
+        }
+        return;
+    }
+
+    if !backend_pid_matches(pid, websocket_url, process_start_key) {
+        return;
+    }
+
+    send_backend_termination_signal(pid, false);
+    wait_for_managed_backend_pid_exit(
+        pid,
+        websocket_url,
+        process_start_key,
+        LIVE_BACKEND_TERMINATE_TIMEOUT,
+    );
+
     if backend_pid_matches(pid, websocket_url, process_start_key) {
-        terminate_backend_pid(pid);
+        send_backend_termination_signal(pid, true);
+        wait_for_managed_backend_pid_exit(
+            pid,
+            websocket_url,
+            process_start_key,
+            LIVE_BACKEND_TERMINATE_TIMEOUT,
+        );
     }
 }
 
@@ -417,32 +449,47 @@ fn terminate_backend_pid(pid: u32) {
 
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        send_backend_termination_signal(pid, false);
         wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
         if backend_pid_is_alive(pid) {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            send_backend_termination_signal(pid, true);
             wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
         }
     }
 
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
+        send_backend_termination_signal(pid, true);
+        wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
+    }
+}
+
+#[allow(dead_code)]
+fn send_backend_termination_signal(pid: u32, force: bool) {
+    #[cfg(test)]
+    if test_fake_spawn_enabled() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let signal = if force { "-KILL" } else { "-TERM" };
+        let _ = Command::new("kill")
+            .arg(signal)
+            .arg(pid.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        wait_for_backend_pid_exit(pid, LIVE_BACKEND_TERMINATE_TIMEOUT);
+    }
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T"]);
+        if force {
+            command.arg("/F");
+        }
+        let _ = command.stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
 
@@ -484,7 +531,30 @@ fn discover_backend_pid_for_websocket_url(websocket_url: &str) -> Option<u32> {
 
     #[cfg(windows)]
     {
-        return None;
+        let script = r#"
+Get-CimInstance Win32_Process | ForEach-Object {
+  if ($_.CommandLine) {
+    "$($_.ProcessId)`t$($_.CommandLine)"
+  }
+}
+"#;
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let (pid, command) = line.split_once('\t')?;
+                if command_line_matches_backend(command, websocket_url) {
+                    pid.trim().parse::<u32>().ok()
+                } else {
+                    None
+                }
+            });
     }
 
     #[allow(unreachable_code)]
@@ -583,6 +653,22 @@ fn backend_process_start_key(pid: u32) -> Option<String> {
 }
 
 #[allow(dead_code)]
+fn wait_for_backend_process_start_key(pid: u32) -> Result<String> {
+    let started = Instant::now();
+    while started.elapsed() < LIVE_BACKEND_HEALTH_TIMEOUT {
+        if let Some(process_start_key) = backend_process_start_key(pid) {
+            return Ok(process_start_key);
+        }
+        if !backend_pid_is_alive(pid) {
+            bail!("managed live backend process {pid} exited before start key was available");
+        }
+        thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
+    }
+
+    bail!("timed out waiting for managed live backend process {pid} start key")
+}
+
+#[allow(dead_code)]
 fn command_line_matches_backend(command: &str, websocket_url: &str) -> bool {
     let args = command.split_whitespace().collect::<Vec<_>>();
     let has_app_server = args.iter().any(|arg| *arg == "app-server");
@@ -634,6 +720,22 @@ fn wait_for_backend_pid_exit(pid: u32, timeout: Duration) {
     let started = Instant::now();
     while started.elapsed() < timeout {
         if !backend_pid_is_alive(pid) {
+            return;
+        }
+        thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
+    }
+}
+
+#[allow(dead_code)]
+fn wait_for_managed_backend_pid_exit(
+    pid: u32,
+    websocket_url: &str,
+    process_start_key: Option<&str>,
+    timeout: Duration,
+) {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if !backend_pid_matches(pid, websocket_url, process_start_key) {
             return;
         }
         thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
@@ -988,8 +1090,12 @@ mod tests {
         wait_until_healthy(&websocket_url);
         let dead_pid = healthy_pid + 1;
 
-        let error = wait_for_live_backend(&shared_codex_config(&websocket_url), dead_pid)
-            .expect_err("dead managed pid should fail");
+        let error = wait_for_live_backend(
+            &shared_codex_config(&websocket_url),
+            dead_pid,
+            "dead-process",
+        )
+        .expect_err("dead managed pid should fail");
 
         assert!(format!("{error:#}").contains("exited before becoming healthy"));
         terminate_backend_pid(healthy_pid);
@@ -1062,6 +1168,31 @@ mod tests {
 
         terminate_managed_backend_pid(pid, &websocket_url, Some("wrong-start-key"));
 
+        assert!(backend_pid_matches(pid, &websocket_url, None));
+        terminate_backend_pid(pid);
+    }
+
+    #[test]
+    fn wait_for_managed_backend_pid_exit_stops_on_process_identity_mismatch() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("wait-start-key");
+        let websocket_url = random_websocket_url();
+        let _env = LiveTestEnv::fake_spawn();
+
+        let pid = spawn_test_live_backend(&websocket_url)
+            .expect("spawn test backend")
+            .expect("test backend pid");
+        wait_until_healthy(&websocket_url);
+
+        let started = Instant::now();
+        wait_for_managed_backend_pid_exit(
+            pid,
+            &websocket_url,
+            Some("wrong-start-key"),
+            Duration::from_secs(1),
+        );
+
+        assert!(started.elapsed() < Duration::from_millis(250));
         assert!(backend_pid_matches(pid, &websocket_url, None));
         terminate_backend_pid(pid);
     }
