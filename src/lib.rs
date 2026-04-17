@@ -1080,9 +1080,9 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
         },
         "hermes": hermes,
         "nextStep": if options.dry_run {
-            "Run setup without --dry-run, then use away on when leaving your computer."
+            "Run setup without --dry-run, then send /live_on to the Telegram bot when leaving your computer."
         } else {
-            "Use away on when leaving your computer. Reply to Codex Telegram messages to keep working from Telegram."
+            "Send /live_on to the Telegram bot when leaving your computer. Reply to Codex Telegram messages to keep working from Telegram; use /live_reset if the shared backend becomes unhealthy."
         }
     }))
 }

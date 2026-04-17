@@ -93,8 +93,10 @@ pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBacke
         }
     }
     if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
-        let process_start_key = backend_process_start_key(pid);
-        terminate_managed_backend_pid(pid, &config.websocket_url, process_start_key.as_deref());
+        bail!(
+            "found codex app-server process {pid} on {} without bridge ownership metadata; refusing to reset it. Use /live_on to reuse it or stop it locally first.",
+            config.websocket_url
+        );
     }
 
     start_live_backend(config, "restarted")
@@ -1382,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_live_backend_discovers_running_backend_when_status_file_is_missing() {
+    fn reset_live_backend_refuses_unowned_backend_when_status_file_is_missing() {
         let _guard = live_test_lock().lock().expect("live test lock");
         let _home = TempHome::new("reset-discover");
         let websocket_url = random_websocket_url();
@@ -1393,12 +1395,12 @@ mod tests {
             .expect("test backend pid");
         wait_until_healthy(&websocket_url);
 
-        let result = reset_live_backend(&shared_codex_config(&websocket_url)).expect("reset");
+        let error =
+            reset_live_backend(&shared_codex_config(&websocket_url)).expect_err("reset refusal");
 
-        assert!(!backend_pid_is_alive(old_pid));
-        assert!(result.status.healthy);
-        assert_ne!(result.status.pid, Some(old_pid));
-        terminate_backend_pid(result.status.pid.expect("reset pid"));
+        assert!(format!("{error:#}").contains("without bridge ownership metadata"));
+        assert!(backend_pid_is_alive(old_pid));
+        terminate_backend_pid(old_pid);
     }
 
     #[test]

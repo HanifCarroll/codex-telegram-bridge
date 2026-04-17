@@ -179,7 +179,7 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
             crate::shell_quote(bridge_command),
             crate::shell_quote(bridge_command)
         ),
-        "nextStep": "Install and start the daemon. Codex updates will go directly to Telegram, Telegram replies route back to the originating thread, and slash commands control away mode or start new threads."
+        "nextStep": "Install and start the daemon. Send /live_on to the Telegram bot before leaving; replies, approvals, and new threads will use the shared Codex live backend."
     }))
 }
 
@@ -827,6 +827,75 @@ fn telegram_live_backend_text(
     )
 }
 
+fn telegram_live_failure_text(title: &str, error: &anyhow::Error) -> String {
+    format!("{title}\nError: {error:#}\nTry /live_reset. If that keeps failing, check `codex-telegram-bridge doctor` locally.")
+}
+
+fn telegram_live_failure_result(
+    telegram: &TelegramConfig,
+    action: &str,
+    title: &str,
+    error: anyhow::Error,
+    timeout: Duration,
+) -> Result<Value> {
+    let message = telegram_live_failure_text(title, &error);
+    let sent = send_telegram_command_text(telegram, &message, timeout)?;
+    Ok(json!({
+        "ok": false,
+        "action": action,
+        "error": format!("{error:#}"),
+        "sent": sent
+    }))
+}
+
+fn execute_live_on_command(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let config = load_daemon_config()?;
+    let codex = config
+        .codex
+        .as_ref()
+        .context("shared Codex live backend is not configured; run setup first")?;
+    let backend = ensure_live_backend(codex)?;
+    let away = set_away_mode(conn, true, now)?;
+    let message = telegram_live_backend_text("Shared live mode is on.", &backend, &away);
+    let sent = send_telegram_command_text(telegram, &message, timeout)?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_live_on",
+        "backend": backend,
+        "away": away,
+        "sent": sent
+    }))
+}
+
+fn execute_live_reset_command(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let config = load_daemon_config()?;
+    let codex = config
+        .codex
+        .as_ref()
+        .context("shared Codex live backend is not configured; run setup first")?;
+    let backend = reset_live_backend(codex)?;
+    let away = set_away_mode(conn, true, now)?;
+    let message = telegram_live_backend_text("Shared live backend was reset.", &backend, &away);
+    let sent = send_telegram_command_text(telegram, &message, timeout)?;
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_live_reset",
+        "backend": backend,
+        "away": away,
+        "sent": sent
+    }))
+}
+
 fn execute_telegram_command(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -868,42 +937,26 @@ fn execute_telegram_command(
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
         }
-        TelegramInboundCommand::LiveOn => {
-            let config = load_daemon_config()?;
-            let codex = config
-                .codex
-                .as_ref()
-                .context("shared Codex live backend is not configured; run setup first")?;
-            let backend = ensure_live_backend(codex)?;
-            let away = set_away_mode(conn, true, now)?;
-            let message = telegram_live_backend_text("Shared live mode is on.", &backend, &away);
-            let sent = send_telegram_command_text(telegram, &message, timeout)?;
-            Ok(json!({
-                "ok": true,
-                "action": "telegram_live_on",
-                "backend": backend,
-                "away": away,
-                "sent": sent
-            }))
-        }
+        TelegramInboundCommand::LiveOn => execute_live_on_command(conn, telegram, now, timeout)
+            .or_else(|error| {
+                telegram_live_failure_result(
+                    telegram,
+                    "telegram_live_on_failed",
+                    "Shared live mode could not start.",
+                    error,
+                    timeout,
+                )
+            }),
         TelegramInboundCommand::LiveReset => {
-            let config = load_daemon_config()?;
-            let codex = config
-                .codex
-                .as_ref()
-                .context("shared Codex live backend is not configured; run setup first")?;
-            let backend = reset_live_backend(codex)?;
-            let away = set_away_mode(conn, true, now)?;
-            let message =
-                telegram_live_backend_text("Shared live backend was reset.", &backend, &away);
-            let sent = send_telegram_command_text(telegram, &message, timeout)?;
-            Ok(json!({
-                "ok": true,
-                "action": "telegram_live_reset",
-                "backend": backend,
-                "away": away,
-                "sent": sent
-            }))
+            execute_live_reset_command(conn, telegram, now, timeout).or_else(|error| {
+                telegram_live_failure_result(
+                    telegram,
+                    "telegram_live_reset_failed",
+                    "Shared live backend could not reset.",
+                    error,
+                    timeout,
+                )
+            })
         }
         TelegramInboundCommand::NewThread(Some(prompt)) => {
             let config = load_daemon_config()?;
@@ -1829,5 +1882,38 @@ mod tests {
             .as_str()
             .expect("live reset text")
             .contains("Shared live backend was reset."));
+    }
+
+    #[test]
+    fn live_mode_command_failures_are_reported_to_telegram() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _env = LiveCommandEnv::new("failure-response");
+        let conn = crate::state::create_state_db_in_memory().expect("db");
+        let telegram = TelegramConfig {
+            bot_token: "123:secret".to_string(),
+            chat_id: "456".to_string(),
+            allowed_user_id: Some("789".to_string()),
+        };
+        let message = json!({
+            "chat": { "id": "456" },
+            "from": { "id": "789" }
+        });
+
+        let live_on = execute_telegram_command(
+            &conn,
+            &telegram,
+            &message,
+            TelegramInboundCommand::LiveOn,
+            0,
+            Duration::from_secs(1),
+        )
+        .expect("live on failure response");
+
+        assert_eq!(live_on["ok"], false);
+        assert_eq!(live_on["action"], "telegram_live_on_failed");
+        assert!(live_on["sent"]["result"]["text"]
+            .as_str()
+            .expect("failure text")
+            .contains("Try /live_reset"));
     }
 }
