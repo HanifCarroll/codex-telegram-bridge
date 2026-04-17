@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use crate::projects::{canonicalize_project_cwd, derive_project_label};
 
@@ -574,6 +576,12 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
 }
 
 pub(crate) fn state_dir_path() -> Result<PathBuf> {
+    if let Ok(dir) = env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR") {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+
     let home = env::var("HOME").context("HOME is not set")?;
     let dir = PathBuf::from(home).join(".codex-telegram-bridge");
     fs::create_dir_all(&dir)?;
@@ -587,6 +595,12 @@ pub(crate) fn state_db_path() -> Result<PathBuf> {
 #[allow(dead_code)]
 pub(crate) fn live_backend_status_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("live-backend.json"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub(crate) fn get_setting_number(conn: &Connection, key: &str) -> Result<Option<u64>> {
@@ -2073,11 +2087,14 @@ mod tests {
 
     #[test]
     fn live_backend_status_path_uses_bridge_state_directory() {
+        let _guard = test_env_lock().lock().expect("test env lock");
         let home =
             std::env::temp_dir().join(format!("codex-live-state-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).expect("create temp home");
         let previous_home = std::env::var("HOME").ok();
+        let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+        std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
         std::env::set_var("HOME", &home);
 
         let path = live_backend_status_path().expect("live backend status path");
@@ -2086,6 +2103,11 @@ mod tests {
             std::env::set_var("HOME", previous_home);
         } else {
             std::env::remove_var("HOME");
+        }
+        if let Some(previous_state_dir) = previous_state_dir {
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+        } else {
+            std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
         }
         let _ = fs::remove_dir_all(&home);
 

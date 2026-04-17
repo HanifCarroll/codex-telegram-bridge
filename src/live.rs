@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::codex::{resolve_codex_binary, CodexAppServerClient, CodexBackend};
 use crate::config::CodexConfig;
@@ -45,11 +45,15 @@ pub(crate) struct EnsureLiveBackendResult {
 #[allow(dead_code)]
 struct LiveBackendLock {
     path: PathBuf,
+    token: String,
 }
 
 impl Drop for LiveBackendLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let current_token = fs::read_to_string(&self.path).unwrap_or_default();
+        if current_token.trim() == self.token {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -257,12 +261,23 @@ fn acquire_live_backend_lock() -> Result<LiveBackendLock> {
         fs::create_dir_all(parent)?;
     }
 
+    let token = format!(
+        "{}:{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let started = Instant::now();
     loop {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                writeln!(file, "pid={}", std::process::id())?;
-                return Ok(LiveBackendLock { path });
+                writeln!(file, "{token}")?;
+                return Ok(LiveBackendLock {
+                    path,
+                    token: token.clone(),
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if live_backend_lock_is_stale(&path) {
@@ -507,7 +522,7 @@ fn discover_backend_pid_for_websocket_url(websocket_url: &str) -> Option<u32> {
     #[cfg(unix)]
     {
         let output = Command::new("ps")
-            .args(["ax", "-o", "pid=,command="])
+            .args(["ax", "-o", "pid=,comm=,command="])
             .output();
         return output
             .ok()
@@ -517,10 +532,13 @@ fn discover_backend_pid_for_websocket_url(websocket_url: &str) -> Option<u32> {
                     .lines()
                     .find_map(|line| {
                         let trimmed = line.trim_start();
-                        let mut parts = trimmed.splitn(2, char::is_whitespace);
+                        let mut parts = trimmed.split_whitespace();
                         let pid = parts.next()?;
-                        let command = parts.next()?.trim_start();
-                        if command_line_matches_backend(command, websocket_url) {
+                        let process_name = parts.next()?.trim();
+                        let command = parts.collect::<Vec<_>>().join(" ");
+                        if !is_unix_shell_wrapper_process(process_name)
+                            && command_line_matches_backend(&command, websocket_url)
+                        {
                             pid.parse::<u32>().ok()
                         } else {
                             None
@@ -592,6 +610,14 @@ fn backend_pid_command_matches(pid: u32, websocket_url: &str) -> bool {
 
     #[cfg(unix)]
     {
+        if unix_process_name(pid)
+            .as_deref()
+            .map(is_unix_shell_wrapper_process)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+
         let pid_arg = pid.to_string();
         let output = Command::new("ps")
             .args(["-p", &pid_arg, "-o", "command="])
@@ -616,6 +642,25 @@ fn backend_pid_command_matches(pid: u32, websocket_url: &str) -> bool {
 
     #[allow(unreachable_code)]
     false
+}
+
+#[cfg(unix)]
+fn unix_process_name(pid: u32) -> Option<String> {
+    let pid_arg = pid.to_string();
+    let output = Command::new("ps")
+        .args(["-p", &pid_arg, "-o", "comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let process_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!process_name.is_empty()).then_some(process_name)
+}
+
+#[cfg(unix)]
+fn is_unix_shell_wrapper_process(process_name: &str) -> bool {
+    matches!(process_name, "sh" | "bash" | "zsh" | "fish" | "nohup")
 }
 
 #[allow(dead_code)]
@@ -931,7 +976,7 @@ mod tests {
     use std::path::PathBuf;
 
     struct TempHome {
-        previous_home: Option<String>,
+        previous_state_dir: Option<String>,
         root: PathBuf,
     }
 
@@ -943,11 +988,11 @@ mod tests {
                 next_test_backend_pid()
             ));
             let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("create temp home");
-            let previous_home = std::env::var("HOME").ok();
-            std::env::set_var("HOME", &root);
+            fs::create_dir_all(&root).expect("create temp state dir");
+            let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", &root);
             Self {
-                previous_home,
+                previous_state_dir,
                 root,
             }
         }
@@ -955,10 +1000,10 @@ mod tests {
 
     impl Drop for TempHome {
         fn drop(&mut self) {
-            if let Some(previous_home) = &self.previous_home {
-                std::env::set_var("HOME", previous_home);
+            if let Some(previous_state_dir) = &self.previous_state_dir {
+                std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
             } else {
-                std::env::remove_var("HOME");
+                std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
             }
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -987,8 +1032,7 @@ mod tests {
     }
 
     fn live_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::state::test_env_lock()
     }
 
     fn shared_codex_config(websocket_url: &str) -> CodexConfig {
@@ -1219,6 +1263,14 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_wrapper_processes_are_not_backend_processes() {
+        assert!(is_unix_shell_wrapper_process("sh"));
+        assert!(is_unix_shell_wrapper_process("nohup"));
+        assert!(!is_unix_shell_wrapper_process("codex"));
+    }
+
     #[test]
     fn reset_live_backend_does_not_terminate_pid_that_does_not_match_recorded_url() {
         let _guard = live_test_lock().lock().expect("live test lock");
@@ -1282,6 +1334,24 @@ mod tests {
         drop(lock);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn live_backend_lock_drop_preserves_newer_lock_token() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("lock-token");
+
+        let lock = acquire_live_backend_lock().expect("acquire lock");
+        let path = live_backend_lock_path().expect("lock path");
+        fs::write(&path, "new-owner-token\n").expect("replace lock token");
+
+        drop(lock);
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read replacement lock"),
+            "new-owner-token\n"
+        );
+        let _ = fs::remove_file(path);
     }
 
     #[test]
