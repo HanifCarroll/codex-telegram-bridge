@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -371,6 +371,10 @@ fn spawn_live_backend_process(config: &CodexConfig) -> Result<u32> {
 
     #[cfg(unix)]
     {
+        if unix_command_exists("screen") {
+            return spawn_live_backend_with_screen(config, &resolved.path);
+        }
+
         let output = Command::new("sh")
             .arg("-c")
             .arg(live_backend_spawn_shell_script())
@@ -414,6 +418,62 @@ fn spawn_live_backend_process(config: &CodexConfig) -> Result<u32> {
 
         Ok(child.id())
     }
+}
+
+#[cfg(unix)]
+fn unix_command_exists(command: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg("command -v \"$1\" >/dev/null 2>&1")
+        .arg("codex-command-exists")
+        .arg(command)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn spawn_live_backend_with_screen(config: &CodexConfig, binary: &Path) -> Result<u32> {
+    let session_name = live_backend_screen_session_name(&config.websocket_url);
+    let status = Command::new("screen")
+        .arg("-dmS")
+        .arg(&session_name)
+        .arg(binary)
+        .arg("app-server")
+        .arg("--listen")
+        .arg(&config.websocket_url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to launch screen session {session_name}"))?;
+
+    if !status.success() {
+        bail!("screen failed to launch live backend session {session_name}: {status}");
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < LIVE_BACKEND_HEALTH_TIMEOUT {
+        if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
+            return Ok(pid);
+        }
+        thread::sleep(LIVE_BACKEND_HEALTH_POLL_INTERVAL);
+    }
+
+    bail!(
+        "screen launched session {session_name}, but no codex app-server process appeared for {}",
+        config.websocket_url
+    )
+}
+
+#[cfg(unix)]
+fn live_backend_screen_session_name(websocket_url: &str) -> String {
+    let mut safe = websocket_url
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    safe.truncate(48);
+    format!("codex-bridge-live-{safe}")
 }
 
 #[cfg(unix)]
@@ -1123,7 +1183,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn live_backend_spawn_script_keeps_app_server_stdin_open() {
+    fn live_backend_screen_session_name_is_safe() {
+        let session_name = live_backend_screen_session_name("ws://127.0.0.1:4500");
+
+        assert!(session_name.starts_with("codex-bridge-live-ws---127-0-0-1-4500"));
+        assert!(session_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'));
+        assert!(session_name.len() <= "codex-bridge-live-".len() + 48);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_backend_fallback_spawn_script_keeps_app_server_alive() {
         let script = live_backend_spawn_shell_script();
 
         assert!(
