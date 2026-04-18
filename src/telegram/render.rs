@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -7,9 +7,10 @@ use crate::codex::get_away_mode;
 use crate::config::{DaemonConfig, RegisteredProject};
 use crate::live::live_backend_status;
 use crate::load_daemon_config;
+use crate::projects::derive_project_label;
 use crate::state::{
-    list_waiting_from_db, pending_outbound_count, ObservedWorkspace, TelegramCallbackAction,
-    TelegramCallbackRoute,
+    derive_thread_display_name, list_waiting_from_db, pending_outbound_count, BridgeThreadSnapshot,
+    ObservedWorkspace, PendingPrompt, TelegramCallbackAction, TelegramCallbackRoute,
 };
 
 const TELEGRAM_CONTINUE_THREAD_HINT: &str =
@@ -19,6 +20,7 @@ const TELEGRAM_ANSWER_THREAD_HINT: &str =
 const TELEGRAM_APPROVAL_HINT: &str =
     "Use the buttons below, or use Telegram's Reply action on this message.";
 const TELEGRAM_MESSAGE_CHAR_LIMIT: usize = 4096;
+const TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT: usize = 3000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedTelegramDelivery {
@@ -231,6 +233,96 @@ pub(crate) fn prepare_telegram_delivery(
     })
 }
 
+fn trim_for_telegram_detail(value: &str, max_chars: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().count() <= max_chars {
+        return Some(value.to_string());
+    }
+    let take = max_chars.saturating_sub(3);
+    Some(format!(
+        "{}...",
+        value.chars().take(take).collect::<String>().trim_end()
+    ))
+}
+
+fn thread_snapshot_event_type(snapshot: &BridgeThreadSnapshot) -> &'static str {
+    if snapshot.pending_prompt.is_some() {
+        "thread_waiting"
+    } else if snapshot.last_turn_status.as_deref() == Some("completed") {
+        "thread_completed"
+    } else {
+        "thread_status_changed"
+    }
+}
+
+fn pending_prompt_value(prompt: &PendingPrompt) -> Value {
+    json!({
+        "promptId": prompt.prompt_id,
+        "promptKind": prompt.kind,
+        "promptStatus": prompt.status,
+        "kind": prompt.kind,
+        "status": prompt.status,
+        "question": prompt
+            .question
+            .as_deref()
+            .and_then(|question| trim_for_telegram_detail(
+                question,
+                TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT
+            ))
+    })
+}
+
+fn thread_snapshot_event(snapshot: &BridgeThreadSnapshot) -> Value {
+    let project = derive_project_label(snapshot.cwd.as_deref());
+    let display_name = derive_thread_display_name(
+        snapshot.name.as_deref(),
+        project.as_deref(),
+        snapshot
+            .pending_prompt
+            .as_ref()
+            .and_then(|prompt| prompt.question.as_deref()),
+        &snapshot.thread_id,
+    );
+    let display_name = trim_for_telegram_line(&display_name, 160);
+    let last_preview = snapshot.last_preview.as_deref().and_then(|preview| {
+        trim_for_telegram_detail(preview, TELEGRAM_THREAD_SNAPSHOT_DETAIL_LIMIT)
+    });
+
+    json!({
+        "type": thread_snapshot_event_type(snapshot),
+        "threadId": snapshot.thread_id,
+        "updatedAt": snapshot.updated_at,
+        "lastPreview": last_preview,
+        "thread": {
+            "threadId": snapshot.thread_id,
+            "name": snapshot.name,
+            "displayName": display_name,
+            "project": project,
+            "cwd": snapshot.cwd,
+            "updatedAt": snapshot.updated_at,
+            "statusType": snapshot.status_type,
+            "statusFlags": snapshot.status_flags,
+            "lastTurnStatus": snapshot.last_turn_status,
+            "lastPreview": last_preview,
+            "pendingPrompt": snapshot.pending_prompt.as_ref().map(pending_prompt_value)
+        }
+    })
+}
+
+pub(crate) fn prepare_telegram_thread_snapshot_delivery(
+    chat_id: &str,
+    snapshot: &BridgeThreadSnapshot,
+) -> Result<PreparedTelegramDelivery> {
+    let prepared = prepare_telegram_delivery(chat_id, &thread_snapshot_event(snapshot))?;
+    if prepared.payloads.len() != 1 {
+        bail!("thread snapshot Telegram delivery exceeded one message");
+    }
+    Ok(prepared)
+}
+
 pub(crate) fn telegram_projects_text(
     config: &DaemonConfig,
     current_project: Option<&RegisteredProject>,
@@ -301,6 +393,8 @@ pub(crate) fn telegram_help_text() -> String {
         "/back - stop remote Codex mode",
         "/repair - fix remote Codex mode",
         "/status - show remote status",
+        "/threads - show the 5 most recent Codex threads",
+        "/threads <count> - show that many recent Codex threads",
         "/new <prompt> - start a new Codex thread",
         "/new - ask for a prompt in a reply",
         "/project - list projects",
@@ -575,6 +669,41 @@ mod tests {
     }
 
     #[test]
+    fn telegram_thread_snapshot_payload_uses_update_template_as_one_message() {
+        let snapshot = crate::state::BridgeThreadSnapshot {
+            thread_id: "thr_done".to_string(),
+            name: Some("Release checklist".to_string()),
+            cwd: Some("/Users/hanifcarroll/projects/codex-telegram-bridge".to_string()),
+            updated_at: Some(42),
+            status_type: "notLoaded".to_string(),
+            status_flags: Vec::new(),
+            last_turn_status: Some("completed".to_string()),
+            last_preview: Some("x".repeat(10_000)),
+            pending_prompt: None,
+        };
+
+        let prepared = prepare_telegram_thread_snapshot_delivery("999", &snapshot)
+            .expect("prepared thread snapshot");
+
+        assert_eq!(prepared.thread_id.as_deref(), Some("thr_done"));
+        assert_eq!(
+            prepared.payloads.len(),
+            1,
+            "explicit /threads results must be one Telegram message per thread"
+        );
+        let text = prepared.payloads[0]["text"]
+            .as_str()
+            .expect("telegram text");
+        assert!(text.starts_with("✅ Codex finished\n🧵 Release checklist"));
+        assert!(text.contains("📁 codex-telegram-bridge"));
+        assert!(text.contains("💬 To continue this thread"));
+        assert!(
+            text.chars().count() <= TELEGRAM_MESSAGE_CHAR_LIMIT,
+            "snapshot messages must fit Telegram's single-message limit"
+        );
+    }
+
+    #[test]
     fn telegram_new_thread_confirmation_reports_working_directory() {
         let message = telegram_new_thread_confirmation_text(
             &RegisteredProject {
@@ -605,6 +734,8 @@ mod tests {
             "/back - stop remote Codex mode",
             "/repair - fix remote Codex mode",
             "/status - show remote status",
+            "/threads - show the 5 most recent Codex threads",
+            "/threads <count> - show that many recent Codex threads",
             "/new <prompt> - start a new Codex thread",
             "/project <id> - switch the current project",
         ] {

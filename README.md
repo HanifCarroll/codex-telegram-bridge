@@ -18,7 +18,7 @@ You do not need Hermes for the default product flow. A normal install is Codex p
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
 - Direct Telegram transport: `telegram setup/status/test/disable`
-- Telegram remote controls: `/away`, `/back`, `/repair`, `/status`, `/help`, `/new`, `/project`
+- Telegram remote controls: `/away`, `/back`, `/repair`, `/status`, `/threads`, `/help`, `/new`, `/project`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
 - Project registry: `projects list/add/import/remove`
 - Thread inspection: `threads`, `show`, `waiting`, `inbox`
@@ -133,6 +133,8 @@ The daemon runs locally. Each cycle:
 Inbound Telegram replies are processed whenever the daemon is running and the shared live backend is reachable. Reply and approval handling starts the Codex turn and returns immediately; completed answers are picked up by the next daemon sync and delivered through the normal outbound notification path. The away gate only controls outbound notifications.
 
 Telegram notifications use a compact header, keep Codex's answer body verbatim, and omit internal thread ids. To continue the conversation remotely, use Telegram's Reply action on the specific Codex notification.
+
+Use `/threads` in Telegram to fetch the 5 most recent Codex threads, or `/threads 10` to choose a count. The bridge sends one Telegram message per thread using the same compact update template, records each message id locally, and routes replies back to the matching Codex thread.
 
 If replies stop reaching Codex, send `/repair` in Telegram. It restarts the shared local backend on the configured websocket URL and keeps remote mode on.
 

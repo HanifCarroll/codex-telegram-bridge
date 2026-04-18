@@ -9,17 +9,19 @@ use std::thread;
 use std::time::Duration;
 
 use crate::codex::{
-    normalized_message, set_away_mode, start_thread_in_cwd, text_input_value, CodexAppServerClient,
+    normalized_message, set_away_mode, start_thread_in_cwd, sync_state_from_live, text_input_value,
+    CodexAppServerClient,
 };
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
 use crate::state::{
     get_setting_number, get_telegram_current_project_id, insert_telegram_callback_route,
-    insert_telegram_command_route, insert_telegram_message_route, lookup_telegram_command_route,
+    insert_telegram_command_route, insert_telegram_message_route,
+    list_recent_thread_snapshots_from_db, lookup_telegram_command_route,
     lookup_telegram_message_route, mark_telegram_command_route_used, observed_workspaces_from_db,
     record_action, record_telegram_inbound_processed, set_setting, set_telegram_current_project_id,
-    telegram_inbound_processed, update_telegram_callback_message_id, TelegramCallbackAction,
-    TelegramCommandRouteKind, TelegramInboundLogContext,
+    telegram_inbound_processed, update_telegram_callback_message_id, BridgeThreadSnapshot,
+    TelegramCallbackAction, TelegramCommandRouteKind, TelegramInboundLogContext,
 };
 use crate::ws::validate_shared_websocket_url;
 use crate::{
@@ -36,8 +38,9 @@ use self::api::{
     telegram_updates_array,
 };
 use self::render::{
-    prepare_telegram_delivery, telegram_help_text, telegram_new_thread_confirmation_text,
-    telegram_project_text, telegram_projects_text, telegram_status_text,
+    prepare_telegram_delivery, prepare_telegram_thread_snapshot_delivery, telegram_help_text,
+    telegram_new_thread_confirmation_text, telegram_project_text, telegram_projects_text,
+    telegram_status_text, PreparedTelegramDelivery,
 };
 
 pub(crate) use self::api::{telegram_bot_id, telegram_set_my_commands};
@@ -50,10 +53,14 @@ enum TelegramInboundCommand {
     Back,
     Repair,
     Status,
+    Threads(Option<String>),
     NewThread(Option<String>),
     Project(Option<String>),
     Unknown(String),
 }
+
+const DEFAULT_TELEGRAM_THREADS_LIMIT: u64 = 5;
+const MAX_TELEGRAM_THREADS_LIMIT: u64 = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutedTelegramCommandPromptReply {
@@ -333,10 +340,28 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
         "/back" => Some(TelegramInboundCommand::Back),
         "/repair" => Some(TelegramInboundCommand::Repair),
         "/status" => Some(TelegramInboundCommand::Status),
+        "/threads" => Some(TelegramInboundCommand::Threads(rest.map(str::to_string))),
         "/new" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
         "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
         _ => Some(TelegramInboundCommand::Unknown(raw_command.to_string())),
     }
+}
+
+fn parse_telegram_threads_limit(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_TELEGRAM_THREADS_LIMIT);
+    };
+    let limit = raw.parse::<u64>().with_context(|| {
+        format!(
+            "Use /threads or /threads <count>, with count between 1 and {MAX_TELEGRAM_THREADS_LIMIT}"
+        )
+    })?;
+    if !(1..=MAX_TELEGRAM_THREADS_LIMIT).contains(&limit) {
+        bail!(
+            "Use /threads or /threads <count>, with count between 1 and {MAX_TELEGRAM_THREADS_LIMIT}"
+        );
+    }
+    Ok(limit)
 }
 
 fn extract_telegram_command(
@@ -487,6 +512,16 @@ pub(crate) fn deliver_telegram_event(
     timeout: Duration,
 ) -> Result<Value> {
     let mut prepared = prepare_telegram_delivery(&telegram.chat_id, event)?;
+    deliver_prepared_telegram_delivery(conn, telegram, &mut prepared, now, timeout)
+}
+
+fn deliver_prepared_telegram_delivery(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    prepared: &mut PreparedTelegramDelivery,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
     for route in &prepared.callback_routes {
         insert_telegram_callback_route(conn, route, now)?;
     }
@@ -525,6 +560,17 @@ pub(crate) fn deliver_telegram_event(
         "threadId": prepared.thread_id,
         "callbacks": prepared.callback_routes.len()
     }))
+}
+
+fn send_recent_thread_snapshot(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    snapshot: &BridgeThreadSnapshot,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut prepared = prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot)?;
+    deliver_prepared_telegram_delivery(conn, telegram, &mut prepared, now, timeout)
 }
 
 fn codex_log_context_from_result<'a>(
@@ -878,6 +924,71 @@ fn execute_repair_command(
     }))
 }
 
+fn telegram_threads_limit_error_text(error: &anyhow::Error) -> String {
+    format!(
+        "{error:#}\n\nExamples:\n/threads\n/threads 10\n\nThe maximum is {MAX_TELEGRAM_THREADS_LIMIT}."
+    )
+}
+
+fn telegram_threads_failure_text(error: &anyhow::Error) -> String {
+    format!("I couldn't fetch recent Codex threads.\nError: {error:#}\n\nTry /repair if the shared backend is unhealthy.")
+}
+
+fn execute_threads_command(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    raw_limit: Option<String>,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let limit = match parse_telegram_threads_limit(raw_limit.as_deref()) {
+        Ok(limit) => limit,
+        Err(error) => {
+            let text = telegram_threads_limit_error_text(&error);
+            let sent = telegram_send_text(telegram, &text, timeout)?;
+            return Ok(json!({
+                "ok": true,
+                "action": "telegram_threads_invalid_limit",
+                "error": format!("{error:#}"),
+                "sent": sent
+            }));
+        }
+    };
+
+    let config = load_daemon_config()?;
+    let mut client = CodexAppServerClient::connect_configured(&config)?;
+    sync_state_from_live(&mut client, conn, now, limit, false)?;
+    let snapshots = list_recent_thread_snapshots_from_db(conn, limit)?;
+    if snapshots.is_empty() {
+        let sent = telegram_send_text(
+            telegram,
+            "No recent Codex threads are cached yet. Open Codex locally or try again after the daemon syncs.",
+            timeout,
+        )?;
+        return Ok(json!({
+            "ok": true,
+            "action": "telegram_threads_empty",
+            "limit": limit,
+            "sent": sent
+        }));
+    }
+
+    let mut sent = Vec::with_capacity(snapshots.len());
+    for snapshot in &snapshots {
+        sent.push(send_recent_thread_snapshot(
+            conn, telegram, snapshot, now, timeout,
+        )?);
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "telegram_threads",
+        "limit": limit,
+        "count": snapshots.len(),
+        "sent": sent
+    }))
+}
+
 fn execute_telegram_command(
     conn: &Connection,
     telegram: &TelegramConfig,
@@ -909,6 +1020,18 @@ fn execute_telegram_command(
         TelegramInboundCommand::Status => {
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
+        }
+        TelegramInboundCommand::Threads(raw_limit) => {
+            execute_threads_command(conn, telegram, raw_limit, now, timeout).or_else(|error| {
+                let message = telegram_threads_failure_text(&error);
+                let sent = telegram_send_text(telegram, &message, timeout)?;
+                Ok(json!({
+                    "ok": false,
+                    "action": "telegram_threads_failed",
+                    "error": format!("{error:#}"),
+                    "sent": sent
+                }))
+            })
         }
         TelegramInboundCommand::Away => {
             execute_away_command(conn, telegram, now, timeout).or_else(|error| {
@@ -1935,5 +2058,33 @@ mod tests {
             .as_str()
             .expect("failure text")
             .contains("Try /repair"));
+    }
+
+    #[test]
+    fn parses_threads_command_with_optional_limit() {
+        assert_eq!(
+            parse_telegram_command_text("/threads"),
+            Some(TelegramInboundCommand::Threads(None))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/threads 12"),
+            Some(TelegramInboundCommand::Threads(Some("12".to_string())))
+        );
+        assert_eq!(
+            parse_telegram_command_text("/threads@codex_remote_bot 3"),
+            Some(TelegramInboundCommand::Threads(Some("3".to_string())))
+        );
+    }
+
+    #[test]
+    fn parses_threads_limit_with_default_and_bounds() {
+        assert_eq!(parse_telegram_threads_limit(None).expect("default"), 5);
+        assert_eq!(
+            parse_telegram_threads_limit(Some("10")).expect("explicit"),
+            10
+        );
+        assert!(parse_telegram_threads_limit(Some("0")).is_err());
+        assert!(parse_telegram_threads_limit(Some("26")).is_err());
+        assert!(parse_telegram_threads_limit(Some("two")).is_err());
     }
 }

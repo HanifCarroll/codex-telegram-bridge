@@ -7,6 +7,7 @@ The intended behavior:
 - no Telegram notifications while you are at your computer
 - `/away` starts or reuses the shared local Codex backend and enables outbound Telegram notifications
 - `/back` disables outbound Telegram notifications
+- `/threads` sends recent Codex threads as reply-routable Telegram messages
 - replies to bridge-sent Telegram messages are routed back to the originating Codex thread
 - approval messages include `Approve` and `Deny` buttons
 - slash commands can toggle away mode, inspect state, pick a project, and start new Codex threads from Telegram
@@ -109,6 +110,12 @@ When Codex needs attention and you are away, the daemon sends a Telegram message
 
 For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
 
+## Recent Threads From Telegram
+
+Use `/threads` to fetch the 5 most recent Codex threads, or `/threads 10` to pick a count up to 25.
+
+The bridge syncs the shared live Codex backend, renders each recent thread with the same Telegram update template used for proactive notifications, and sends one Telegram message per thread. Each sent message is stored in the local route table, so replying to any result continues that exact Codex thread.
+
 ## Notification Format
 
 Bridge notifications are designed to feel like Codex is speaking directly in Telegram:
@@ -166,6 +173,8 @@ The bridge accepts these standalone Telegram commands from the paired chat and a
 - `/back`: stop remote Codex mode and clear pending outbound notifications
 - `/repair`: restart the shared Codex backend and keep remote mode on
 - `/status`: show away mode, pending delivery count, and waiting thread count
+- `/threads`: send the 5 most recent Codex threads as separate reply-routable messages
+- `/threads <count>`: send that many recent Codex threads, up to 25
 - `/project`: list configured projects and recent observed workspaces
 - `/project <id>`: switch the current project for future Telegram-created threads
 - `/new <prompt>`: create a new Codex thread in the current project and send the prompt immediately

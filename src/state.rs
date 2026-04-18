@@ -1056,6 +1056,77 @@ pub(crate) fn list_waiting_from_db(
     })
 }
 
+pub(crate) fn list_recent_thread_snapshots_from_db(
+    conn: &Connection,
+    limit: u64,
+) -> Result<Vec<BridgeThreadSnapshot>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT t.thread_id, t.name, t.cwd, t.updated_at, t.status_type, t.status_flags_json,
+                t.last_turn_status, t.last_preview, p.prompt_id, p.prompt_kind, p.prompt_status,
+                p.question
+         FROM threads_cache t
+         LEFT JOIN pending_prompts p ON p.thread_id = t.thread_id
+         ORDER BY COALESCE(t.updated_at, t.last_seen_at, 0) DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![to_sql_i64(limit)?], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+        ))
+    })?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    raw.into_iter()
+        .map(
+            |(
+                thread_id,
+                name,
+                cwd,
+                updated_at_raw,
+                status_type,
+                status_flags_json,
+                last_turn_status,
+                last_preview,
+                prompt_id,
+                prompt_kind,
+                prompt_status,
+                question,
+            )| {
+                Ok(BridgeThreadSnapshot {
+                    thread_id,
+                    name,
+                    cwd,
+                    updated_at: optional_from_sql_i64(updated_at_raw)?,
+                    status_type,
+                    status_flags: serde_json::from_str(&status_flags_json).unwrap_or_default(),
+                    last_turn_status,
+                    last_preview,
+                    pending_prompt: prompt_id.map(|prompt_id| PendingPrompt {
+                        prompt_id,
+                        kind: prompt_kind.unwrap_or_else(|| "reply".to_string()),
+                        status: prompt_status.unwrap_or_else(|| "Needs input".to_string()),
+                        question,
+                    }),
+                })
+            },
+        )
+        .collect()
+}
+
 pub(crate) fn list_inbox_from_db(
     conn: &Connection,
     now: u64,
@@ -2031,6 +2102,43 @@ mod tests {
 
         let history = get_thread_history(&conn, "thr_wait", 10).expect("history");
         assert_eq!(history[0].action_type, "reply");
+    }
+
+    #[test]
+    fn list_recent_thread_snapshots_orders_by_latest_activity() {
+        let conn = create_state_db_in_memory().expect("db");
+        let older = snapshot_fixture(
+            "thr_old",
+            "/tmp/project-old",
+            1200,
+            "notLoaded",
+            vec![],
+            Some("completed"),
+        );
+        let newer = snapshot_fixture(
+            "thr_new",
+            "/tmp/project-new",
+            2400,
+            "active",
+            vec!["waitingOnUserInput"],
+            Some("in_progress"),
+        );
+
+        upsert_thread_snapshot(&conn, &older, 1200).expect("upsert older");
+        upsert_thread_snapshot(&conn, &newer, 2400).expect("upsert newer");
+
+        let recent = list_recent_thread_snapshots_from_db(&conn, 1).expect("recent threads");
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].thread_id, "thr_new");
+        assert_eq!(
+            recent[0]
+                .pending_prompt
+                .as_ref()
+                .expect("pending prompt")
+                .kind,
+            "reply"
+        );
     }
 
     #[test]

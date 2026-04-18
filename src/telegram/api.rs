@@ -104,6 +104,7 @@ pub(crate) fn telegram_bot_commands() -> Vec<Value> {
         json!({ "command": "back", "description": "Stop remote Codex mode" }),
         json!({ "command": "repair", "description": "Fix remote Codex mode" }),
         json!({ "command": "status", "description": "Show remote Codex status" }),
+        json!({ "command": "threads", "description": "Show recent Codex threads" }),
         json!({ "command": "new", "description": "Start a new Codex thread" }),
         json!({ "command": "project", "description": "Show or switch the current project" }),
     ]
@@ -193,7 +194,7 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["start", "help", "away", "back", "repair", "status", "new", "project",]
+            vec!["start", "help", "away", "back", "repair", "status", "threads", "new", "project",]
         );
         for removed in [
             "away_on",
@@ -213,7 +214,7 @@ mod tests {
             );
         }
         for required in [
-            "start", "help", "away", "back", "repair", "status", "new", "project",
+            "start", "help", "away", "back", "repair", "status", "threads", "new", "project",
         ] {
             assert!(
                 names.contains(&required),
