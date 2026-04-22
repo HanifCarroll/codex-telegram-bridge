@@ -673,7 +673,7 @@ mod tests {
         let snapshot = crate::state::BridgeThreadSnapshot {
             thread_id: "thr_done".to_string(),
             name: Some("Release checklist".to_string()),
-            cwd: Some("/Users/hanifcarroll/projects/codex-telegram-bridge".to_string()),
+            cwd: Some("/Users/hanifcarroll/projects/tools/codex-telegram-bridge".to_string()),
             updated_at: Some(42),
             status_type: "notLoaded".to_string(),
             status_flags: Vec::new(),

@@ -705,7 +705,7 @@ mod tests {
                 "codex-telegram-bridge",
                 "projects",
                 "add",
-                "/Users/hanifcarroll/projects/codex-telegram-bridge",
+                "/Users/hanifcarroll/projects/tools/codex-telegram-bridge",
                 "--id",
                 "bridge",
                 "--label",

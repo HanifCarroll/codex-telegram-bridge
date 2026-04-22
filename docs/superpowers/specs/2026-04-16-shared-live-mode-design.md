@@ -1,7 +1,7 @@
 # Shared Live Mode Design
 
 Date: 2026-04-16
-Repo: `/Users/hanifcarroll/projects/codex-telegram-bridge`
+Repo: `/Users/hanifcarroll/projects/tools/codex-telegram-bridge`
 
 ## Summary
 

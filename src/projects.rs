@@ -206,7 +206,7 @@ mod tests {
             RegisteredProject {
                 id: "bridge".to_string(),
                 label: "Codex Telegram Bridge".to_string(),
-                cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
+                cwd: "/Users/hanifcarroll/projects/tools/codex-telegram-bridge".to_string(),
                 aliases: vec!["codex".to_string(), "telegram-bridge".to_string()],
             },
             RegisteredProject {
@@ -239,7 +239,7 @@ mod tests {
             RegisteredProject {
                 id: "bridge".to_string(),
                 label: "Codex Telegram Bridge".to_string(),
-                cwd: "/Users/hanifcarroll/projects/codex-telegram-bridge".to_string(),
+                cwd: "/Users/hanifcarroll/projects/tools/codex-telegram-bridge".to_string(),
                 aliases: vec!["codex".to_string()],
             },
             RegisteredProject {
