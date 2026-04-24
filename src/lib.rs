@@ -323,7 +323,7 @@ fn run() -> Result<()> {
             if once {
                 let now = now_millis()?;
                 let mut client = configured_codex_client()?;
-                let sync_result = match sync_state_from_live(&mut client, &conn, now, 50, true) {
+                let sync_result = match sync_state_from_live(&mut client, &conn, now, 50, false) {
                     Ok(sync_result) => sync_result,
                     Err(error) => {
                         let filtered = filter_watch_events(
@@ -358,7 +358,7 @@ fn run() -> Result<()> {
                 loop {
                     let now = now_millis()?;
                     let mut client = configured_codex_client()?;
-                    let filtered = match sync_state_from_live(&mut client, &conn, now, 50, true) {
+                    let filtered = match sync_state_from_live(&mut client, &conn, now, 50, false) {
                         Ok(sync_result) => watch_events_from_sync_result(
                             &sync_result,
                             client.drain_notifications(),

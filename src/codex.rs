@@ -24,7 +24,8 @@ use crate::projects::derive_project_label;
 use crate::state::{
     clear_pending_outbound_events, derive_thread_display_name, get_setting_number,
     get_setting_text, recent_actions_json, reconcile_thread_snapshots, set_setting,
-    set_setting_text, upsert_thread_snapshot, BridgeThreadSnapshot, PendingPrompt,
+    set_setting_text, should_emit_for_away_window, upsert_thread_snapshot, BridgeThreadSnapshot,
+    PendingPrompt,
 };
 use crate::ws::{validate_shared_websocket_url, WsJsonRpcTransport};
 
@@ -79,6 +80,10 @@ fn last_preview_from_summary(summary: &Value) -> Option<String> {
 
 fn event_type(event: &Value) -> Option<&str> {
     event.get("type").and_then(Value::as_str)
+}
+
+fn summary_updated_at(summary: &Value) -> Option<u64> {
+    summary.get("updatedAt").and_then(Value::as_u64)
 }
 
 fn extract_item_text(item: &Value) -> Option<String> {
@@ -454,6 +459,8 @@ pub(crate) fn sync_state_from_live(
     limit: u64,
     record_deliveries: bool,
 ) -> Result<Value> {
+    let away = get_setting_text(conn, "away")?.unwrap_or_default() == "true";
+    let away_started_at = get_setting_number(conn, "away_started_at")?;
     let list = client.request(
         "thread/list",
         json!({
@@ -468,11 +475,13 @@ pub(crate) fn sync_state_from_live(
                 .get("id")
                 .and_then(Value::as_str)
                 .context("thread id missing in thread/list")?;
+            let include_turns =
+                away && should_emit_for_away_window(away_started_at, summary_updated_at(summary));
             let read = client.request(
                 "thread/read",
                 json!({
                     "threadId": thread_id,
-                    "includeTurns": false
+                    "includeTurns": include_turns
                 }),
             )?;
             let Some(thread) = read.get("thread") else {
