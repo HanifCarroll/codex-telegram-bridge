@@ -62,6 +62,25 @@ fn last_preview_from_thread(thread: &Value) -> Option<String> {
     fallback
 }
 
+fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn last_preview_from_summary(summary: &Value) -> Option<String> {
+    string_field(summary, "lastPreview")
+        .or_else(|| string_field(summary, "preview"))
+        .or_else(|| string_field(summary, "lastMessage"))
+}
+
+fn event_type(event: &Value) -> Option<&str> {
+    event.get("type").and_then(Value::as_str)
+}
+
 fn extract_item_text(item: &Value) -> Option<String> {
     if let Some(text) = item.get("text").and_then(Value::as_str).map(str::trim) {
         if !text.is_empty() {
@@ -287,8 +306,10 @@ pub(crate) fn normalize_thread_snapshot(
         .and_then(|items| items.last())
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str)
-        .map(|s| s.to_string());
-    let last_preview = last_preview_from_thread(thread);
+        .map(|s| s.to_string())
+        .or_else(|| string_field(summary, "lastTurnStatus"));
+    let last_preview =
+        last_preview_from_thread(thread).or_else(|| last_preview_from_summary(summary));
     let pending_prompt = derive_pending_prompt(&thread_id, &status_flags, last_preview.clone());
     Ok(BridgeThreadSnapshot {
         thread_id,
@@ -451,7 +472,7 @@ pub(crate) fn sync_state_from_live(
                 "thread/read",
                 json!({
                     "threadId": thread_id,
-                    "includeTurns": true
+                    "includeTurns": false
                 }),
             )?;
             let Some(thread) = read.get("thread") else {
@@ -461,7 +482,64 @@ pub(crate) fn sync_state_from_live(
             snapshots.push(snapshot);
         }
     }
-    reconcile_thread_snapshots(conn, now, snapshots, record_deliveries)
+    let sync_result = reconcile_thread_snapshots(conn, now, snapshots, record_deliveries)?;
+    enrich_completed_event_previews(sync_result, |thread_id| {
+        fetch_full_completed_preview(client, thread_id)
+    })
+}
+
+fn fetch_full_completed_preview(
+    client: &mut CodexAppServerClient,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let read = client.request(
+        "thread/read",
+        json!({
+            "threadId": thread_id,
+            "includeTurns": true
+        }),
+    )?;
+    Ok(read.get("thread").and_then(last_preview_from_thread))
+}
+
+fn enrich_completed_event_previews<F>(mut sync_result: Value, mut fetch_preview: F) -> Result<Value>
+where
+    F: FnMut(&str) -> Result<Option<String>>,
+{
+    let Some(events) = sync_result.get_mut("events").and_then(Value::as_array_mut) else {
+        return Ok(sync_result);
+    };
+    let mut updates = Vec::new();
+    for event in events {
+        if event_type(event) != Some("thread_completed") {
+            continue;
+        }
+        let Some(thread_id) = event
+            .get("threadId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(preview) = fetch_preview(&thread_id)? else {
+            continue;
+        };
+        event["lastPreview"] = json!(preview.clone());
+        updates.push((thread_id, preview));
+    }
+
+    if let Some(threads) = sync_result.get_mut("threads").and_then(Value::as_array_mut) {
+        for (thread_id, preview) in updates {
+            if let Some(thread) = threads
+                .iter_mut()
+                .find(|thread| thread.get("threadId").and_then(Value::as_str) == Some(&thread_id))
+            {
+                thread["lastPreview"] = json!(preview);
+            }
+        }
+    }
+
+    Ok(sync_result)
 }
 
 pub(crate) fn resolve_codex_binary() -> Result<ResolvedBinary> {
@@ -2474,6 +2552,71 @@ raise SystemExit(1)
         assert_eq!(
             inbox.items[0].recent_action.as_ref().unwrap()["payload"]["message"],
             "On it"
+        );
+    }
+
+    #[test]
+    fn normalize_thread_snapshot_uses_summary_fields_without_turns() {
+        let snapshot = normalize_thread_snapshot(
+            &json!({
+                "id": "thr_summary",
+                "name": "Summary only",
+                "cwd": "/tmp/project-a",
+                "updatedAt": 1234,
+                "status": { "type": "active", "activeFlags": ["waitingOnUserInput"] },
+                "lastTurnStatus": "in_progress",
+                "lastPreview": "Need a reply"
+            }),
+            &json!({
+                "id": "thr_summary",
+                "status": { "type": "active", "activeFlags": ["waitingOnUserInput"] }
+            }),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.thread_id, "thr_summary");
+        assert_eq!(snapshot.name.as_deref(), Some("Summary only"));
+        assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project-a"));
+        assert_eq!(snapshot.last_turn_status.as_deref(), Some("in_progress"));
+        assert_eq!(snapshot.last_preview.as_deref(), Some("Need a reply"));
+        assert_eq!(
+            snapshot
+                .pending_prompt
+                .as_ref()
+                .map(|prompt| prompt.kind.as_str()),
+            Some("reply")
+        );
+    }
+
+    #[test]
+    fn completed_events_are_enriched_with_full_final_preview() {
+        let sync_result = json!({
+            "threads": [{
+                "threadId": "thr_done",
+                "lastPreview": "Summary preview"
+            }],
+            "events": [{
+                "type": "thread_completed",
+                "threadId": "thr_done",
+                "lastPreview": "Summary preview"
+            }]
+        });
+
+        let enriched = enrich_completed_event_previews(sync_result, |thread_id| {
+            assert_eq!(thread_id, "thr_done");
+            Ok(Some(
+                "Full final answer\n\nWith all paragraphs.".to_string(),
+            ))
+        })
+        .expect("enrich");
+
+        assert_eq!(
+            enriched["events"][0]["lastPreview"],
+            "Full final answer\n\nWith all paragraphs."
+        );
+        assert_eq!(
+            enriched["threads"][0]["lastPreview"],
+            "Full final answer\n\nWith all paragraphs."
         );
     }
 

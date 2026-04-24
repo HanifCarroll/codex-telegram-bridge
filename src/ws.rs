@@ -3,10 +3,13 @@ use serde_json::Value;
 use std::io::ErrorKind;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
-use tungstenite::{client, Error as WsError, Message, WebSocket};
+use tungstenite::{
+    client::client_with_config, protocol::WebSocketConfig, Error as WsError, Message, WebSocket,
+};
 use url::Url;
 
 const WEBSOCKET_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES: usize = 256 << 20;
 
 #[derive(Debug)]
 pub(crate) struct WsJsonRpcTransport {
@@ -17,8 +20,8 @@ impl WsJsonRpcTransport {
     pub(crate) fn connect(url: &str) -> Result<Self> {
         let url = validate_shared_websocket_url(url)?;
         let stream = connect_loopback_tcp(&url, websocket_io_timeout())?;
-        let (socket, _) =
-            client(url.as_str(), stream).context("failed to connect websocket transport")?;
+        let (socket, _) = client_with_config(url.as_str(), stream, Some(local_app_server_config()))
+            .context("failed to connect websocket transport")?;
         Ok(Self { socket })
     }
 
@@ -113,6 +116,14 @@ impl WsJsonRpcTransport {
             .get_mut()
             .set_nonblocking(value)
             .with_context(|| format!("failed to set websocket nonblocking={value}"))
+    }
+}
+
+fn local_app_server_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES),
+        max_frame_size: Some(LOCAL_APP_SERVER_WEBSOCKET_LIMIT_BYTES),
+        ..WebSocketConfig::default()
     }
 }
 
@@ -266,6 +277,47 @@ mod tests {
             })
         );
         server.join().expect("fake ws server thread");
+    }
+
+    #[test]
+    fn websocket_transport_accepts_large_local_app_server_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ws server");
+        let address = listener.local_addr().expect("fake ws server addr");
+        let oversized_text = "x".repeat((16 << 20) + 1);
+        let expected_text = oversized_text.clone();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept websocket client");
+            let mut socket = tungstenite::accept(stream).expect("accept websocket");
+            let request = socket.read().expect("read websocket request");
+            let text = request.into_text().expect("text websocket request");
+            serde_json::from_str::<Value>(&text).expect("parse websocket request");
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": { "payload": oversized_text }
+                    }))
+                    .expect("serialize websocket response"),
+                ))
+                .expect("write websocket response");
+        });
+
+        let mut transport =
+            WsJsonRpcTransport::connect(&format!("ws://{address}")).expect("connect transport");
+        transport
+            .write_json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "thread/list",
+                "params": {}
+            }))
+            .expect("write websocket JSON");
+        let response = transport.read_json().expect("read websocket JSON");
+        assert_eq!(response["result"]["payload"], expected_text);
+
+        server.join().expect("join fake websocket server");
     }
 
     #[test]

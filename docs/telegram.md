@@ -87,6 +87,21 @@ codex-telegram-bridge daemon run --once
 codex-telegram-bridge daemon run
 ```
 
+If the daemon is running but Telegram updates stop arriving, verify the live sync path directly:
+
+```bash
+codex-telegram-bridge sync --limit 50
+codex-telegram-bridge watch --once
+```
+
+`daemon status` only proves the LaunchAgent and config are present. A moved checkout or stale installed binary can still break live sync. After moving this repo, reinstall from the new path and restart the daemon:
+
+```bash
+cargo install --path /path/to/codex-telegram-bridge --force
+codex-telegram-bridge daemon stop
+codex-telegram-bridge daemon start
+```
+
 ## Presence Gate
 
 ```text
