@@ -17,8 +17,10 @@ You do not need Hermes for the default product flow. A normal install is Codex p
 
 - Product setup: `setup`
 - Presence gate: `away on`, `away off`, `away status`
+- Full remote mode gate: `remote on`, `remote off`, `remote repair`, `remote status`
 - Direct Telegram transport: `telegram setup/status/test/disable`
 - Telegram remote controls: `/away`, `/back`, `/repair`, `/status`, `/threads`, `/help`, `/new`, `/project`
+- Native macOS companion: `apps/macos-menu-bar`
 - Proactive daemon: `daemon run/install/start/stop/status/logs`
 - Project registry: `projects list/add/import/remove`
 - Thread inspection: `threads`, `show`, `waiting`, `inbox`
@@ -171,6 +173,33 @@ codex-telegram-bridge away off
 ```
 
 `away on` starts a new away session. The daemon only sends events observed after that session started, so old waiting threads do not flood Telegram when you leave. `away off` clears pending outbound notifications so delayed retries do not notify you after you return.
+
+For desktop integrations such as the macOS menu bar app, use full remote mode instead:
+
+```bash
+codex-telegram-bridge remote status
+codex-telegram-bridge remote on
+codex-telegram-bridge remote off
+codex-telegram-bridge remote repair
+```
+
+`remote on` starts or reuses the shared local `codex app-server` before enabling away mode. `remote off` behaves like `/back`: it disables away mode and clears pending Telegram notifications. `remote repair` restarts the shared backend and keeps remote mode on.
+
+### macOS Menu Bar App
+
+Build the native companion app from the repo root:
+
+```bash
+scripts/build_macos_menu_bar_app.sh
+```
+
+The script builds the Rust bridge and Swift menu bar executable, then writes:
+
+```text
+target/macos-menu-bar/Codex Bridge.app
+```
+
+The app embeds the bridge binary inside the bundle so it can run from Finder or Login Items without relying on a shell `PATH`. Its menu shows the next useful remote-mode action: `Start Remote Mode` when remote mode is off, and `Stop Remote Mode` when it is on. It also exposes `Repair Connection`, `Refresh Status`, config access, and state-folder access.
 
 ### Telegram
 

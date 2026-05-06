@@ -108,13 +108,16 @@ pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBacke
 
 #[allow(dead_code)]
 fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatus> {
-    let mut status = read_live_backend_status()?.unwrap_or_else(|| LiveBackendStatus {
-        websocket_url: config.websocket_url.clone(),
-        pid: None,
-        process_start_key: None,
-        healthy: false,
-        last_error: None,
-    });
+    let previous_status = read_live_backend_status()?;
+    let mut status = previous_status
+        .clone()
+        .unwrap_or_else(|| LiveBackendStatus {
+            websocket_url: config.websocket_url.clone(),
+            pid: None,
+            process_start_key: None,
+            healthy: false,
+            last_error: None,
+        });
 
     if status.websocket_url != config.websocket_url {
         status = LiveBackendStatus {
@@ -175,7 +178,9 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         }
     }
 
-    write_live_backend_status(&status)?;
+    if previous_status.as_ref() != Some(&status) {
+        write_live_backend_status(&status)?;
+    }
     Ok(status)
 }
 

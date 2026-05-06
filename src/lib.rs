@@ -18,7 +18,8 @@ mod telegram;
 mod ws;
 
 use crate::cli::{
-    AwayCommands, Cli, Commands, DaemonCommands, HermesCommands, ProjectCommands, TelegramCommands,
+    AwayCommands, Cli, Commands, DaemonCommands, HermesCommands, ProjectCommands, RemoteCommands,
+    TelegramCommands,
 };
 use crate::codex::{
     attach_follow_result, build_show_thread_result, classify_app_server_error_message,
@@ -40,15 +41,15 @@ use crate::mcp::run_mcp_server;
 use crate::projects::{build_registered_project, ensure_unique_project_id, slugify_project_token};
 use crate::state::{
     archive_result, create_state_db, list_inbox_from_db, list_waiting_from_db,
-    observed_workspaces_from_db, record_action, resolve_archive_targets, state_db_path,
-    unarchive_thread_result, ObservedWorkspace,
+    observed_workspaces_from_db, pending_outbound_count, record_action, resolve_archive_targets,
+    state_db_path, unarchive_thread_result, ObservedWorkspace,
 };
 #[cfg(test)]
 use crate::state::{classify_inbox_item, create_state_db_in_memory, BridgeThreadSnapshot};
 #[cfg(test)]
 use crate::state::{
-    deliver_due_outbound_events, enqueue_outbound_event, pending_outbound_count,
-    record_transport_delivery, transport_delivery_exists, OutboxDeliverySummary,
+    deliver_due_outbound_events, enqueue_outbound_event, record_transport_delivery,
+    transport_delivery_exists, OutboxDeliverySummary,
 };
 use crate::telegram::{
     telegram_disable_result, telegram_setup_result, telegram_status_result, telegram_test_result,
@@ -61,7 +62,8 @@ pub(crate) use config::{
     TelegramSetupOptions,
 };
 #[allow(unused_imports)]
-pub(crate) use live::{ensure_live_backend, reset_live_backend};
+pub(crate) use live::{ensure_live_backend, live_backend_status, reset_live_backend};
+use rusqlite::Connection;
 pub(crate) use state::state_dir_path;
 
 #[derive(Serialize)]
@@ -220,6 +222,15 @@ fn run() -> Result<()> {
                 AwayCommands::On => set_away_mode(&conn, true, now)?,
                 AwayCommands::Off => set_away_mode(&conn, false, now)?,
                 AwayCommands::Status => get_away_mode(&conn)?,
+            };
+            println!("{}", serde_json::to_string(&payload)?);
+        }
+        Commands::Remote { command } => {
+            let payload = match command {
+                RemoteCommands::On => remote_mode_on_result(RemoteModeStartAction::On)?,
+                RemoteCommands::Off => remote_mode_off_result()?,
+                RemoteCommands::Repair => remote_mode_on_result(RemoteModeStartAction::Repair)?,
+                RemoteCommands::Status => remote_mode_status_result()?,
             };
             println!("{}", serde_json::to_string(&payload)?);
         }
@@ -1087,6 +1098,100 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
     }))
 }
 
+fn remote_backend_status_value(config: Option<&DaemonConfig>) -> Value {
+    match config.and_then(|config| config.codex.as_ref()) {
+        Some(codex) => match live_backend_status(codex) {
+            Ok(status) => json!(status),
+            Err(error) => json!({
+                "websocketUrl": codex.websocket_url,
+                "pid": Value::Null,
+                "processStartKey": Value::Null,
+                "healthy": false,
+                "lastError": format!("{error:#}")
+            }),
+        },
+        None => Value::Null,
+    }
+}
+
+fn remote_mode_status_payload(
+    action: &str,
+    config: Option<&DaemonConfig>,
+    away: Value,
+    backend: Value,
+    conn: &Connection,
+) -> Result<Value> {
+    Ok(json!({
+        "ok": true,
+        "action": action,
+        "configPath": daemon_config_path()?.display().to_string(),
+        "stateFolderPath": state_dir_path()?.display().to_string(),
+        "configured": config.is_some(),
+        "telegramConfigured": config.as_ref().and_then(|config| config.telegram.as_ref()).is_some(),
+        "codexConfigured": config.as_ref().and_then(|config| config.codex.as_ref()).is_some(),
+        "away": away,
+        "backend": backend,
+        "pending": pending_outbound_count(conn)?
+    }))
+}
+
+fn remote_mode_status_result() -> Result<Value> {
+    let config = read_daemon_config_raw()?;
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    let away = get_away_mode(&conn)?;
+    let backend = remote_backend_status_value(config.as_ref());
+    remote_mode_status_payload("remote_status", config.as_ref(), away, backend, &conn)
+}
+
+#[derive(Clone, Copy)]
+enum RemoteModeStartAction {
+    On,
+    Repair,
+}
+
+impl RemoteModeStartAction {
+    fn json_action(self) -> &'static str {
+        match self {
+            Self::On => "remote_on",
+            Self::Repair => "remote_repair",
+        }
+    }
+}
+
+fn remote_mode_on_result(action: RemoteModeStartAction) -> Result<Value> {
+    let now = now_millis()?;
+    let config = load_daemon_config()?;
+    let codex = config
+        .codex
+        .as_ref()
+        .context("shared Codex live backend is not configured; run setup first")?;
+    let backend = match action {
+        RemoteModeStartAction::On => ensure_live_backend(codex)?,
+        RemoteModeStartAction::Repair => reset_live_backend(codex)?,
+    };
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    let away = set_away_mode(&conn, true, now)?;
+    remote_mode_status_payload(
+        action.json_action(),
+        Some(&config),
+        away,
+        json!(backend.status),
+        &conn,
+    )
+}
+
+fn remote_mode_off_result() -> Result<Value> {
+    let now = now_millis()?;
+    let config = read_daemon_config_raw()?;
+    let db_path = state_db_path()?;
+    let conn = create_state_db(&db_path)?;
+    let away = set_away_mode(&conn, false, now)?;
+    let backend = remote_backend_status_value(config.as_ref());
+    remote_mode_status_payload("remote_off", config.as_ref(), away, backend, &conn)
+}
+
 fn projects_list_result(observed_limit: u64) -> Result<Value> {
     let config = load_daemon_config()?;
     let db_path = state_db_path()?;
@@ -1348,6 +1453,41 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct TempStateDir {
+        previous_state_dir: Option<String>,
+        root: PathBuf,
+    }
+
+    impl TempStateDir {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "codex-telegram-bridge-{name}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create temp state dir");
+            let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", &root);
+            Self {
+                previous_state_dir,
+                root,
+            }
+        }
+    }
+
+    impl Drop for TempStateDir {
+        fn drop(&mut self) {
+            if let Some(previous_state_dir) = &self.previous_state_dir {
+                std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+            } else {
+                std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn derives_waiting_prompt_from_status_flags() {
@@ -1390,6 +1530,51 @@ mod tests {
             Some("Can you confirm the plan?")
         );
         assert_eq!(snapshot.last_turn_status.as_deref(), Some("in_progress"));
+    }
+
+    #[test]
+    fn remote_status_reports_missing_config_without_failing() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let state = TempStateDir::new("remote-status-missing-config");
+
+        let status = remote_mode_status_result().expect("remote status");
+
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["action"], "remote_status");
+        assert_eq!(status["configured"], false);
+        assert_eq!(status["stateFolderPath"], state.root.display().to_string());
+        assert_eq!(status["away"]["away"], false);
+        assert_eq!(status["backend"], Value::Null);
+        assert_eq!(status["pending"], 0);
+    }
+
+    #[test]
+    fn remote_off_clears_pending_notifications() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _state = TempStateDir::new("remote-off-clears-pending");
+        let conn = create_state_db(&state_db_path().expect("state db path")).expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        enqueue_outbound_event(
+            &conn,
+            &json!({
+                "type": "thread_waiting",
+                "threadId": "thr_remote",
+                "updatedAt": 1500
+            }),
+            2000,
+        )
+        .expect("enqueue");
+        assert_eq!(pending_outbound_count(&conn).expect("pending before"), 1);
+
+        let result = remote_mode_off_result().expect("remote off");
+
+        assert_eq!(result["action"], "remote_off");
+        assert_eq!(result["configured"], false);
+        assert_eq!(result["away"]["away"], false);
+        assert_eq!(result["away"]["clearedPendingNotifications"], 1);
+        assert_eq!(result["backend"], Value::Null);
+        assert_eq!(result["pending"], 0);
+        assert_eq!(pending_outbound_count(&conn).expect("pending after"), 0);
     }
 
     #[test]

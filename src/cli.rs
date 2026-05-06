@@ -51,6 +51,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: AwayCommands,
     },
+    #[command(about = "Control full remote Codex mode for local desktop integrations")]
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
     #[command(about = "List recent Codex threads")]
     Threads {
         #[arg(long, default_value_t = 25)]
@@ -238,6 +243,18 @@ pub(crate) enum Commands {
 pub(crate) enum AwayCommands {
     On,
     Off,
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RemoteCommands {
+    #[command(about = "Start or reuse the shared live backend and enable away mode")]
+    On,
+    #[command(about = "Disable away mode and clear pending Telegram notifications")]
+    Off,
+    #[command(about = "Restart the shared live backend and keep away mode enabled")]
+    Repair,
+    #[command(about = "Show remote mode, backend, and pending notification state")]
     Status,
 }
 
