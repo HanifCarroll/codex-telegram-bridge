@@ -62,7 +62,10 @@ pub(crate) use config::{
     TelegramSetupOptions,
 };
 #[allow(unused_imports)]
-pub(crate) use live::{ensure_live_backend, live_backend_status, reset_live_backend};
+pub(crate) use live::{
+    ensure_live_backend, live_backend_idle_status, live_backend_status, reconcile_live_backend,
+    reset_live_backend,
+};
 use rusqlite::Connection;
 pub(crate) use state::state_dir_path;
 
@@ -1098,15 +1101,22 @@ fn setup_result(options: SetupOptions<'_>) -> Result<Value> {
     }))
 }
 
-fn remote_backend_status_value(config: Option<&DaemonConfig>) -> Value {
+fn remote_backend_status_value(config: Option<&DaemonConfig>, required: bool) -> Value {
     match config.and_then(|config| config.codex.as_ref()) {
-        Some(codex) => match live_backend_status(codex) {
+        Some(codex) => match if required {
+            live_backend_status(codex)
+        } else {
+            live_backend_idle_status(codex)
+        } {
             Ok(status) => json!(status),
             Err(error) => json!({
                 "websocketUrl": codex.websocket_url,
                 "pid": Value::Null,
                 "processStartKey": Value::Null,
                 "healthy": false,
+                "required": required,
+                "state": if required { "unhealthy" } else { "idle" },
+                "recoverable": required,
                 "lastError": format!("{error:#}")
             }),
         },
@@ -1140,7 +1150,8 @@ fn remote_mode_status_result() -> Result<Value> {
     let db_path = state_db_path()?;
     let conn = create_state_db(&db_path)?;
     let away = get_away_mode(&conn)?;
-    let backend = remote_backend_status_value(config.as_ref());
+    let backend_required = away.get("away").and_then(Value::as_bool) == Some(true);
+    let backend = remote_backend_status_value(config.as_ref(), backend_required);
     remote_mode_status_payload("remote_status", config.as_ref(), away, backend, &conn)
 }
 
@@ -1188,7 +1199,7 @@ fn remote_mode_off_result() -> Result<Value> {
     let db_path = state_db_path()?;
     let conn = create_state_db(&db_path)?;
     let away = set_away_mode(&conn, false, now)?;
-    let backend = remote_backend_status_value(config.as_ref());
+    let backend = remote_backend_status_value(config.as_ref(), false);
     remote_mode_status_payload("remote_off", config.as_ref(), away, backend, &conn)
 }
 
@@ -1546,6 +1557,36 @@ mod tests {
         assert_eq!(status["away"]["away"], false);
         assert_eq!(status["backend"], Value::Null);
         assert_eq!(status["pending"], 0);
+    }
+
+    #[test]
+    fn remote_status_reports_idle_backend_when_remote_mode_is_off() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _state = TempStateDir::new("remote-status-idle-backend");
+        let websocket_url = "ws://127.0.0.1:9";
+        write_daemon_config(&DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: "thread_waiting".to_string(),
+            telegram: None,
+            codex: Some(CodexConfig {
+                live_mode: CodexLiveMode::Shared,
+                websocket_url: websocket_url.to_string(),
+            }),
+            projects: Vec::new(),
+        })
+        .expect("write config");
+
+        let status = remote_mode_status_result().expect("remote status");
+
+        assert_eq!(status["configured"], true);
+        assert_eq!(status["codexConfigured"], true);
+        assert_eq!(status["away"]["away"], false);
+        assert_eq!(status["backend"]["websocketUrl"], websocket_url);
+        assert_eq!(status["backend"]["required"], false);
+        assert_eq!(status["backend"]["state"], "idle");
+        assert_eq!(status["backend"]["healthy"], false);
+        assert_eq!(status["backend"]["lastError"], Value::Null);
     }
 
     #[test]

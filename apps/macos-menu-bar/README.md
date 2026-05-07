@@ -23,12 +23,22 @@ target/macos-menu-bar/Codex Bridge.app
 
 The script embeds the Rust bridge binary inside the app bundle so the app works when macOS launches it without a developer shell `PATH`.
 
+From the repo root, install it into `~/Applications`, register it as a Login Item, and launch it:
+
+```sh
+scripts/install_macos_menu_bar_app.sh
+```
+
+Use `--install-dir <path>`, `--no-login-item`, or `--no-open` to change installer behavior.
+
 Menu wording follows the bridge product model:
 
 - `Remote Mode: On` means Telegram notifications are enabled.
 - `Remote Mode: Off` means Telegram notifications stay local.
 - The primary action is state-aware: off shows `Start Remote Mode`, on shows `Stop Remote Mode`.
-- `Connection: Needs Repair` means use `Repair Connection` before relying on remote replies.
+- `Connection: Idle` means the shared backend is not required because remote mode is off.
+- `Connection: Ready` means the shared backend is reachable.
+- `Connection: Needs Attention` means automatic reconciliation could not make the backend usable; use `Repair Connection` or inspect the issue text.
 
 For development:
 

@@ -85,6 +85,33 @@ fn away_notifications_enabled(conn: &Connection) -> Result<bool> {
     ))
 }
 
+fn reconcile_daemon_backend(conn: &Connection, config: &DaemonConfig, now: u64) -> Value {
+    if !away_notifications_enabled(conn).unwrap_or(false) {
+        return Value::Null;
+    }
+    let Some(codex) = config.codex.as_ref() else {
+        return json!({
+            "ok": false,
+            "required": true,
+            "state": "unhealthy",
+            "error": "shared Codex live backend is not configured"
+        });
+    };
+    match crate::reconcile_live_backend(codex, now) {
+        Ok(result) => json!({
+            "ok": result.status.healthy,
+            "action": result.action,
+            "status": result.status
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "required": true,
+            "state": "unhealthy",
+            "error": format!("{error:#}")
+        }),
+    }
+}
+
 fn deliver_outbound_events(
     conn: &Connection,
     config: &DaemonConfig,
@@ -115,6 +142,7 @@ fn daemon_cycle(
     timeout: Duration,
 ) -> Result<Value> {
     let filter = parse_event_filter(Some(&config.events));
+    let backend = reconcile_daemon_backend(conn, config, now);
     let events = match CodexAppServerClient::connect_configured(config).and_then(|mut client| {
         let sync_result = sync_state_from_live(&mut client, conn, now, 50, true)?;
         Ok(watch_events_from_sync_result(
@@ -148,6 +176,7 @@ fn daemon_cycle(
         "action": "daemon_cycle",
         "observed": events.len(),
         "enqueued": enqueued,
+        "backend": backend,
         "delivery": delivery,
         "telegramUpdates": telegram_updates,
         "pending": pending_outbound_count(conn)?
@@ -676,6 +705,63 @@ mod tests {
     use super::*;
     use crate::codex::set_away_mode;
     use crate::state::{create_state_db_in_memory, pending_outbound_count};
+    use std::path::PathBuf;
+
+    struct TempStateDir {
+        previous_state_dir: Option<String>,
+        root: PathBuf,
+    }
+
+    impl TempStateDir {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "codex-telegram-bridge-daemon-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create temp state dir");
+            let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", &root);
+            Self {
+                previous_state_dir,
+                root,
+            }
+        }
+    }
+
+    impl Drop for TempStateDir {
+        fn drop(&mut self) {
+            if let Some(previous_state_dir) = &self.previous_state_dir {
+                std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+            } else {
+                std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    struct FakeSpawnEnv {
+        previous_spawn: Option<String>,
+    }
+
+    impl FakeSpawnEnv {
+        fn new() -> Self {
+            let previous_spawn = std::env::var("CODEX_LIVE_TEST_FAKE_SPAWN").ok();
+            std::env::set_var("CODEX_LIVE_TEST_FAKE_SPAWN", "1");
+            Self { previous_spawn }
+        }
+    }
+
+    impl Drop for FakeSpawnEnv {
+        fn drop(&mut self) {
+            crate::live::terminate_all_test_live_backends();
+            if let Some(previous_spawn) = &self.previous_spawn {
+                std::env::set_var("CODEX_LIVE_TEST_FAKE_SPAWN", previous_spawn);
+            } else {
+                std::env::remove_var("CODEX_LIVE_TEST_FAKE_SPAWN");
+            }
+        }
+    }
 
     #[test]
     fn daemon_install_dry_run_resolves_relative_bridge_command_for_services() {
@@ -775,6 +861,57 @@ mod tests {
 
         assert_eq!(result["action"], "daemon_cycle");
         assert_eq!(result["observed"], 1);
+    }
+
+    #[test]
+    fn daemon_backend_reconciliation_is_idle_while_remote_mode_is_off() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _state = TempStateDir::new("remote-off");
+        let conn = create_state_db_in_memory().expect("db");
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: "thread_error".to_string(),
+            telegram: None,
+            codex: Some(crate::CodexConfig {
+                live_mode: crate::CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:9".to_string(),
+            }),
+            projects: Vec::new(),
+        };
+
+        let backend = reconcile_daemon_backend(&conn, &config, 1000);
+
+        assert_eq!(backend, Value::Null);
+    }
+
+    #[test]
+    fn daemon_backend_reconciliation_starts_backend_while_remote_mode_is_on() {
+        let _guard = crate::state::test_env_lock().lock().expect("env lock");
+        let _state = TempStateDir::new("remote-on");
+        let _spawn = FakeSpawnEnv::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind random port");
+        let websocket_url = format!("ws://{}", listener.local_addr().expect("addr"));
+        drop(listener);
+        let conn = create_state_db_in_memory().expect("db");
+        set_away_mode(&conn, true, 1000).expect("away on");
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: "thread_error".to_string(),
+            telegram: None,
+            codex: Some(crate::CodexConfig {
+                live_mode: crate::CodexLiveMode::Shared,
+                websocket_url,
+            }),
+            projects: Vec::new(),
+        };
+
+        let backend = reconcile_daemon_backend(&conn, &config, 2000);
+
+        assert_eq!(backend["ok"], true);
+        assert_eq!(backend["status"]["required"], true);
+        assert_eq!(backend["status"]["state"], "ready");
     }
 
     #[test]
