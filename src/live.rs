@@ -20,6 +20,13 @@ const LIVE_BACKEND_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_BACKEND_TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
 #[allow(dead_code)]
 const LIVE_BACKEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const LIVE_BACKEND_RECONCILE_BACKOFF_BASE_MS: u64 = 5_000;
+const LIVE_BACKEND_RECONCILE_BACKOFF_MAX_MS: u64 = 60_000;
+
+pub(crate) const LIVE_BACKEND_STATE_IDLE: &str = "idle";
+pub(crate) const LIVE_BACKEND_STATE_READY: &str = "ready";
+pub(crate) const LIVE_BACKEND_STATE_UNHEALTHY: &str = "unhealthy";
+pub(crate) const LIVE_BACKEND_STATE_BLOCKED: &str = "blocked";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +38,16 @@ pub(crate) struct LiveBackendStatus {
     pub(crate) process_start_key: Option<String>,
     pub(crate) healthy: bool,
     pub(crate) last_error: Option<String>,
+    #[serde(default)]
+    pub(crate) required: bool,
+    #[serde(default)]
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) recoverable: bool,
+    #[serde(default)]
+    pub(crate) reconcile_attempts: u32,
+    #[serde(default)]
+    pub(crate) retry_after_ms: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -56,14 +73,21 @@ impl Drop for LiveBackendLock {
 pub(crate) fn live_backend_status(config: &CodexConfig) -> Result<LiveBackendStatus> {
     validate_live_backend_config(config)?;
     let _lock = acquire_live_backend_lock()?;
-    live_backend_status_unlocked(config)
+    live_backend_status_unlocked(config, true)
+}
+
+#[allow(dead_code)]
+pub(crate) fn live_backend_idle_status(config: &CodexConfig) -> Result<LiveBackendStatus> {
+    validate_live_backend_config(config)?;
+    let _lock = acquire_live_backend_lock()?;
+    live_backend_status_unlocked(config, false)
 }
 
 #[allow(dead_code)]
 pub(crate) fn ensure_live_backend(config: &CodexConfig) -> Result<EnsureLiveBackendResult> {
     validate_live_backend_config(config)?;
     let _lock = acquire_live_backend_lock()?;
-    let status = live_backend_status_unlocked(config)?;
+    let status = live_backend_status_unlocked(config, true)?;
     if status.healthy {
         return Ok(EnsureLiveBackendResult {
             action: "reused".to_string(),
@@ -80,6 +104,75 @@ pub(crate) fn ensure_live_backend(config: &CodexConfig) -> Result<EnsureLiveBack
     }
 
     start_live_backend(config, "started")
+}
+
+#[allow(dead_code)]
+pub(crate) fn reconcile_live_backend(
+    config: &CodexConfig,
+    now_ms: u64,
+) -> Result<EnsureLiveBackendResult> {
+    validate_live_backend_config(config)?;
+    let _lock = acquire_live_backend_lock()?;
+    let status = live_backend_status_unlocked(config, true)?;
+    if status.healthy {
+        return Ok(EnsureLiveBackendResult {
+            action: "reused".to_string(),
+            status,
+        });
+    }
+    if status.state == LIVE_BACKEND_STATE_BLOCKED || !status.recoverable {
+        return Ok(EnsureLiveBackendResult {
+            action: "blocked".to_string(),
+            status,
+        });
+    }
+    if status
+        .retry_after_ms
+        .is_some_and(|retry_after| retry_after > now_ms)
+    {
+        return Ok(EnsureLiveBackendResult {
+            action: "deferred".to_string(),
+            status,
+        });
+    }
+
+    let attempts = status.reconcile_attempts.saturating_add(1);
+    if let Some(pid) = status.pid {
+        terminate_managed_backend_pid(
+            pid,
+            &config.websocket_url,
+            status.process_start_key.as_deref(),
+        );
+    }
+
+    match start_live_backend(config, "started") {
+        Ok(mut result) => {
+            result.status.reconcile_attempts = 0;
+            result.status.retry_after_ms = None;
+            write_live_backend_status(&result.status)?;
+            Ok(result)
+        }
+        Err(error) => {
+            let retry_after_ms = now_ms.saturating_add(reconcile_backoff_ms(attempts));
+            let mut failed =
+                read_live_backend_status()?.unwrap_or_else(|| empty_live_backend_status(config));
+            set_status_state(
+                &mut failed,
+                true,
+                LIVE_BACKEND_STATE_UNHEALTHY,
+                false,
+                true,
+                Some(format!("{error:#}")),
+            );
+            failed.reconcile_attempts = attempts;
+            failed.retry_after_ms = Some(retry_after_ms);
+            write_live_backend_status(&failed)?;
+            Ok(EnsureLiveBackendResult {
+                action: "deferred".to_string(),
+                status: failed,
+            })
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -107,26 +200,16 @@ pub(crate) fn reset_live_backend(config: &CodexConfig) -> Result<EnsureLiveBacke
 }
 
 #[allow(dead_code)]
-fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatus> {
+fn live_backend_status_unlocked(config: &CodexConfig, required: bool) -> Result<LiveBackendStatus> {
     let previous_status = read_live_backend_status()?;
     let mut status = previous_status
         .clone()
-        .unwrap_or_else(|| LiveBackendStatus {
-            websocket_url: config.websocket_url.clone(),
-            pid: None,
-            process_start_key: None,
-            healthy: false,
-            last_error: None,
-        });
+        .unwrap_or_else(|| empty_live_backend_status(config));
+    normalize_status_fields(&mut status, required);
 
     if status.websocket_url != config.websocket_url {
-        status = LiveBackendStatus {
-            websocket_url: config.websocket_url.clone(),
-            pid: None,
-            process_start_key: None,
-            healthy: false,
-            last_error: None,
-        };
+        status = empty_live_backend_status(config);
+        normalize_status_fields(&mut status, required);
     }
 
     backfill_process_start_key(&mut status);
@@ -144,6 +227,9 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         if let Some(pid) = discover_backend_pid_for_websocket_url(&config.websocket_url) {
             status.pid = Some(pid);
             status.process_start_key = backend_process_start_key(pid);
+        } else {
+            status.pid = None;
+            status.process_start_key = None;
         }
     }
 
@@ -155,14 +241,36 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         ),
         None => false,
     };
+    if !required && !managed_pid_matches {
+        set_status_state(
+            &mut status,
+            false,
+            LIVE_BACKEND_STATE_IDLE,
+            false,
+            true,
+            None,
+        );
+        if previous_status.as_ref() != Some(&status) {
+            write_live_backend_status(&status)?;
+        }
+        return Ok(status);
+    }
+
     match verify_live_backend_health(&config.websocket_url) {
         Ok(()) if managed_pid_matches => {
-            status.healthy = true;
-            status.last_error = None;
+            set_status_state(
+                &mut status,
+                required,
+                LIVE_BACKEND_STATE_READY,
+                true,
+                true,
+                None,
+            );
+            status.reconcile_attempts = 0;
+            status.retry_after_ms = None;
         }
         Ok(()) => {
-            status.healthy = false;
-            status.last_error = Some(match status.pid {
+            let last_error = Some(match status.pid {
                 Some(pid) => format!(
                     "managed live backend process {pid} is not running with the configured websocket URL"
                 ),
@@ -171,10 +279,35 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
                         .to_string()
                 }
             });
+            set_status_state(
+                &mut status,
+                required,
+                LIVE_BACKEND_STATE_BLOCKED,
+                false,
+                false,
+                last_error,
+            );
         }
         Err(error) => {
-            status.healthy = false;
-            status.last_error = Some(format!("{error:#}"));
+            if required {
+                set_status_state(
+                    &mut status,
+                    true,
+                    LIVE_BACKEND_STATE_UNHEALTHY,
+                    false,
+                    true,
+                    Some(format!("{error:#}")),
+                );
+            } else {
+                set_status_state(
+                    &mut status,
+                    false,
+                    LIVE_BACKEND_STATE_IDLE,
+                    false,
+                    true,
+                    None,
+                );
+            }
         }
     }
 
@@ -182,6 +315,62 @@ fn live_backend_status_unlocked(config: &CodexConfig) -> Result<LiveBackendStatu
         write_live_backend_status(&status)?;
     }
     Ok(status)
+}
+
+fn empty_live_backend_status(config: &CodexConfig) -> LiveBackendStatus {
+    LiveBackendStatus {
+        websocket_url: config.websocket_url.clone(),
+        pid: None,
+        process_start_key: None,
+        healthy: false,
+        last_error: None,
+        required: false,
+        state: LIVE_BACKEND_STATE_IDLE.to_string(),
+        recoverable: true,
+        reconcile_attempts: 0,
+        retry_after_ms: None,
+    }
+}
+
+fn normalize_status_fields(status: &mut LiveBackendStatus, required: bool) {
+    status.required = required;
+    if status.state.is_empty() {
+        status.state = if status.healthy {
+            LIVE_BACKEND_STATE_READY
+        } else if required {
+            LIVE_BACKEND_STATE_UNHEALTHY
+        } else {
+            LIVE_BACKEND_STATE_IDLE
+        }
+        .to_string();
+    }
+    if status.healthy {
+        status.recoverable = true;
+        status.reconcile_attempts = 0;
+        status.retry_after_ms = None;
+    }
+}
+
+fn set_status_state(
+    status: &mut LiveBackendStatus,
+    required: bool,
+    state: &str,
+    healthy: bool,
+    recoverable: bool,
+    last_error: Option<String>,
+) {
+    status.required = required;
+    status.state = state.to_string();
+    status.healthy = healthy;
+    status.recoverable = recoverable;
+    status.last_error = last_error;
+}
+
+fn reconcile_backoff_ms(attempts: u32) -> u64 {
+    let exponent = attempts.saturating_sub(1).min(4);
+    LIVE_BACKEND_RECONCILE_BACKOFF_BASE_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(LIVE_BACKEND_RECONCILE_BACKOFF_MAX_MS)
 }
 
 fn backfill_process_start_key(status: &mut LiveBackendStatus) {
@@ -253,6 +442,11 @@ fn wait_for_live_backend(
                     process_start_key: Some(process_start_key.to_string()),
                     healthy: true,
                     last_error: None,
+                    required: true,
+                    state: LIVE_BACKEND_STATE_READY.to_string(),
+                    recoverable: true,
+                    reconcile_attempts: 0,
+                    retry_after_ms: None,
                 };
                 write_live_backend_status(&status)?;
                 return Ok(status);
@@ -271,6 +465,11 @@ fn wait_for_live_backend(
         process_start_key: Some(process_start_key.to_string()),
         healthy: false,
         last_error,
+        required: true,
+        state: LIVE_BACKEND_STATE_UNHEALTHY.to_string(),
+        recoverable: true,
+        reconcile_attempts: 0,
+        retry_after_ms: None,
     };
     write_live_backend_status(&status)?;
 
@@ -1189,6 +1388,83 @@ mod tests {
         panic!("fake live backend did not become healthy at {websocket_url}");
     }
 
+    #[test]
+    fn optional_status_reports_idle_without_health_error_when_backend_is_not_required() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("optional-idle");
+        let websocket_url = random_websocket_url();
+
+        let status =
+            live_backend_idle_status(&shared_codex_config(&websocket_url)).expect("idle status");
+
+        assert_eq!(status.websocket_url, websocket_url);
+        assert_eq!(status.state, LIVE_BACKEND_STATE_IDLE);
+        assert!(!status.required);
+        assert!(!status.healthy);
+        assert!(status.recoverable);
+        assert_eq!(status.last_error, None);
+    }
+
+    #[test]
+    fn optional_status_clears_stale_pid_when_backend_is_not_required() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("optional-stale-pid");
+        let websocket_url = random_websocket_url();
+        let mut stale = empty_live_backend_status(&shared_codex_config(&websocket_url));
+        stale.pid = Some(77_777);
+        stale.process_start_key = Some("dead-test-process".to_string());
+        write_live_backend_status(&stale).expect("write stale status");
+
+        let status =
+            live_backend_idle_status(&shared_codex_config(&websocket_url)).expect("idle status");
+
+        assert_eq!(status.state, LIVE_BACKEND_STATE_IDLE);
+        assert_eq!(status.pid, None);
+        assert_eq!(status.process_start_key, None);
+        assert_eq!(status.last_error, None);
+    }
+
+    #[test]
+    fn required_status_reports_unhealthy_when_backend_is_missing() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("required-unhealthy");
+        let websocket_url = random_websocket_url();
+
+        let status = live_backend_status(&shared_codex_config(&websocket_url)).expect("status");
+
+        assert_eq!(status.state, LIVE_BACKEND_STATE_UNHEALTHY);
+        assert!(status.required);
+        assert!(!status.healthy);
+        assert!(status.recoverable);
+        assert!(status.last_error.is_some());
+    }
+
+    #[test]
+    fn reconcile_live_backend_defers_until_retry_time() {
+        let _guard = live_test_lock().lock().expect("live test lock");
+        let _home = TempHome::new("reconcile-defer");
+        let websocket_url = random_websocket_url();
+        let mut status = empty_live_backend_status(&shared_codex_config(&websocket_url));
+        set_status_state(
+            &mut status,
+            true,
+            LIVE_BACKEND_STATE_UNHEALTHY,
+            false,
+            true,
+            Some("previous startup failed".to_string()),
+        );
+        status.reconcile_attempts = 2;
+        status.retry_after_ms = Some(10_000);
+        write_live_backend_status(&status).expect("write deferred status");
+
+        let result =
+            reconcile_live_backend(&shared_codex_config(&websocket_url), 5_000).expect("reconcile");
+
+        assert_eq!(result.action, "deferred");
+        assert_eq!(result.status.retry_after_ms, Some(10_000));
+        assert_eq!(result.status.reconcile_attempts, 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_backend_screen_session_name_is_safe() {
@@ -1237,6 +1513,11 @@ mod tests {
             process_start_key: None,
             healthy: true,
             last_error: None,
+            required: true,
+            state: LIVE_BACKEND_STATE_READY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         };
         write_live_backend_status(&initial).expect("write initial status");
 
@@ -1266,6 +1547,11 @@ mod tests {
             process_start_key: Some("stale-test-process".to_string()),
             healthy: false,
             last_error: Some("socket closed".to_string()),
+            required: true,
+            state: LIVE_BACKEND_STATE_UNHEALTHY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         })
         .expect("write unhealthy status");
 
@@ -1327,6 +1613,11 @@ mod tests {
             process_start_key: Some("dead-test-process".to_string()),
             healthy: true,
             last_error: None,
+            required: true,
+            state: LIVE_BACKEND_STATE_READY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         })
         .expect("write stale status");
 
@@ -1399,6 +1690,11 @@ mod tests {
             process_start_key: None,
             healthy: true,
             last_error: None,
+            required: true,
+            state: LIVE_BACKEND_STATE_READY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         })
         .expect("write legacy status");
 
@@ -1493,6 +1789,11 @@ mod tests {
             process_start_key: backend_process_start_key(current_pid),
             healthy: false,
             last_error: Some("stale pid".to_string()),
+            required: true,
+            state: LIVE_BACKEND_STATE_UNHEALTHY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         })
         .expect("write stale status");
 
@@ -1577,6 +1878,11 @@ mod tests {
             process_start_key: None,
             healthy: false,
             last_error: Some("starting".to_string()),
+            required: true,
+            state: LIVE_BACKEND_STATE_UNHEALTHY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         };
         let updated = LiveBackendStatus {
             websocket_url,
@@ -1584,6 +1890,11 @@ mod tests {
             process_start_key: None,
             healthy: true,
             last_error: None,
+            required: true,
+            state: LIVE_BACKEND_STATE_READY.to_string(),
+            recoverable: true,
+            reconcile_attempts: 0,
+            retry_after_ms: None,
         };
 
         write_live_backend_status(&initial).expect("write initial");

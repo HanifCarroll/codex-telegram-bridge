@@ -10,6 +10,8 @@ struct BridgeStatus: Equatable {
 
     var mode: Mode
     var backendHealthy: Bool?
+    var backendState: String?
+    var backendRequired: Bool
     var backendError: String?
     var pendingNotifications: Int
     var configPath: String?
@@ -19,6 +21,8 @@ struct BridgeStatus: Equatable {
     static let loading = BridgeStatus(
         mode: .unknown,
         backendHealthy: nil,
+        backendState: nil,
+        backendRequired: false,
         backendError: nil,
         pendingNotifications: 0,
         configPath: nil,
@@ -32,7 +36,9 @@ struct BridgeStatus: Equatable {
         let codexConfigured = payload.codexConfigured ?? false
 
         self.backendHealthy = payload.backend?.healthy
-        self.backendError = payload.backend?.lastError
+        self.backendState = payload.backend?.state
+        self.backendRequired = payload.backend?.required ?? false
+        self.backendError = self.backendRequired ? payload.backend?.lastError : nil
         self.pendingNotifications = payload.pending ?? 0
         self.configPath = payload.configPath
         self.stateFolderPath = payload.stateFolderPath
@@ -55,6 +61,8 @@ struct BridgeStatus: Equatable {
     private init(
         mode: Mode,
         backendHealthy: Bool?,
+        backendState: String?,
+        backendRequired: Bool,
         backendError: String?,
         pendingNotifications: Int,
         configPath: String?,
@@ -63,6 +71,8 @@ struct BridgeStatus: Equatable {
     ) {
         self.mode = mode
         self.backendHealthy = backendHealthy
+        self.backendState = backendState
+        self.backendRequired = backendRequired
         self.backendError = backendError
         self.pendingNotifications = pendingNotifications
         self.configPath = configPath
@@ -87,5 +97,7 @@ struct BridgeAwayPayload: Decodable {
 
 struct BridgeBackendPayload: Decodable {
     let healthy: Bool?
+    let required: Bool?
+    let state: String?
     let lastError: String?
 }

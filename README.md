@@ -185,6 +185,8 @@ codex-telegram-bridge remote repair
 
 `remote on` starts or reuses the shared local `codex app-server` before enabling away mode. `remote off` behaves like `/back`: it disables away mode and clears pending Telegram notifications. `remote repair` restarts the shared backend and keeps remote mode on.
 
+When remote mode is off, the shared backend is optional. A stopped backend is reported as idle instead of repair-needed. While remote mode is on, the daemon reconciles the bridge-owned backend automatically and keeps `remote repair` as the explicit force-reset path.
+
 ### macOS Menu Bar App
 
 Build the native companion app from the repo root:
@@ -200,6 +202,14 @@ target/macos-menu-bar/Codex Bridge.app
 ```
 
 The app embeds the bridge binary inside the bundle so it can run from Finder or Login Items without relying on a shell `PATH`. Its menu shows the next useful remote-mode action: `Start Remote Mode` when remote mode is off, and `Stop Remote Mode` when it is on. It also exposes `Repair Connection`, `Refresh Status`, config access, and state-folder access.
+
+To install it as a normal local app, register it to open after restart, and launch it:
+
+```bash
+scripts/install_macos_menu_bar_app.sh
+```
+
+The installer copies the bundle to `~/Applications/Codex Bridge.app` by default. Use `--install-dir <path>`, `--no-login-item`, or `--no-open` when needed.
 
 ### Telegram
 

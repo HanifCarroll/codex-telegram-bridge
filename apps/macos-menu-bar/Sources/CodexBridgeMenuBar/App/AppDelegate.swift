@@ -249,11 +249,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var connectionTitle: String {
+        switch status.backendState {
+        case "idle":
+            return "Connection: Idle"
+        case "ready":
+            return "Connection: Ready"
+        case "blocked":
+            return "Connection: Needs Attention"
+        case "unhealthy" where status.backendRequired:
+            return "Connection: Needs Attention"
+        case "unhealthy":
+            return "Connection: Idle"
+        default:
+            break
+        }
         switch status.backendHealthy {
         case .some(true):
             return "Connection: Ready"
         case .some(false):
-            return "Connection: Needs Repair"
+            return status.backendRequired ? "Connection: Needs Attention" : "Connection: Idle"
         case .none:
             return "Connection: Not Checked"
         }
