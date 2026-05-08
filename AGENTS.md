@@ -9,3 +9,13 @@ Work tracking: GitHub Issues are canonical for repo-bound bugs, features, refact
 - Treat Superpowers as explicit heavy mode for large or risky work that needs specs, worktrees, subagent execution, code-review gates, and verification discipline. Do not use it by default for one-off bugs, small UI tweaks, routine refactors, or urgent fixes.
 - Every substantive Codex thread should have a named work item, desired outcome, acceptance criteria, risk notes, verification plan, and final status: done, blocked, parked, or split.
 - Matt issue/PRD/triage skills should read `docs/agents/issue-tracker.md`, `docs/agents/triage-labels.md`, and `docs/agents/domain.md` before publishing or labeling work.
+
+## macOS Menu Bar App
+
+The local launcher/update path for `Codex Bridge.app` is:
+
+```sh
+scripts/install_macos_menu_bar_app.sh
+```
+
+Run this from the repo root after changing the macOS menu bar app, the embedded bridge CLI behavior it depends on, or the app bundle scripts. The installer rebuilds the Rust bridge and Swift menu bar app, replaces `~/Applications/Codex Bridge.app`, re-registers the Login Item, and launches the updated app.
