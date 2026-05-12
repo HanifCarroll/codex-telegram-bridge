@@ -229,9 +229,9 @@ fn daemon_cycle(
 }
 
 pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> Result<()> {
-    let config = load_daemon_config()?;
     let db_path = state_db_path()?;
     let conn = create_state_db(&db_path)?;
+    let config = load_daemon_config()?;
     if once {
         let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
         println!("{}", serde_json::to_string(&result)?);
@@ -265,6 +265,7 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
     );
     let watch_rx = start_codex_watch_receiver().ok();
     loop {
+        let config = load_daemon_config()?;
         let result = daemon_cycle(&conn, &config, now_millis()?, timeout)?;
         println!("{}", serde_json::to_string(&result)?);
         if let Some(rx) = watch_rx.as_ref() {
@@ -889,6 +890,44 @@ mod tests {
         let on_count =
             enqueue_daemon_notification_events(&conn, &[event], 2000).expect("away on enqueue");
         assert_eq!(on_count, 1, "daemon should notify while user is away");
+    }
+
+    #[test]
+    fn daemon_delivery_skips_disabled_telegram_transport() {
+        let conn = create_state_db_in_memory().expect("db");
+        let event = json!({
+            "type": "thread_waiting",
+            "threadId": "thr_1",
+            "updatedAt": 1500
+        });
+        enqueue_outbound_event(&conn, &event, 2000).expect("enqueue event");
+        let config = DaemonConfig {
+            version: 4,
+            bridge_command: "bridge".to_string(),
+            events: "thread_waiting".to_string(),
+            telegram: Some(crate::TelegramConfig {
+                bot_token: "123:secret".to_string(),
+                chat_id: "456".to_string(),
+                allowed_user_id: None,
+                enabled: false,
+            }),
+            discord: None,
+            codex: Some(crate::CodexConfig {
+                live_mode: crate::CodexLiveMode::Shared,
+                websocket_url: "ws://127.0.0.1:9".to_string(),
+            }),
+            projects: Vec::new(),
+        };
+
+        let summary = deliver_outbound_events(&conn, &config, 3000, Duration::from_millis(10))
+            .expect("deliver disabled transport");
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.delivered, 1);
+        assert!(
+            !transport_delivery_exists(&conn, &notification_event_id(&event), "telegram")
+                .expect("delivery lookup")
+        );
     }
 
     #[test]
