@@ -592,6 +592,10 @@ pub(crate) fn state_db_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("state.db"))
 }
 
+pub(crate) fn remote_mode_status_path() -> Result<PathBuf> {
+    Ok(state_dir_path()?.join("remote-mode.json"))
+}
+
 #[allow(dead_code)]
 pub(crate) fn live_backend_status_path() -> Result<PathBuf> {
     Ok(state_dir_path()?.join("live-backend.json"))
@@ -640,6 +644,28 @@ pub(crate) fn get_setting_text(conn: &Connection, key: &str) -> Result<Option<St
     )
     .optional()
     .map_err(Into::into)
+}
+
+pub(crate) fn list_settings_with_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, value FROM settings
+         WHERE key LIKE ?1
+         ORDER BY key",
+    )?;
+    let pattern = format!("{prefix}%");
+    let rows = stmt.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub(crate) fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    Ok(())
 }
 
 pub(crate) fn upsert_thread_snapshot(
@@ -1926,6 +1952,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
+                enabled: true,
             },
         )
         .expect("extract command prompt reply")
@@ -1955,6 +1982,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
+                enabled: true,
             },
         )
         .expect("route")
@@ -1995,6 +2023,7 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
+                enabled: true,
             },
         )
         .expect("route")

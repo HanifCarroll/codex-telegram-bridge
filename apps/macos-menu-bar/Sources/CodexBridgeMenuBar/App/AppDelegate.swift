@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 @main
@@ -21,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isWorking = false
     private var lastUpdated: Date?
     private var lastError: String?
+    private var stateWatchSources: [DispatchSourceFileSystemObject] = []
+    private var watchedStateFolderPath: String?
+    private var observedRefreshTask: Task<Void, Never>?
+    private var periodicRefreshTimer: Timer?
 
     private struct ModePresentation {
         var menuTitle: String
@@ -31,8 +36,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
+        startPeriodicRefresh()
         rebuildMenu()
         Task { await refresh() }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        stopStateMonitoring()
+        periodicRefreshTimer?.invalidate()
+        observedRefreshTask?.cancel()
     }
 
     private func configureStatusItem() {
@@ -46,8 +58,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showMenu(_ sender: NSStatusBarButton) {
-        rebuildMenu()
-        statusItem.menu?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+        Task {
+            await refresh()
+            statusItem.menu?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+        }
     }
 
     private func rebuildMenu() {
@@ -56,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(disabledItem(status.detail))
         menu.addItem(disabledItem(connectionTitle))
         menu.addItem(disabledItem(queueTitle))
+        menu.addItem(disabledItem(channelTitle))
 
         if let lastUpdated {
             menu.addItem(disabledItem("Updated: \(lastUpdated.formatted(date: .omitted, time: .standard))"))
@@ -70,6 +85,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(primaryRemoteActionItem())
         menu.addItem(actionItem("Repair Connection", #selector(repair(_:)), enabled: !isWorking))
         menu.addItem(actionItem("Refresh Status", #selector(refreshFromMenu(_:)), enabled: !isWorking))
+
+        menu.addItem(.separator())
+        menu.addItem(telegramChannelActionItem())
+        menu.addItem(discordChannelActionItem())
 
         menu.addItem(.separator())
         menu.addItem(actionItem("Open Config File", #selector(openConfig(_:)), enabled: status.configPath != nil))
@@ -104,6 +123,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func telegramChannelActionItem() -> NSMenuItem {
+        let title = status.telegramEnabled ? "Disable Telegram" : "Enable Telegram"
+        return actionItem(title, #selector(toggleTelegram(_:)), enabled: !isWorking && status.telegramConfigured)
+    }
+
+    private func discordChannelActionItem() -> NSMenuItem {
+        let title = status.discordEnabled ? "Disable Discord" : "Enable Discord"
+        return actionItem(title, #selector(toggleDiscord(_:)), enabled: !isWorking && status.discordConfigured)
+    }
+
     @objc private func turnAway(_ sender: NSMenuItem) {
         Task { await runAction { try await self.client.turnAway() } }
     }
@@ -114,6 +143,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func repair(_ sender: NSMenuItem) {
         Task { await runAction { try await self.client.repair() } }
+    }
+
+    @objc private func toggleTelegram(_ sender: NSMenuItem) {
+        Task { await runAction { try await self.client.setTelegramEnabled(!self.status.telegramEnabled) } }
+    }
+
+    @objc private func toggleDiscord(_ sender: NSMenuItem) {
+        Task { await runAction { try await self.client.setDiscordEnabled(!self.status.discordEnabled) } }
     }
 
     @objc private func refreshFromMenu(_ sender: NSMenuItem) {
@@ -177,6 +214,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatus() async throws {
         status = try await client.status()
         lastUpdated = Date()
+        configureStateMonitoring(folderPath: status.stateFolderPath)
+    }
+
+    private func startPeriodicRefresh() {
+        periodicRefreshTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refresh()
+            }
+        }
+        timer.tolerance = 5
+        periodicRefreshTimer = timer
+    }
+
+    private func configureStateMonitoring(folderPath: String?) {
+        guard let folderPath, !folderPath.isEmpty, watchedStateFolderPath != folderPath else {
+            return
+        }
+
+        stopStateMonitoring()
+        watchedStateFolderPath = folderPath
+
+        for filename in ["remote-mode.json", "live-backend.json"] {
+            startMonitoring(path: URL(fileURLWithPath: folderPath).appendingPathComponent(filename).path)
+        }
+    }
+
+    private func startMonitoring(path: String) {
+        guard FileManager.default.fileExists(atPath: path) else {
+            return
+        }
+
+        let fileDescriptor = open(path, O_EVTONLY)
+        guard fileDescriptor >= 0 else {
+            return
+        }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileDescriptor,
+            eventMask: [.write, .delete, .rename],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            Task { @MainActor in
+                self?.scheduleObservedStateRefresh()
+            }
+        }
+        source.setCancelHandler {
+            close(fileDescriptor)
+        }
+        source.resume()
+        stateWatchSources.append(source)
+    }
+
+    private func stopStateMonitoring() {
+        stateWatchSources.forEach { $0.cancel() }
+        stateWatchSources.removeAll()
+        watchedStateFolderPath = nil
+    }
+
+    private func scheduleObservedStateRefresh() {
+        observedRefreshTask?.cancel()
+        observedRefreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            await self?.refresh()
+        }
     }
 
     private func updateStatusItemButton() {
@@ -275,12 +378,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var queueTitle: String {
         if status.pendingNotifications == 0 {
-            return "Queued Telegram Updates: None"
+            return "Queued Updates: None"
         }
         if status.pendingNotifications == 1 {
-            return "Queued Telegram Updates: 1"
+            return "Queued Updates: 1"
         }
-        return "Queued Telegram Updates: \(status.pendingNotifications)"
+        return "Queued Updates: \(status.pendingNotifications)"
+    }
+
+    private var channelTitle: String {
+        let telegram = status.telegramConfigured ? (status.telegramEnabled ? "Telegram On" : "Telegram Off") : "Telegram Setup"
+        let discord = status.discordConfigured ? (status.discordEnabled ? "Discord On" : "Discord Off") : "Discord Setup"
+        return "Channels: \(telegram), \(discord)"
     }
 
     private var currentIssue: String? {

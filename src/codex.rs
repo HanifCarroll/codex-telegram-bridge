@@ -23,9 +23,9 @@ use crate::now_millis;
 use crate::projects::derive_project_label;
 use crate::state::{
     clear_pending_outbound_events, derive_thread_display_name, get_setting_number,
-    get_setting_text, recent_actions_json, reconcile_thread_snapshots, set_setting,
-    set_setting_text, should_emit_for_away_window, upsert_thread_snapshot, BridgeThreadSnapshot,
-    PendingPrompt,
+    get_setting_text, recent_actions_json, reconcile_thread_snapshots, remote_mode_status_path,
+    set_setting, set_setting_text, should_emit_for_away_window, upsert_thread_snapshot,
+    BridgeThreadSnapshot, PendingPrompt,
 };
 use crate::ws::{validate_shared_websocket_url, WsJsonRpcTransport};
 
@@ -84,6 +84,20 @@ fn event_type(event: &Value) -> Option<&str> {
 
 fn summary_updated_at(summary: &Value) -> Option<u64> {
     summary.get("updatedAt").and_then(Value::as_u64)
+}
+
+fn turn_timestamp(turn: &Value) -> Option<u64> {
+    turn.get("completedAt")
+        .and_then(Value::as_u64)
+        .or_else(|| turn.get("updatedAt").and_then(Value::as_u64))
+        .or_else(|| turn.get("startedAt").and_then(Value::as_u64))
+}
+
+fn latest_turn_timestamp(thread: &Value) -> Option<u64> {
+    thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.iter().filter_map(turn_timestamp).max())
 }
 
 fn extract_item_text(item: &Value) -> Option<String> {
@@ -280,10 +294,18 @@ pub(crate) fn normalize_thread_snapshot(
                 .and_then(Value::as_str)
                 .map(|s| s.to_string())
         });
-    let updated_at = thread
+    let summary_or_thread_updated_at = thread
         .get("updatedAt")
         .and_then(Value::as_u64)
         .or_else(|| summary.get("updatedAt").and_then(Value::as_u64));
+    let updated_at = match (summary_or_thread_updated_at, latest_turn_timestamp(thread)) {
+        (Some(summary_updated_at), Some(turn_updated_at)) => {
+            Some(summary_updated_at.max(turn_updated_at))
+        }
+        (Some(summary_updated_at), None) => Some(summary_updated_at),
+        (None, Some(turn_updated_at)) => Some(turn_updated_at),
+        (None, None) => None,
+    };
     let status_type = thread
         .pointer("/status/type")
         .and_then(Value::as_str)
@@ -696,19 +718,21 @@ pub(crate) fn get_away_mode(conn: &Connection) -> Result<Value> {
             )?;
         }
     }
-    Ok(json!({
+    let state = json!({
         "ok": true,
         "away": get_setting_text(conn, "away")?.unwrap_or_default() == "true",
         "awayStartedAt": away_started_at,
         "awaySessionId": away_session_id
-    }))
+    });
+    write_remote_mode_status_marker(&state)?;
+    Ok(state)
 }
 
 pub(crate) fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<Value> {
     set_setting_text(conn, "away", if away { "true" } else { "false" })?;
     conn.execute("DELETE FROM settings WHERE key = ?1", params!["away_mode"])?;
 
-    if away {
+    let state = if away {
         let session_id = now.to_string();
         set_setting(conn, "away_started_at", now)?;
         conn.execute(
@@ -716,12 +740,12 @@ pub(crate) fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<V
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params!["away_session_id", session_id],
         )?;
-        Ok(json!({
+        json!({
             "ok": true,
             "away": true,
             "awayStartedAt": now,
             "awaySessionId": now.to_string()
-        }))
+        })
     } else {
         let cleared_pending = clear_pending_outbound_events(conn)?;
         conn.execute(
@@ -732,14 +756,36 @@ pub(crate) fn set_away_mode(conn: &Connection, away: bool, now: u64) -> Result<V
             "DELETE FROM settings WHERE key = ?1",
             params!["away_session_id"],
         )?;
-        Ok(json!({
+        json!({
             "ok": true,
             "away": false,
             "awayStartedAt": Value::Null,
             "awaySessionId": Value::Null,
             "clearedPendingNotifications": cleared_pending
-        }))
+        })
+    };
+    write_remote_mode_status_marker(&state)?;
+    Ok(state)
+}
+
+fn write_remote_mode_status_marker(state: &Value) -> Result<()> {
+    #[cfg(test)]
+    if env::var_os("CODEX_TELEGRAM_BRIDGE_STATE_DIR").is_none() {
+        return Ok(());
     }
+
+    let marker = json!({
+        "away": state.get("away").cloned().unwrap_or(Value::Bool(false)),
+        "awayStartedAt": state.get("awayStartedAt").cloned().unwrap_or(Value::Null),
+        "awaySessionId": state.get("awaySessionId").cloned().unwrap_or(Value::Null)
+    });
+    let content = serde_json::to_vec(&marker)?;
+    let path = remote_mode_status_path()?;
+    if fs::read(&path).ok().as_deref() == Some(content.as_slice()) {
+        return Ok(());
+    }
+    fs::write(path, content)?;
+    Ok(())
 }
 
 pub(crate) fn build_show_thread_result(
@@ -1833,9 +1879,42 @@ mod tests {
     use crate::{get_away_mode, set_away_mode};
     use serde_json::json;
     use std::collections::BTreeSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    struct TempStateDir {
+        previous_state_dir: Option<String>,
+        root: PathBuf,
+    }
+
+    impl TempStateDir {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "codex-telegram-bridge-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create temp state dir");
+            let previous_state_dir = std::env::var("CODEX_TELEGRAM_BRIDGE_STATE_DIR").ok();
+            std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", &root);
+            Self {
+                previous_state_dir,
+                root,
+            }
+        }
+    }
+
+    impl Drop for TempStateDir {
+        fn drop(&mut self) {
+            if let Some(previous_state_dir) = &self.previous_state_dir {
+                std::env::set_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR", previous_state_dir);
+            } else {
+                std::env::remove_var("CODEX_TELEGRAM_BRIDGE_STATE_DIR");
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn app_server_initialize_params_use_stable_capabilities() {
@@ -1851,6 +1930,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "final_answer".to_string(),
             telegram: None,
+            discord: None,
             codex: None,
             projects: Vec::new(),
         };
@@ -2598,6 +2678,38 @@ raise SystemExit(1)
     }
 
     #[test]
+    fn normalize_thread_snapshot_uses_latest_turn_timestamp_when_summary_is_stale() {
+        let snapshot = normalize_thread_snapshot(
+            &json!({
+                "id": "thr_done",
+                "name": "Done",
+                "updatedAt": 1000,
+                "lastTurnStatus": "completed",
+                "lastPreview": "Old summary"
+            }),
+            &json!({
+                "id": "thr_done",
+                "updatedAt": 1000,
+                "status": { "type": "idle", "activeFlags": [] },
+                "turns": [{
+                    "status": "completed",
+                    "completedAt": 2500,
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "Fresh answer"
+                    }]
+                }]
+            }),
+        )
+        .expect("snapshot");
+
+        assert_eq!(snapshot.updated_at, Some(2500));
+        assert_eq!(snapshot.last_turn_status.as_deref(), Some("completed"));
+        assert_eq!(snapshot.last_preview.as_deref(), Some("Fresh answer"));
+    }
+
+    #[test]
     fn completed_events_are_enriched_with_full_final_preview() {
         let sync_result = json!({
             "threads": [{
@@ -2912,6 +3024,30 @@ raise SystemExit(1)
         assert_eq!(disabled["away"], false);
         assert_eq!(disabled["awayStartedAt"], Value::Null);
         assert_eq!(disabled["awaySessionId"], Value::Null);
+    }
+
+    #[test]
+    fn away_mode_writes_remote_mode_status_marker() {
+        let _guard = test_env_lock().lock().expect("env lock");
+        let state_dir = TempStateDir::new("remote-mode-marker");
+        let conn = create_state_db_in_memory().expect("db");
+
+        set_away_mode(&conn, true, 1234).expect("enable away");
+        let marker_path = state_dir.root.join("remote-mode.json");
+        let enabled_marker: Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("read enabled marker"))
+                .expect("parse enabled marker");
+        assert_eq!(enabled_marker["away"], true);
+        assert_eq!(enabled_marker["awayStartedAt"], 1234);
+        assert_eq!(enabled_marker["awaySessionId"], "1234");
+
+        set_away_mode(&conn, false, 1500).expect("disable away");
+        let disabled_marker: Value =
+            serde_json::from_slice(&std::fs::read(&marker_path).expect("read disabled marker"))
+                .expect("parse disabled marker");
+        assert_eq!(disabled_marker["away"], false);
+        assert_eq!(disabled_marker["awayStartedAt"], Value::Null);
+        assert_eq!(disabled_marker["awaySessionId"], Value::Null);
     }
 
     #[test]

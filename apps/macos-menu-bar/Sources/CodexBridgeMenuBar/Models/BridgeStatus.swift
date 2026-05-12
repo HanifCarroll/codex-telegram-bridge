@@ -14,6 +14,10 @@ struct BridgeStatus: Equatable {
     var backendRequired: Bool
     var backendError: String?
     var pendingNotifications: Int
+    var telegramConfigured: Bool
+    var telegramEnabled: Bool
+    var discordConfigured: Bool
+    var discordEnabled: Bool
     var configPath: String?
     var stateFolderPath: String?
     var detail: String
@@ -25,6 +29,10 @@ struct BridgeStatus: Equatable {
         backendRequired: false,
         backendError: nil,
         pendingNotifications: 0,
+        telegramConfigured: false,
+        telegramEnabled: false,
+        discordConfigured: false,
+        discordEnabled: false,
         configPath: nil,
         stateFolderPath: nil,
         detail: "Loading"
@@ -40,18 +48,22 @@ struct BridgeStatus: Equatable {
         self.backendRequired = payload.backend?.required ?? false
         self.backendError = self.backendRequired ? payload.backend?.lastError : nil
         self.pendingNotifications = payload.pending ?? 0
+        self.telegramConfigured = payload.telegramConfigured ?? false
+        self.telegramEnabled = payload.telegramEnabled ?? false
+        self.discordConfigured = payload.discordConfigured ?? false
+        self.discordEnabled = payload.discordEnabled ?? false
         self.configPath = payload.configPath
         self.stateFolderPath = payload.stateFolderPath
 
         if !configured || !codexConfigured {
             self.mode = .unavailable
-            self.detail = "Run setup to enable Telegram control."
+            self.detail = "Run setup to enable remote control."
         } else if isAway == true {
             self.mode = .away
-            self.detail = "Telegram notifications are on."
+            self.detail = "Remote notifications are on."
         } else if isAway == false {
             self.mode = .back
-            self.detail = "Telegram notifications are off."
+            self.detail = "Remote notifications are off."
         } else {
             self.mode = .unknown
             self.detail = "Status is not available yet."
@@ -65,6 +77,10 @@ struct BridgeStatus: Equatable {
         backendRequired: Bool,
         backendError: String?,
         pendingNotifications: Int,
+        telegramConfigured: Bool,
+        telegramEnabled: Bool,
+        discordConfigured: Bool,
+        discordEnabled: Bool,
         configPath: String?,
         stateFolderPath: String?,
         detail: String
@@ -75,6 +91,10 @@ struct BridgeStatus: Equatable {
         self.backendRequired = backendRequired
         self.backendError = backendError
         self.pendingNotifications = pendingNotifications
+        self.telegramConfigured = telegramConfigured
+        self.telegramEnabled = telegramEnabled
+        self.discordConfigured = discordConfigured
+        self.discordEnabled = discordEnabled
         self.configPath = configPath
         self.stateFolderPath = stateFolderPath
         self.detail = detail
@@ -84,6 +104,10 @@ struct BridgeStatus: Equatable {
 struct BridgeStatusPayload: Decodable {
     let configured: Bool?
     let codexConfigured: Bool?
+    let telegramConfigured: Bool?
+    let telegramEnabled: Bool?
+    let discordConfigured: Bool?
+    let discordEnabled: Bool?
     let away: BridgeAwayPayload?
     let backend: BridgeBackendPayload?
     let pending: Int?

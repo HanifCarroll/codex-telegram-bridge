@@ -12,12 +12,16 @@ use crate::codex::{
     filter_watch_events, parse_event_filter, start_codex_watch_receiver, sync_state_from_live,
     watch_events_from_sync_result, watch_thread_error_event, CodexAppServerClient,
 };
+use crate::discord::{deliver_discord_event, process_discord_updates};
 use crate::state::{
     create_state_db, deliver_due_outbound_events, enqueue_outbound_event, pending_outbound_count,
     record_transport_delivery, should_emit_for_away_window, state_db_path,
     transport_delivery_exists, OutboxDeliverySummary,
 };
-use crate::telegram::{deliver_telegram_event, process_telegram_updates, telegram_set_my_commands};
+use crate::telegram::{
+    deliver_telegram_event, process_telegram_updates, refresh_telegram_typing_indicators,
+    telegram_set_my_commands,
+};
 use crate::{
     daemon_config_path, load_daemon_config, notification_event_id, now_millis, shell_quote,
     state_dir_path, DaemonConfig,
@@ -120,18 +124,31 @@ fn deliver_outbound_events(
 ) -> Result<OutboxDeliverySummary> {
     deliver_due_outbound_events(conn, now, 100, |event| {
         let event_id = notification_event_id(event);
-        let telegram = config
-            .telegram
-            .as_ref()
-            .context("Telegram is not configured. Run setup first.")?;
-        let result = if transport_delivery_exists(conn, &event_id, "telegram")? {
-            json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
-        } else {
-            let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
-            record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
-            result
-        };
-        Ok(json!({ "telegram": result }))
+        let telegram =
+            if let Some(telegram) = config.telegram.as_ref().filter(|telegram| telegram.enabled) {
+                if transport_delivery_exists(conn, &event_id, "telegram")? {
+                    json!({ "ok": true, "transport": "telegram", "skipped": "already_delivered" })
+                } else {
+                    let result = deliver_telegram_event(conn, telegram, event, now, timeout)?;
+                    record_transport_delivery(conn, &event_id, "telegram", &result, now)?;
+                    result
+                }
+            } else {
+                Value::Null
+            };
+        let discord =
+            if let Some(discord) = config.discord.as_ref().filter(|discord| discord.enabled) {
+                if transport_delivery_exists(conn, &event_id, "discord")? {
+                    json!({ "ok": true, "transport": "discord", "skipped": "already_delivered" })
+                } else {
+                    let result = deliver_discord_event(conn, discord, event, now, timeout)?;
+                    record_transport_delivery(conn, &event_id, "discord", &result, now)?;
+                    result
+                }
+            } else {
+                Value::Null
+            };
+        Ok(json!({ "telegram": telegram, "discord": discord }))
     })
 }
 
@@ -160,12 +177,39 @@ fn daemon_cycle(
     } else {
         OutboxDeliverySummary::default()
     };
-    let telegram_updates = match config.telegram.as_ref() {
-        Some(_) => match process_telegram_updates(conn, config, now, timeout) {
+    let telegram_updates = match config.telegram.as_ref().filter(|telegram| telegram.enabled) {
+        Some(telegram) => {
+            let typing = refresh_telegram_typing_indicators(conn, telegram, now, timeout)
+                .unwrap_or_else(|error| {
+                    json!({
+                        "ok": false,
+                        "transport": "telegram",
+                        "error": format!("{error:#}")
+                    })
+                });
+            match process_telegram_updates(conn, config, now, timeout) {
+                Ok(mut result) => {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("typing".to_string(), typing);
+                    }
+                    result
+                }
+                Err(error) => json!({
+                    "ok": false,
+                    "transport": "telegram",
+                    "typing": typing,
+                    "error": format!("{error:#}")
+                }),
+            }
+        }
+        None => Value::Null,
+    };
+    let discord_updates = match config.discord.as_ref().filter(|discord| discord.enabled) {
+        Some(_) => match process_discord_updates(conn, config, now, timeout) {
             Ok(result) => result,
             Err(error) => json!({
                 "ok": false,
-                "transport": "telegram",
+                "transport": "discord",
                 "error": format!("{error:#}")
             }),
         },
@@ -179,6 +223,7 @@ fn daemon_cycle(
         "backend": backend,
         "delivery": delivery,
         "telegramUpdates": telegram_updates,
+        "discordUpdates": discord_updates,
         "pending": pending_outbound_count(conn)?
     }))
 }
@@ -193,16 +238,20 @@ pub(crate) fn run_daemon(once: bool, poll_interval: u64, timeout: Duration) -> R
         return Ok(());
     }
 
-    let telegram_commands = config.telegram.as_ref().map(|telegram| {
-        telegram_set_my_commands(telegram, timeout)
-            .map(|_| json!({ "registered": true }))
-            .unwrap_or_else(|error| {
-                json!({
-                    "registered": false,
-                    "error": format!("{error:#}")
+    let telegram_commands = config
+        .telegram
+        .as_ref()
+        .filter(|telegram| telegram.enabled)
+        .map(|telegram| {
+            telegram_set_my_commands(telegram, timeout)
+                .map(|_| json!({ "registered": true }))
+                .unwrap_or_else(|error| {
+                    json!({
+                        "registered": false,
+                        "error": format!("{error:#}")
+                    })
                 })
-            })
-    });
+        });
 
     println!(
         "{}",
@@ -850,6 +899,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_error".to_string(),
             telegram: None,
+            discord: None,
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
@@ -873,6 +923,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_error".to_string(),
             telegram: None,
+            discord: None,
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:9".to_string(),
@@ -900,6 +951,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_error".to_string(),
             telegram: None,
+            discord: None,
             codex: Some(crate::CodexConfig {
                 live_mode: crate::CodexLiveMode::Shared,
                 websocket_url,

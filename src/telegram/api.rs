@@ -96,6 +96,37 @@ pub(crate) fn telegram_send_text_message_id(
         .context("Telegram sendMessage response missing result.message_id")
 }
 
+#[cfg(not(test))]
+pub(crate) fn telegram_send_chat_action(
+    telegram: &TelegramConfig,
+    action: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    telegram_api_post(
+        &telegram.bot_token,
+        "sendChatAction",
+        &json!({
+            "chat_id": telegram.chat_id,
+            "action": action
+        }),
+        timeout,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn telegram_send_chat_action(
+    telegram: &TelegramConfig,
+    action: &str,
+    _timeout: Duration,
+) -> Result<Value> {
+    Ok(json!({
+        "ok": true,
+        "result": true,
+        "chat_id": telegram.chat_id,
+        "action": action
+    }))
+}
+
 pub(crate) fn telegram_bot_commands() -> Vec<Value> {
     vec![
         json!({ "command": "start", "description": "Pair and show remote control help" }),
@@ -104,6 +135,10 @@ pub(crate) fn telegram_bot_commands() -> Vec<Value> {
         json!({ "command": "back", "description": "Stop remote Codex mode" }),
         json!({ "command": "repair", "description": "Fix remote Codex mode" }),
         json!({ "command": "status", "description": "Show remote Codex status" }),
+        json!({ "command": "telegram_on", "description": "Enable Telegram channel" }),
+        json!({ "command": "telegram_off", "description": "Disable Telegram channel" }),
+        json!({ "command": "discord_on", "description": "Enable Discord channel" }),
+        json!({ "command": "discord_off", "description": "Disable Discord channel" }),
         json!({ "command": "threads", "description": "Show recent Codex threads" }),
         json!({ "command": "new", "description": "Start a new Codex thread" }),
         json!({ "command": "project", "description": "Show or switch the current project" }),
@@ -194,7 +229,21 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["start", "help", "away", "back", "repair", "status", "threads", "new", "project",]
+            vec![
+                "start",
+                "help",
+                "away",
+                "back",
+                "repair",
+                "status",
+                "telegram_on",
+                "telegram_off",
+                "discord_on",
+                "discord_off",
+                "threads",
+                "new",
+                "project",
+            ]
         );
         for removed in [
             "away_on",

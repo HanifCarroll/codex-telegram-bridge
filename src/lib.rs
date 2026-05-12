@@ -10,6 +10,7 @@ mod cli;
 mod codex;
 mod config;
 mod daemon;
+mod discord;
 mod live;
 mod mcp;
 mod projects;
@@ -18,8 +19,8 @@ mod telegram;
 mod ws;
 
 use crate::cli::{
-    AwayCommands, Cli, Commands, DaemonCommands, HermesCommands, ProjectCommands, RemoteCommands,
-    TelegramCommands,
+    AwayCommands, Cli, Commands, DaemonCommands, DiscordCommands, HermesCommands, ProjectCommands,
+    RemoteCommands, TelegramCommands,
 };
 use crate::codex::{
     attach_follow_result, build_show_thread_result, classify_app_server_error_message,
@@ -37,6 +38,9 @@ use crate::daemon::{
     run_daemon, start_daemon_service, stop_daemon_service, uninstall_daemon_service,
     DEFAULT_DAEMON_LABEL,
 };
+use crate::discord::{
+    discord_set_enabled_result, discord_setup_result, discord_status_result, discord_test_result,
+};
 use crate::mcp::run_mcp_server;
 use crate::projects::{build_registered_project, ensure_unique_project_id, slugify_project_token};
 use crate::state::{
@@ -52,14 +56,16 @@ use crate::state::{
     transport_delivery_exists, OutboxDeliverySummary,
 };
 use crate::telegram::{
-    telegram_disable_result, telegram_setup_result, telegram_status_result, telegram_test_result,
+    telegram_set_enabled_result, telegram_setup_result, telegram_status_result,
+    telegram_test_result,
 };
 use clap::Parser;
 pub(crate) use config::{
-    daemon_config_path, load_daemon_config, merged_daemon_config, read_daemon_config_raw,
-    redacted_daemon_config, resolve_telegram_bot_token, write_daemon_config, CodexConfig,
-    CodexLiveMode, DaemonConfig, RegisteredProject, SetupOptions, TelegramConfig,
-    TelegramSetupOptions,
+    daemon_config_path, discord_config_channel_ids, discord_config_enabled, load_daemon_config,
+    merged_daemon_config, read_daemon_config_raw, redacted_daemon_config,
+    resolve_discord_bot_token, resolve_telegram_bot_token, telegram_config_enabled,
+    write_daemon_config, CodexConfig, CodexLiveMode, DaemonConfig, DiscordConfig,
+    DiscordSetupOptions, RegisteredProject, SetupOptions, TelegramConfig, TelegramSetupOptions,
 };
 #[allow(unused_imports)]
 pub(crate) use live::{
@@ -101,6 +107,9 @@ struct DoctorBridge {
     config_path: String,
     config_exists: bool,
     telegram_configured: bool,
+    telegram_enabled: bool,
+    discord_configured: bool,
+    discord_enabled: bool,
     codex_configured: bool,
     codex_live_mode: Option<String>,
     codex_websocket_url: Option<String>,
@@ -465,6 +474,10 @@ fn run() -> Result<()> {
                 let result = telegram_status_result()?;
                 println!("{}", serde_json::to_string(&result)?);
             }
+            TelegramCommands::Enable { dry_run } => {
+                let result = telegram_set_enabled_result(true, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
             TelegramCommands::Test {
                 message,
                 timeout_ms,
@@ -475,7 +488,50 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string(&result)?);
             }
             TelegramCommands::Disable { dry_run } => {
-                let result = telegram_disable_result(dry_run)?;
+                let result = telegram_set_enabled_result(false, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+        },
+        Commands::Discord { command } => match command {
+            DiscordCommands::Setup {
+                bot_token,
+                channel_ids,
+                allowed_user_id,
+                events,
+                bridge_command,
+                websocket_url,
+                dry_run,
+            } => {
+                let result = discord_setup_result(DiscordSetupOptions {
+                    bot_token: bot_token.as_deref(),
+                    channel_ids: &channel_ids,
+                    allowed_user_id: allowed_user_id.as_deref(),
+                    events: &events,
+                    bridge_command: &bridge_command,
+                    websocket_url: &websocket_url,
+                    dry_run,
+                })?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DiscordCommands::Status => {
+                let result = discord_status_result()?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DiscordCommands::Enable { dry_run } => {
+                let result = discord_set_enabled_result(true, dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DiscordCommands::Test {
+                message,
+                timeout_ms,
+                dry_run,
+            } => {
+                let result =
+                    discord_test_result(&message, Duration::from_millis(timeout_ms), dry_run)?;
+                println!("{}", serde_json::to_string(&result)?);
+            }
+            DiscordCommands::Disable { dry_run } => {
+                let result = discord_set_enabled_result(false, dry_run)?;
                 println!("{}", serde_json::to_string(&result)?);
             }
         },
@@ -983,6 +1039,8 @@ fn daemon_run_command(bridge_command: &str) -> String {
 fn doctor_bridge() -> Result<DoctorBridge> {
     let config_path = daemon_config_path()?;
     let config = read_daemon_config_raw()?;
+    let telegram = config.as_ref().and_then(|config| config.telegram.as_ref());
+    let discord = config.as_ref().and_then(|config| config.discord.as_ref());
     let codex = config.as_ref().and_then(|config| config.codex.as_ref());
     let (live_backend_healthy, live_backend_pid, live_backend_error) = match codex {
         Some(codex) => match live::live_backend_status(codex) {
@@ -1000,10 +1058,10 @@ fn doctor_bridge() -> Result<DoctorBridge> {
     Ok(DoctorBridge {
         config_path: config_path.display().to_string(),
         config_exists: config_path.exists(),
-        telegram_configured: config
-            .as_ref()
-            .and_then(|config| config.telegram.as_ref())
-            .is_some(),
+        telegram_configured: telegram.is_some(),
+        telegram_enabled: telegram_config_enabled(telegram),
+        discord_configured: discord.is_some(),
+        discord_enabled: discord_config_enabled(discord),
         codex_configured: codex.is_some(),
         codex_live_mode: codex.map(|codex| match codex.live_mode {
             CodexLiveMode::Shared => "shared".to_string(),
@@ -1138,6 +1196,9 @@ fn remote_mode_status_payload(
         "stateFolderPath": state_dir_path()?.display().to_string(),
         "configured": config.is_some(),
         "telegramConfigured": config.as_ref().and_then(|config| config.telegram.as_ref()).is_some(),
+        "telegramEnabled": telegram_config_enabled(config.as_ref().and_then(|config| config.telegram.as_ref())),
+        "discordConfigured": config.as_ref().and_then(|config| config.discord.as_ref()).is_some(),
+        "discordEnabled": discord_config_enabled(config.as_ref().and_then(|config| config.discord.as_ref())),
         "codexConfigured": config.as_ref().and_then(|config| config.codex.as_ref()).is_some(),
         "away": away,
         "backend": backend,
@@ -1569,6 +1630,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: "thread_waiting".to_string(),
             telegram: None,
+            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: websocket_url.to_string(),

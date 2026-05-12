@@ -123,6 +123,8 @@ Inbound Telegram replies and button callbacks are processed whenever the daemon 
 
 When Codex needs attention and you are away, the daemon sends a Telegram message. Reply directly to that Telegram message with the exact text you want sent to Codex. The daemon reads Telegram updates by long polling, looks up the original Telegram message id in SQLite, sends the reply through the shared live Codex backend, and lets the next sync cycle deliver Codex's answer when the turn finishes.
 
+After a Telegram reply, approval callback, or `/new` prompt starts a Codex turn, the daemon refreshes Telegram's `typing` chat action until the answer is delivered or the short-lived typing window expires.
+
 For approval prompts, use the `Approve` or `Deny` buttons. The callback data contains only an opaque route id; the thread id stays in the local SQLite route table.
 
 ## Recent Threads From Telegram
@@ -208,11 +210,12 @@ Use a Telegram bot token dedicated to this bridge. Telegram update delivery shou
 
 ```bash
 codex-telegram-bridge telegram status
+codex-telegram-bridge telegram enable
 codex-telegram-bridge telegram disable --dry-run
 codex-telegram-bridge telegram disable
 ```
 
-Disabling Telegram removes the daemon config file because Telegram is the only supported notification transport.
+Disabling Telegram pauses Telegram delivery and bot polling without deleting the bot token, chat id, Discord setup, or shared Codex backend config. Re-enable it with `telegram enable`, the menu bar app, or `/telegram_on` from an enabled bot channel.
 
 ## Security Notes
 
@@ -236,7 +239,7 @@ The bridge does not keep historical token versions. Once the config file is repl
 
 The local bridge state lives under `~/.codex-telegram-bridge/` and typically contains:
 
-- `config.json`: bridge/Telegram config and project registry
+- `config.json`: bridge transport config and project registry
 - `state.db`: cached thread metadata, message routing ids, inbound update dedupe, and other local bridge state
 - `daemon.out.log` and `daemon.err.log`: daemon logs
 

@@ -1,10 +1,9 @@
 mod api;
-mod render;
+pub(crate) mod render;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use std::fs;
 use std::thread;
 use std::time::Duration;
 
@@ -15,13 +14,14 @@ use crate::codex::{
 use crate::live::EnsureLiveBackendResult;
 use crate::projects::{resolve_new_thread_request, resolve_project_query};
 use crate::state::{
-    get_setting_number, get_telegram_current_project_id, insert_telegram_callback_route,
-    insert_telegram_command_route, insert_telegram_message_route,
+    delete_setting, get_setting_number, get_telegram_current_project_id,
+    insert_telegram_callback_route, insert_telegram_command_route, insert_telegram_message_route,
     list_recent_thread_snapshots_from_db, lookup_telegram_command_route,
     lookup_telegram_message_route, mark_telegram_command_route_used, observed_workspaces_from_db,
-    record_action, record_telegram_inbound_processed, set_setting, set_telegram_current_project_id,
-    telegram_inbound_processed, update_telegram_callback_message_id, BridgeThreadSnapshot,
-    TelegramCallbackAction, TelegramCommandRouteKind, TelegramInboundLogContext,
+    record_action, record_telegram_inbound_processed, set_setting, set_setting_text,
+    set_telegram_current_project_id, telegram_inbound_processed,
+    update_telegram_callback_message_id, BridgeThreadSnapshot, TelegramCallbackAction,
+    TelegramCommandRouteKind, TelegramInboundLogContext,
 };
 use crate::ws::validate_shared_websocket_url;
 use crate::{
@@ -34,8 +34,8 @@ use crate::{
 use self::api::{
     telegram_answer_callback_query, telegram_bot_commands, telegram_chat_id,
     telegram_delete_webhook, telegram_from_user_id, telegram_get_updates, telegram_message_id,
-    telegram_send_message, telegram_send_text, telegram_send_text_message_id,
-    telegram_updates_array,
+    telegram_send_chat_action, telegram_send_message, telegram_send_text,
+    telegram_send_text_message_id, telegram_updates_array,
 };
 use self::render::{
     prepare_telegram_delivery, prepare_telegram_thread_snapshot_delivery, telegram_help_text,
@@ -53,6 +53,10 @@ enum TelegramInboundCommand {
     Back,
     Repair,
     Status,
+    TelegramOn,
+    TelegramOff,
+    DiscordOn,
+    DiscordOff,
     Threads(Option<String>),
     NewThread(Option<String>),
     Project(Option<String>),
@@ -61,6 +65,8 @@ enum TelegramInboundCommand {
 
 const DEFAULT_TELEGRAM_THREADS_LIMIT: u64 = 5;
 const MAX_TELEGRAM_THREADS_LIMIT: u64 = 25;
+const TELEGRAM_TYPING_TTL_MS: u64 = 120_000;
+const TELEGRAM_TYPING_REFRESH_MS: u64 = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutedTelegramCommandPromptReply {
@@ -116,6 +122,7 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            enabled: true,
         }
     } else if options.dry_run {
         TelegramConfig {
@@ -126,6 +133,7 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            enabled: true,
         }
     } else {
         discover_telegram_pairing(&bot_token, options.pair_timeout_ms)?
@@ -186,11 +194,13 @@ pub(crate) fn telegram_setup_result(options: TelegramSetupOptions<'_>) -> Result
 
 pub(crate) fn telegram_status_result() -> Result<Value> {
     let config = read_daemon_config_raw()?;
+    let telegram = config.as_ref().and_then(|config| config.telegram.as_ref());
     Ok(json!({
         "ok": true,
         "action": "telegram_status",
         "configPath": daemon_config_path()?.display().to_string(),
-        "configured": config.as_ref().and_then(|config| config.telegram.as_ref()).is_some(),
+        "configured": telegram.is_some(),
+        "enabled": telegram.map(|telegram| telegram.enabled).unwrap_or(false),
         "config": config.as_ref().map(redacted_daemon_config)
     }))
 }
@@ -253,25 +263,35 @@ pub(crate) fn telegram_test_result(
     }))
 }
 
-pub(crate) fn telegram_disable_result(dry_run: bool) -> Result<Value> {
+pub(crate) fn telegram_set_enabled_result(enabled: bool, dry_run: bool) -> Result<Value> {
     let path = daemon_config_path()?;
-    let config = read_daemon_config_raw()?;
-    let had_telegram = config
-        .as_ref()
-        .and_then(|config| config.telegram.as_ref())
-        .is_some();
-    let removes_config = config.is_some();
-    if !dry_run && removes_config && path.exists() {
-        fs::remove_file(&path)?;
+    let mut config =
+        read_daemon_config_raw()?.context("daemon config is missing. Run telegram setup first.")?;
+    let telegram = config
+        .telegram
+        .as_mut()
+        .context("Telegram is not configured. Run telegram setup first.")?;
+    let previous_enabled = telegram.enabled;
+    telegram.enabled = enabled;
+    if !dry_run {
+        write_daemon_config(&config)?;
     }
     Ok(json!({
         "ok": true,
-        "action": "telegram_disable",
+        "action": if enabled { "telegram_enable" } else { "telegram_disable" },
         "dryRun": dry_run,
-        "hadTelegram": had_telegram,
-        "removedConfig": removes_config,
-        "configPath": path.display().to_string()
+        "configured": true,
+        "previousEnabled": previous_enabled,
+        "enabled": enabled,
+        "configPath": path.display().to_string(),
+        "config": redacted_daemon_config(&config)
     }))
+}
+
+#[cfg(test)]
+#[cfg(test)]
+pub(crate) fn telegram_disable_result(dry_run: bool) -> Result<Value> {
+    telegram_set_enabled_result(false, dry_run)
 }
 
 fn discover_telegram_pairing(bot_token: &str, timeout_ms: u64) -> Result<TelegramConfig> {
@@ -295,6 +315,7 @@ fn discover_telegram_pairing(bot_token: &str, timeout_ms: u64) -> Result<Telegra
                     bot_token: bot_token.to_string(),
                     chat_id,
                     allowed_user_id,
+                    enabled: true,
                 });
             }
         }
@@ -340,6 +361,10 @@ fn parse_telegram_command_text(text: &str) -> Option<TelegramInboundCommand> {
         "/back" => Some(TelegramInboundCommand::Back),
         "/repair" => Some(TelegramInboundCommand::Repair),
         "/status" => Some(TelegramInboundCommand::Status),
+        "/telegram_on" => Some(TelegramInboundCommand::TelegramOn),
+        "/telegram_off" => Some(TelegramInboundCommand::TelegramOff),
+        "/discord_on" => Some(TelegramInboundCommand::DiscordOn),
+        "/discord_off" => Some(TelegramInboundCommand::DiscordOff),
         "/threads" => Some(TelegramInboundCommand::Threads(rest.map(str::to_string))),
         "/new" => Some(TelegramInboundCommand::NewThread(rest.map(str::to_string))),
         "/project" => Some(TelegramInboundCommand::Project(rest.map(str::to_string))),
@@ -551,6 +576,9 @@ fn deliver_prepared_telegram_delivery(
         route.message_id = Some(first_message_id);
         update_telegram_callback_message_id(conn, &route.callback_id, first_message_id)?;
     }
+    if let Some(thread_id) = prepared.thread_id.as_deref() {
+        clear_telegram_typing_indicator(conn, telegram, thread_id)?;
+    }
     Ok(json!({
         "ok": true,
         "transport": "telegram",
@@ -571,6 +599,100 @@ fn send_recent_thread_snapshot(
 ) -> Result<Value> {
     let mut prepared = prepare_telegram_thread_snapshot_delivery(&telegram.chat_id, snapshot)?;
     deliver_prepared_telegram_delivery(conn, telegram, &mut prepared, now, timeout)
+}
+
+fn telegram_typing_key(chat_id: &str, thread_id: &str) -> String {
+    format!("telegram_typing:{chat_id}:{thread_id}")
+}
+
+fn register_telegram_typing_indicator(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    thread_id: &str,
+    now: u64,
+) -> Result<()> {
+    set_setting_text(
+        conn,
+        &telegram_typing_key(&telegram.chat_id, thread_id),
+        &json!({
+            "chatId": telegram.chat_id,
+            "threadId": thread_id,
+            "until": now + TELEGRAM_TYPING_TTL_MS,
+            "nextAt": now
+        })
+        .to_string(),
+    )
+}
+
+pub(crate) fn refresh_telegram_typing_indicators(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    now: u64,
+    timeout: Duration,
+) -> Result<Value> {
+    let rows = crate::state::list_settings_with_prefix(conn, "telegram_typing:")?;
+    let mut active = 0usize;
+    let mut sent = 0usize;
+    let mut expired = 0usize;
+    let mut failed = 0usize;
+    for (key, raw) in rows {
+        let value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => {
+                delete_setting(conn, &key)?;
+                expired += 1;
+                continue;
+            }
+        };
+        let chat_id = value.get("chatId").and_then(Value::as_str);
+        if chat_id != Some(telegram.chat_id.as_str()) {
+            continue;
+        }
+        let until = value.get("until").and_then(Value::as_u64).unwrap_or(0);
+        if until <= now {
+            delete_setting(conn, &key)?;
+            expired += 1;
+            continue;
+        }
+        active += 1;
+        let next_at = value.get("nextAt").and_then(Value::as_u64).unwrap_or(0);
+        if next_at > now {
+            continue;
+        }
+        match telegram_send_chat_action(telegram, "typing", timeout) {
+            Ok(_) => {
+                sent += 1;
+                set_setting_text(
+                    conn,
+                    &key,
+                    &json!({
+                        "chatId": telegram.chat_id,
+                        "threadId": value.get("threadId").cloned().unwrap_or(Value::Null),
+                        "until": until,
+                        "nextAt": now + TELEGRAM_TYPING_REFRESH_MS
+                    })
+                    .to_string(),
+                )?;
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    Ok(json!({
+        "ok": failed == 0,
+        "transport": "telegram",
+        "active": active,
+        "sent": sent,
+        "expired": expired,
+        "failed": failed
+    }))
+}
+
+fn clear_telegram_typing_indicator(
+    conn: &Connection,
+    telegram: &TelegramConfig,
+    thread_id: &str,
+) -> Result<()> {
+    delete_setting(conn, &telegram_typing_key(&telegram.chat_id, thread_id))
 }
 
 fn codex_log_context_from_result<'a>(
@@ -635,6 +757,10 @@ fn send_codex_reply_to_thread(
         }),
         now,
     )?;
+    if let Some(telegram) = config.telegram.as_ref() {
+        register_telegram_typing_indicator(conn, telegram, thread_id, now)?;
+        let _ = refresh_telegram_typing_indicators(conn, telegram, now, Duration::from_secs(5));
+    }
     Ok(json!({
         "ok": true,
         "action": "telegram_reply",
@@ -693,6 +819,10 @@ fn send_codex_approval_to_thread(
         }),
         now,
     )?;
+    if let Some(telegram) = config.telegram.as_ref() {
+        register_telegram_typing_indicator(conn, telegram, thread_id, now)?;
+        let _ = refresh_telegram_typing_indicators(conn, telegram, now, Duration::from_secs(5));
+    }
     Ok(json!({
         "ok": true,
         "action": "telegram_approval",
@@ -766,6 +896,10 @@ fn start_new_thread_from_telegram(
         }),
         now,
     )?;
+    if let Some(telegram) = config.telegram.as_ref() {
+        register_telegram_typing_indicator(conn, telegram, thread_id, now)?;
+        let _ = refresh_telegram_typing_indicators(conn, telegram, now, Duration::from_secs(5));
+    }
     Ok(result)
 }
 
@@ -1020,6 +1154,34 @@ fn execute_telegram_command(
         TelegramInboundCommand::Status => {
             let sent = telegram_send_text(telegram, &telegram_status_text(conn)?, timeout)?;
             Ok(json!({ "ok": true, "action": "telegram_status", "sent": sent }))
+        }
+        TelegramInboundCommand::TelegramOn => {
+            let state = telegram_set_enabled_result(true, false)?;
+            let sent = telegram_send_text(telegram, "Telegram channel is enabled.", timeout)?;
+            Ok(
+                json!({ "ok": true, "action": "telegram_enable_command", "state": state, "sent": sent }),
+            )
+        }
+        TelegramInboundCommand::TelegramOff => {
+            let state = telegram_set_enabled_result(false, false)?;
+            let sent = telegram_send_text(telegram, "Telegram channel is disabled.", timeout)?;
+            Ok(
+                json!({ "ok": true, "action": "telegram_disable_command", "state": state, "sent": sent }),
+            )
+        }
+        TelegramInboundCommand::DiscordOn => {
+            let state = crate::discord::discord_set_enabled_result(true, false)?;
+            let sent = telegram_send_text(telegram, "Discord channel is enabled.", timeout)?;
+            Ok(
+                json!({ "ok": true, "action": "discord_enable_command", "state": state, "sent": sent }),
+            )
+        }
+        TelegramInboundCommand::DiscordOff => {
+            let state = crate::discord::discord_set_enabled_result(false, false)?;
+            let sent = telegram_send_text(telegram, "Discord channel is disabled.", timeout)?;
+            Ok(
+                json!({ "ok": true, "action": "discord_disable_command", "state": state, "sent": sent }),
+            )
         }
         TelegramInboundCommand::Threads(raw_limit) => {
             execute_threads_command(conn, telegram, raw_limit, now, timeout).or_else(|error| {
@@ -1710,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_disable_dry_run_reports_config_removal_without_deleting_file() {
+    fn telegram_disable_dry_run_reports_state_without_deleting_file() {
         let _guard = config_test_lock().lock().expect("config lock");
         let _backup = ConfigBackup::capture().expect("capture config backup");
         let path = write_daemon_config(&DaemonConfig {
@@ -1721,7 +1883,9 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
+                enabled: true,
             }),
+            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: "ws://127.0.0.1:4500".to_string(),
@@ -1734,9 +1898,11 @@ mod tests {
 
         assert_eq!(result["action"], "telegram_disable");
         assert_eq!(result["dryRun"], true);
-        assert_eq!(result["hadTelegram"], true);
-        assert_eq!(result["removedConfig"], true);
+        assert_eq!(result["configured"], true);
+        assert_eq!(result["previousEnabled"], true);
+        assert_eq!(result["enabled"], false);
         assert_eq!(result["configPath"], path.display().to_string());
+        assert_eq!(result["config"]["telegram"]["enabled"], false);
         assert!(path.exists(), "dry run should leave config in place");
     }
 
@@ -1802,6 +1968,7 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
+            enabled: true,
         };
 
         let command = extract_telegram_command(
@@ -1848,6 +2015,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
             telegram: None,
+            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: server.url.clone(),
@@ -1897,6 +2065,7 @@ mod tests {
             bridge_command: "bridge".to_string(),
             events: crate::DEFAULT_NOTIFICATION_EVENTS.to_string(),
             telegram: None,
+            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: server.url.clone(),
@@ -1953,7 +2122,9 @@ mod tests {
                 bot_token: "123:secret".to_string(),
                 chat_id: "456".to_string(),
                 allowed_user_id: Some("789".to_string()),
+                enabled: true,
             }),
+            discord: None,
             codex: Some(CodexConfig {
                 live_mode: CodexLiveMode::Shared,
                 websocket_url: websocket_url.clone(),
@@ -1966,6 +2137,7 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
+            enabled: true,
         };
         let message = json!({
             "chat": { "id": "456" },
@@ -2036,6 +2208,7 @@ mod tests {
             bot_token: "123:secret".to_string(),
             chat_id: "456".to_string(),
             allowed_user_id: Some("789".to_string()),
+            enabled: true,
         };
         let message = json!({
             "chat": { "id": "456" },

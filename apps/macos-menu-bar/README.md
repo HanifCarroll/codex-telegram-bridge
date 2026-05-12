@@ -33,9 +33,11 @@ Use `--install-dir <path>`, `--no-login-item`, or `--no-open` to change installe
 
 Menu wording follows the bridge product model:
 
-- `Remote Mode: On` means Telegram notifications are enabled.
-- `Remote Mode: Off` means Telegram notifications stay local.
+- `Remote Mode: On` means remote notifications are enabled for the active channels.
+- `Remote Mode: Off` means remote notifications stay local.
+- `Enable Telegram`, `Disable Telegram`, `Enable Discord`, and `Disable Discord` pause or resume each transport without deleting setup.
 - The primary action is state-aware: off shows `Start Remote Mode`, on shows `Stop Remote Mode`.
+- The menu refreshes from bridge state on open, observes `remote-mode.json` and `live-backend.json` for Telegram-side changes, and falls back to a periodic refresh.
 - `Connection: Idle` means the shared backend is not required because remote mode is off.
 - `Connection: Ready` means the shared backend is reachable.
 - `Connection: Needs Attention` means automatic reconciliation could not make the backend usable; use `Repair Connection` or inspect the issue text.
